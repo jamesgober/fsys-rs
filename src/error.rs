@@ -131,6 +131,27 @@ pub enum Error {
         /// Operations that succeeded before the failure.
         completed_steps: Vec<String>,
     },
+
+    /// A batch operation was submitted to a [`crate::Handle`] that is
+    /// being dropped.
+    ///
+    /// **Code:** `FS-00009`. Caller action: the handle is shutting down;
+    /// rebuild a new handle if more IO is needed. This error is only
+    /// produced when a batch submit races with `Handle::drop` — it is
+    /// effectively unreachable when handle ownership is single-threaded
+    /// or properly fenced.
+    ShutdownInProgress,
+
+    /// The group-lane queue is full and a non-blocking submission was
+    /// rejected.
+    ///
+    /// **Code:** `FS-00010`. **Reserved variant — never emitted in
+    /// `0.4.0`.** The default backpressure mode in `0.4.0` is blocking
+    /// submission (callers wait when the queue is full); this variant
+    /// is reserved for a future opt-in error-mode (`Builder::backpressure
+    /// (BackpressureMode::Error)`) that has not landed yet. Match it to
+    /// satisfy exhaustiveness even though it cannot occur today.
+    QueueFull,
 }
 
 impl Error {
@@ -159,6 +180,8 @@ impl Error {
             Error::AlignmentRequired { .. } => "FS-00006",
             Error::AtomicReplaceFailed { .. } => "FS-00007",
             Error::PartialDirectoryOp { .. } => "FS-00008",
+            Error::ShutdownInProgress => "FS-00009",
+            Error::QueueFull => "FS-00010",
         }
     }
 }
@@ -217,6 +240,20 @@ impl fmt::Display for Error {
                     completed_steps.len()
                 )
             }
+            Error::ShutdownInProgress => {
+                write!(
+                    f,
+                    "[{}] handle is shutting down; batch submission rejected",
+                    self.code()
+                )
+            }
+            Error::QueueFull => {
+                write!(
+                    f,
+                    "[{}] group-lane queue is full (reserved variant; never emitted in 0.4.0)",
+                    self.code()
+                )
+            }
         }
     }
 }
@@ -231,7 +268,9 @@ impl std::error::Error for Error {
             | Error::UnsupportedPlatform { .. }
             | Error::UnsupportedMethod { .. }
             | Error::AlignmentRequired { .. }
-            | Error::PartialDirectoryOp { .. } => None,
+            | Error::PartialDirectoryOp { .. }
+            | Error::ShutdownInProgress
+            | Error::QueueFull => None,
         }
     }
 }
@@ -239,6 +278,82 @@ impl std::error::Error for Error {
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
         Error::Io(value)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// BatchError
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// The error type returned by batch operations
+/// (`Handle::write_batch`, `Handle::delete_batch`, `Handle::copy_batch`,
+/// and `Batch::commit`).
+///
+/// `BatchError` reports per-batch failure semantics under decision #5
+/// of the `0.4.0` design (independent ops, not transactions). When a
+/// batch op fails — whether by returning an `Err` or by panicking — the
+/// dispatcher stops processing the current batch, sends the response,
+/// and moves on to the next batch in the queue. Subsequent ops in the
+/// failing batch are **not attempted**. Ops that succeeded before the
+/// failure **are** durable; fsys does **not** roll them back.
+///
+/// To recover from a `BatchError`, inspect:
+/// - [`failed_at`](BatchError::failed_at): the index of the op that
+///   failed.
+/// - [`completed`](BatchError::completed): the number of ops that
+///   completed successfully *before* the failure (always equal to
+///   `failed_at` in `0.4.0`; the field is preserved as a structural
+///   guarantee for future phases that might allow continuation).
+/// - [`source`](BatchError::source): the underlying [`Error`] that
+///   describes the failure.
+///
+/// Callers needing all-or-nothing semantics must layer their own
+/// transactional logic on top of fsys, or wait for `Method::Journal`
+/// in `0.7.0`.
+#[derive(Debug)]
+#[non_exhaustive]
+#[must_use = "errors should be inspected, propagated, or logged"]
+pub struct BatchError {
+    /// The zero-based index of the op that failed within its batch.
+    pub failed_at: usize,
+    /// The number of ops that completed successfully before the failure.
+    pub completed: usize,
+    /// The underlying error.
+    ///
+    /// Boxed because `Error` is `non_exhaustive` and may grow large; the
+    /// box keeps `BatchError` itself small even when the inner error
+    /// carries large payloads (e.g. paths, detail strings, captured
+    /// `std::io::Error`s).
+    pub source: Box<Error>,
+}
+
+impl BatchError {
+    /// Returns the inner [`Error`] as a borrowed reference.
+    ///
+    /// Convenience wrapper over `&*self.source`.
+    pub fn inner(&self) -> &Error {
+        &self.source
+    }
+
+    /// Consumes this `BatchError` and returns the boxed inner [`Error`].
+    pub fn into_inner(self) -> Box<Error> {
+        self.source
+    }
+}
+
+impl fmt::Display for BatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "batch failed at op {} after {} successful op(s): {}",
+            self.failed_at, self.completed, self.source
+        )
+    }
+}
+
+impl std::error::Error for BatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
     }
 }
 
@@ -431,5 +546,100 @@ mod tests {
             completed_steps: vec![],
         };
         assert!(std::error::Error::source(&err).is_none());
+    }
+
+    // ── 0.4.0 additions ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_error_code_shutdown_in_progress_returns_fs00009() {
+        let err = Error::ShutdownInProgress;
+        assert_eq!(err.code(), "FS-00009");
+    }
+
+    #[test]
+    fn test_error_display_shutdown_in_progress_includes_code() {
+        let err = Error::ShutdownInProgress;
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00009]"));
+        assert!(s.contains("shutting down"));
+    }
+
+    #[test]
+    fn test_error_source_shutdown_in_progress_returns_none() {
+        let err = Error::ShutdownInProgress;
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_error_code_queue_full_returns_fs00010() {
+        let err = Error::QueueFull;
+        assert_eq!(err.code(), "FS-00010");
+    }
+
+    #[test]
+    fn test_error_display_queue_full_marked_reserved() {
+        let err = Error::QueueFull;
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00010]"));
+        assert!(s.to_ascii_lowercase().contains("reserved"));
+    }
+
+    #[test]
+    fn test_error_source_queue_full_returns_none() {
+        let err = Error::QueueFull;
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_batch_error_fields_round_trip() {
+        let inner = Error::Io(io::Error::from(io::ErrorKind::NotFound));
+        let be = BatchError {
+            failed_at: 3,
+            completed: 3,
+            source: Box::new(inner),
+        };
+        assert_eq!(be.failed_at, 3);
+        assert_eq!(be.completed, 3);
+        assert_eq!(be.inner().code(), "FS-00001");
+    }
+
+    #[test]
+    fn test_batch_error_display_includes_indices_and_inner() {
+        let inner = Error::HardwareProbeFailed {
+            detail: "probe stub".into(),
+        };
+        let be = BatchError {
+            failed_at: 7,
+            completed: 7,
+            source: Box::new(inner),
+        };
+        let s = be.to_string();
+        assert!(s.contains("op 7"));
+        assert!(s.contains("7 successful"));
+        assert!(s.contains("FS-00003"));
+    }
+
+    #[test]
+    fn test_batch_error_implements_std_error_with_inner_source() {
+        let inner = Error::Io(io::Error::from(io::ErrorKind::PermissionDenied));
+        let be = BatchError {
+            failed_at: 0,
+            completed: 0,
+            source: Box::new(inner),
+        };
+        let dyn_err: &dyn std::error::Error = &be;
+        assert!(dyn_err.source().is_some());
+    }
+
+    #[test]
+    fn test_batch_error_into_inner_returns_boxed_error() {
+        let inner = Error::ShutdownInProgress;
+        let be = BatchError {
+            failed_at: 0,
+            completed: 0,
+            source: Box::new(inner),
+        };
+        let unboxed: Box<Error> = be.into_inner();
+        assert_eq!(unboxed.code(), "FS-00009");
     }
 }

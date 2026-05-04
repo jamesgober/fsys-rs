@@ -4,7 +4,7 @@
 ######################################################
 [package]
 name    = "fsys"
-version = "0.3.0"
+version = "0.4.0"
 
 # METADATA
 readme  = "README.md"
@@ -77,6 +77,16 @@ async = ["dep:tokio"]
 [dependencies]
 tokio = { version = "1", features = ["fs", "rt"], optional = true }
 
+# Bounded MPMC + oneshot channels with `select!` support.
+# Used by the 0.4.0 pipeline subsystem: the group-lane work queue
+# (bounded MPMC with blocking-submit backpressure), the per-batch response
+# channels (oneshot), and the dispatcher's shutdown signaling channel.
+# `std::sync::mpsc` is insufficient because it does not provide bounded
+# MPMC nor a usable `select` primitive. `crossbeam-channel` is the
+# established, near-universal choice in production Rust concurrent code,
+# is API-stable across the 0.5.x series, and carries no transitive deps.
+crossbeam-channel = "0.5"
+
 # Syscall wrappers for Unix platforms (Linux, macOS).
 # Required for O_DIRECT, pread/pwrite, fdatasync, F_FULLFSYNC, F_NOCACHE,
 # and platform-specific atomic rename primitives.
@@ -117,6 +127,22 @@ harness = false
 
 [[bench]]
 name    = "method_comparison"
+harness = false
+
+# 0.4.0 group-lane benchmarks.
+# Floor-target validation runs on the Linux primary box; Windows
+# numbers are the Windows-specific baseline for regression detection
+# (decision D-3 in `.dev/DECISIONS-0.4.0.md`).
+[[bench]]
+name    = "batch_throughput"
+harness = false
+
+[[bench]]
+name    = "solo_vs_batch"
+harness = false
+
+[[bench]]
+name    = "concurrent_batches"
 harness = false
 
 

@@ -45,18 +45,23 @@ It exists because the standard library's file IO is general-purpose by design, i
 
 ## Status & roadmap
 
-Current state: **early but usable core**. `0.3.0` ships foundational construction
-APIs including `Builder`/`Handle`, file and directory CRUD, metadata,
-platform-specific IO paths, and convenience quick helpers.
+Current state: **dual-pipeline model in place**. `0.4.0` adds the group-lane
+batch API on top of the `0.3.0` foundation: `Handle::write_batch`,
+`delete_batch`, `copy_batch`, and the chainable `Batch` builder route through
+a per-handle dispatcher thread (lazy spawn, clean shutdown on drop) with a
+hybrid time-or-count window and a bounded queue with blocking submission.
+Solo-lane operations (`write`, `read`, `append`, `write_at`, etc.) remain
+byte-for-byte identical to `0.3.0` — the pipeline is invisible on that path.
 
 - `0.1.x` — [**DONE**]: Initial setup.
 - `0.2.x` — [**DONE**]: Scaffolding and foundation modules.
-- `0.3.x` — [**CURRENT**]: Construction core (CRUD + Handle + cross-platform IO).
-- `0.4.x` — [**NEXT**]: Advanced API refinements and capability expansion.
-- `0.5.x` — [**NEXT**]: Performance tuning, hardening, and broader test coverage.
-- `0.6.x` — [**ALPHA**]: Stabilization and polish.
-- `0.7.x` — [**BETA**]: Public testing and compatibility validation.
-- `0.8.x` — [**RC**]: Release candidate.
+- `0.3.x` — [**DONE**]: Construction core (CRUD + Handle + cross-platform IO).
+- `0.4.x` — [**CURRENT**]: Pipelines + batch operations (group-lane dispatch, `Batch` builder, `BatchError`).
+- `0.5.x` — [**NEXT**]: Real hardware probe + `Method::Mmap` / `Direct` consolidation, Linux `io_uring`, NVMe passthrough.
+- `0.6.x` — [**NEXT**]: `write_copy`, async batch wrappers, `scan` / `find` / `count` directory APIs.
+- `0.7.x` — [**ALPHA**]: `Method::Journal`, observability, deep audit.
+- `0.8.x` — [**BETA**]: Public testing and compatibility validation.
+- `0.9.x` — [**RC**]: Release candidate.
 - `1.0.0` — Stable API release.
 
 The roadmap is aspirational, not a schedule. Versions ship when they're right, not when the calendar agrees.
@@ -68,7 +73,7 @@ The roadmap is aspirational, not a schedule. Versions ship when they're right, n
 
 ```toml
 [dependencies]
-fsys = "0.3.0"
+fsys = "0.4.0"
 ```
 
 > The crate is published to reserve the name. **Do not depend on it for production work** until at least `0.8.0`.

@@ -5,10 +5,18 @@
 //! `impl` blocks defined in [`crate::crud`].
 //!
 //! `Handle` is `Send + Sync`: the mutable state (active method) is managed
-//! with atomic operations.
+//! with atomic operations. As of `0.4.0`, every `Handle` also owns a
+//! pipeline subsystem (crate-internal) that powers the group-lane batch
+//! API ([`Handle::write_batch`], [`Handle::delete_batch`],
+//! [`Handle::copy_batch`], [`Handle::batch`]). The dispatcher thread is
+//! spawned lazily on the first batch submission and shut down cleanly
+//! when the `Handle` is dropped — idle handles cost zero threads.
 
+use crate::batch::Batch;
+use crate::error::BatchError;
 use crate::method::Method;
 use crate::path::Mode;
+use crate::pipeline::{BatchOp, HandleSnapshot, Pipeline};
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -61,6 +69,13 @@ pub struct Handle {
     /// May be updated to a less-capable method if the OS rejects a
     /// privileged open (e.g. `O_DIRECT` rejected on tmpfs → falls back
     /// to `Data`).
+    ///
+    /// **0.4.0 limitation.** This field is updated by solo-lane runtime
+    /// fallbacks but **not** by group-lane (batch) per-op fallbacks —
+    /// the dispatcher runs without a [`Handle`] reference. Group-lane
+    /// fallback information surfaces in [`BatchError::source`] for the
+    /// failing op. See decision D-5 in `.dev/DECISIONS-0.4.0.md`; full
+    /// cross-lane consistency arrives in `0.5.0`.
     active_method: AtomicU8,
     /// Optional root directory. When set, all relative paths are resolved
     /// against this root and path-escape checks are enforced.
@@ -69,6 +84,12 @@ pub struct Handle {
     mode: Mode,
     /// Probed logical sector size for aligned Direct IO buffers (bytes).
     sector_size: u32,
+    /// Per-handle pipeline. Owns the lazy group-lane dispatcher thread.
+    /// Declared last so its `Drop` runs after the rest of the state has
+    /// already been read into snapshots — although correctness does not
+    /// depend on field-drop order (the dispatcher consumes only its
+    /// `BatchJob`-supplied [`HandleSnapshot`]s, never the live state).
+    pipeline: Pipeline,
 }
 
 impl Handle {
@@ -81,6 +102,7 @@ impl Handle {
         root: Option<PathBuf>,
         mode: Mode,
         sector_size: u32,
+        pipeline: Pipeline,
     ) -> Self {
         Self {
             configured_method: AtomicU8::new(configured_method.to_u8()),
@@ -88,6 +110,7 @@ impl Handle {
             root,
             mode,
             sector_size,
+            pipeline,
         }
     }
 
@@ -246,6 +269,174 @@ impl Handle {
         let name = format!(".fsys-tmp-{}.{}", n, stem);
         parent.join(name)
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Batch API (0.4.0)
+    //
+    // Routes through the group-lane pipeline. The pipeline's dispatcher is
+    // spawned lazily on first use and shut down cleanly on `Handle` drop.
+    // See `pipeline/mod.rs` and `.dev/DECISIONS-0.4.0.md` (D-4, D-5) for the
+    // architecture.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Atomically writes every `(path, data)` pair in `batch` through the
+    /// group lane.
+    ///
+    /// Ops execute in **strict submission order**. The first failure (a
+    /// returned `Err` *or* a panic inside an op) stops the batch — ops
+    /// after the failure are **not** attempted. Ops that succeeded before
+    /// the failure **are** durable; fsys does not roll them back.
+    ///
+    /// # Latency characteristics
+    ///
+    /// Submits to the group lane. **Blocks** if the queue is full (default
+    /// capacity 1024 jobs). Returns when every op in this batch has been
+    /// processed by the dispatcher and a per-batch result is reported back.
+    /// First call to any batch method on this handle spawns the dispatcher
+    /// thread (~one-time ~50–200 µs cost).
+    ///
+    /// # Errors
+    ///
+    /// - [`BatchError`] wrapping [`Error::InvalidPath`] if any path
+    ///   escapes the handle root. Reported with `failed_at` set to the
+    ///   first invalid index and `completed = 0` (path validation
+    ///   happens before submission, so nothing was attempted).
+    /// - [`BatchError`] wrapping the underlying [`Error`] if a
+    ///   per-op IO error occurs in the dispatcher. `failed_at` is the
+    ///   op index, `completed` is the count of ops that succeeded
+    ///   before it.
+    /// - [`BatchError`] wrapping [`Error::ShutdownInProgress`] if the
+    ///   handle is being dropped concurrently with this submission
+    ///   (effectively unreachable when handle ownership is single-
+    ///   threaded or properly fenced).
+    pub fn write_batch<P: AsRef<Path>>(
+        &self,
+        batch: &[(P, &[u8])],
+    ) -> std::result::Result<(), BatchError> {
+        let mut ops: Vec<BatchOp> = Vec::with_capacity(batch.len());
+        for (i, (path, data)) in batch.iter().enumerate() {
+            let resolved = self
+                .resolve_path(path.as_ref())
+                .map_err(|e| pre_submit_err(i, e))?;
+            ops.push(BatchOp::Write {
+                path: resolved,
+                data: data.to_vec(),
+            });
+        }
+        self.submit_batch(ops)
+    }
+
+    /// Idempotently deletes every path in `batch` through the group lane.
+    ///
+    /// Same ordering and failure semantics as [`Handle::write_batch`].
+    /// Missing files are not an error (matching solo-lane
+    /// [`Handle::delete`]).
+    ///
+    /// # Latency characteristics
+    ///
+    /// See [`Handle::write_batch`].
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`Handle::write_batch`]; per-op delete errors are
+    /// limited to permission and OS-level failures.
+    pub fn delete_batch<P: AsRef<Path>>(&self, batch: &[P]) -> std::result::Result<(), BatchError> {
+        let mut ops: Vec<BatchOp> = Vec::with_capacity(batch.len());
+        for (i, path) in batch.iter().enumerate() {
+            let resolved = self
+                .resolve_path(path.as_ref())
+                .map_err(|e| pre_submit_err(i, e))?;
+            ops.push(BatchOp::Delete { path: resolved });
+        }
+        self.submit_batch(ops)
+    }
+
+    /// Copies every `(src, dst)` pair in `batch` through the group lane.
+    ///
+    /// Each copy is implemented as `read(src)` followed by an
+    /// atomic-replace `write(dst)`, identical to solo-lane
+    /// [`Handle::copy`] under the atomic-replace pattern.
+    ///
+    /// # Latency characteristics
+    ///
+    /// See [`Handle::write_batch`].
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`Handle::write_batch`]; per-op copy errors include
+    /// "source missing" (returns the underlying `Error::Io` with
+    /// `ErrorKind::NotFound`).
+    pub fn copy_batch<P: AsRef<Path>, Q: AsRef<Path>>(
+        &self,
+        batch: &[(P, Q)],
+    ) -> std::result::Result<(), BatchError> {
+        let mut ops: Vec<BatchOp> = Vec::with_capacity(batch.len());
+        for (i, (src, dst)) in batch.iter().enumerate() {
+            let resolved_src = self
+                .resolve_path(src.as_ref())
+                .map_err(|e| pre_submit_err(i, e))?;
+            let resolved_dst = self
+                .resolve_path(dst.as_ref())
+                .map_err(|e| pre_submit_err(i, e))?;
+            ops.push(BatchOp::Copy {
+                src: resolved_src,
+                dst: resolved_dst,
+            });
+        }
+        self.submit_batch(ops)
+    }
+
+    /// Returns a [`Batch`] builder bound to this handle.
+    ///
+    /// The builder accumulates ops via chainable `write` / `delete` /
+    /// `copy` calls and submits them all in a single batch when
+    /// [`Batch::commit`] is called. Useful for very large or dynamic
+    /// batches where building a slice up-front is awkward.
+    ///
+    /// # Allocation semantics
+    ///
+    /// Per decision R-15 in `.dev/DECISIONS-0.4.0.md`, the builder
+    /// allocates **at each `.write()` / `.delete()` / `.copy()` call**,
+    /// not lazily at commit. Allocations are paced; a 10K-op batch pays
+    /// 10K small allocations spread across the build loop, not one big
+    /// burst at commit.
+    pub fn batch(&self) -> Batch<'_> {
+        Batch::new(self)
+    }
+
+    /// Returns the [`HandleSnapshot`] used by the pipeline dispatcher.
+    ///
+    /// Captures `active_method`, `sector_size`, and `use_direct` at the
+    /// moment of the call. The snapshot travels with each [`BatchJob`]
+    /// into the dispatcher; subsequent solo-lane fallbacks on this
+    /// handle do not retroactively update jobs already in flight.
+    pub(crate) fn snapshot(&self) -> HandleSnapshot {
+        HandleSnapshot {
+            method: self.active_method(),
+            sector_size: self.sector_size,
+            use_direct: self.use_direct(),
+        }
+    }
+
+    /// Submits a pre-resolved op vector through the group-lane pipeline.
+    ///
+    /// `pub(crate)` — used by [`Batch::commit`] in `batch.rs` to avoid
+    /// exposing the pipeline field directly to that module.
+    pub(crate) fn submit_batch(&self, ops: Vec<BatchOp>) -> std::result::Result<(), BatchError> {
+        self.pipeline.submit(ops, self.snapshot())
+    }
+}
+
+/// Builds a [`BatchError`] for a path-validation failure that happens
+/// *before* submission. `completed = 0` because no op has been
+/// dispatched yet; `failed_at` is the index of the offending op in the
+/// caller's slice.
+fn pre_submit_err(index: usize, e: Error) -> BatchError {
+    BatchError {
+        failed_at: index,
+        completed: 0,
+        source: Box::new(e),
+    }
 }
 
 // Handle is Send + Sync because AtomicU8 and AtomicU64 are Send + Sync,
@@ -271,9 +462,17 @@ mod tests {
     use super::*;
     use crate::method::Method;
     use crate::path::Mode;
+    use crate::pipeline::PipelineConfig;
 
     fn make_handle(method: Method) -> Handle {
-        Handle::new_raw(method, method.resolve(), None, Mode::Dev, 512)
+        Handle::new_raw(
+            method,
+            method.resolve(),
+            None,
+            Mode::Dev,
+            512,
+            Pipeline::new(PipelineConfig::DEFAULT),
+        )
     }
 
     #[test]
@@ -310,7 +509,14 @@ mod tests {
 
     #[test]
     fn test_use_direct_reflects_method() {
-        let h = Handle::new_raw(Method::Direct, Method::Direct, None, Mode::Dev, 512);
+        let h = Handle::new_raw(
+            Method::Direct,
+            Method::Direct,
+            None,
+            Mode::Dev,
+            512,
+            Pipeline::new(PipelineConfig::DEFAULT),
+        );
         assert!(h.use_direct());
         let h2 = make_handle(Method::Sync);
         assert!(!h2.use_direct());
@@ -332,6 +538,7 @@ mod tests {
             Some(root.clone()),
             Mode::Dev,
             512,
+            Pipeline::new(PipelineConfig::DEFAULT),
         );
         let resolved = h
             .resolve_path(Path::new("subdir/file.txt"))
@@ -342,7 +549,14 @@ mod tests {
     #[test]
     fn test_resolve_path_escape_is_rejected() {
         let root = std::env::temp_dir().join("jail");
-        let h = Handle::new_raw(Method::Sync, Method::Sync, Some(root), Mode::Dev, 512);
+        let h = Handle::new_raw(
+            Method::Sync,
+            Method::Sync,
+            Some(root),
+            Mode::Dev,
+            512,
+            Pipeline::new(PipelineConfig::DEFAULT),
+        );
         let result = h.resolve_path(Path::new("../../etc/passwd"));
         assert!(result.is_err(), "path escape must be rejected");
     }
@@ -357,7 +571,14 @@ mod tests {
 
     #[test]
     fn test_sector_size_accessor() {
-        let h = Handle::new_raw(Method::Sync, Method::Sync, None, Mode::Dev, 4096);
+        let h = Handle::new_raw(
+            Method::Sync,
+            Method::Sync,
+            None,
+            Mode::Dev,
+            4096,
+            Pipeline::new(PipelineConfig::DEFAULT),
+        );
         assert_eq!(h.sector_size(), 4096);
     }
 }
