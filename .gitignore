@@ -1,0 +1,52 @@
+# Custom
+
+
+# Development
+/dev
+/.dev
+
+# Private (not for GitHub)
+/.private/
+
+# Rust/Cargo Build Artifacts
+/target/
+**/*.rs.bk
+
+# Kraken Build Artifacts
+/build/
+/compiler/build/
+
+# Dependencies
+/node_modules/
+/vendor/
+
+# Editor & OS Junk
+/.vscode
+.DS_Store
+.Spotlight-V100
+.Trash-*
+.Trashes
+.directory
+.LSOverride
+.AppleDouble
+Desktop.ini
+ehthumbs.db
+Thumbs.db
+$RECYCLE.BIN/
+
+# Environment & Secrets
+.env
+/.claude
+/config/
+storage/*.key
+Homestead.yaml
+Homestead.json
+/config.json
+
+# Sublime Text & Other IDEs
+*.tmlanguage.cache
+*.tmPreferences.cache
+*.stTheme.cache
+*.sublime-workspace
+*.sublime-project
+._*

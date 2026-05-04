@@ -1,0 +1,12 @@
+# Normalize line endings across all platforms.
+* text=auto eol=lf
+
+# Binary files — do not normalize.
+*.bin binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.png binary
+*.jpg binary
+*.ico binary

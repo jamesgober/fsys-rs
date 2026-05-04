@@ -1,0 +1,66 @@
+[package]
+name = "fsys"
+version = "0.1.0"
+edition = "2021"
+readme  = "README.md"
+license = "APACHE-2.0 OR MIT"
+rust-version = "1.75"
+
+description   = "Adaptive file and directory IO for Rust — fast, hardware-aware, multi-strategy."
+documentation = "https://docs.rs/fsys"
+repository    = "https://github.com/jamesgober/fsys-rs"
+homepage      = "https://github.com/jamesgober/fsys-rs"
+
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "CHANGELOG.md",
+]
+keywords = [
+    "io", 
+    "filesystem", 
+    "storage", 
+    "durability", 
+    "nvme"
+]
+categories = [
+    "filesystem", 
+    "hardware-support", 
+    "os"
+]
+
+
+[lib]
+name = "fsys"
+path = "src/lib.rs"
+
+
+[features]
+default = []
+
+
+[dependencies]
+
+
+[dev-dependencies]
+
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = true
