@@ -22,11 +22,13 @@ pub mod cpu;
 pub mod drive;
 pub mod io_primitives;
 pub mod memory;
+mod probe;
 
 pub use crate::hardware::cpu::{CpuFeatures, CpuInfo};
 pub use crate::hardware::drive::{DriveInfo, DriveKind};
 pub use crate::hardware::io_primitives::IoPrimitives;
 pub use crate::hardware::memory::MemoryInfo;
+pub use crate::hardware::probe::PlpStatus;
 
 /// Aggregated hardware snapshot.
 ///

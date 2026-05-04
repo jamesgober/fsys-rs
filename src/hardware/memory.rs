@@ -23,15 +23,14 @@ pub struct MemoryInfo {
 
 /// Returns a fresh [`MemoryInfo`] snapshot.
 ///
-/// Always returns the `Default` value in `0.0.2`. Real probing (live,
-/// platform-specific) lands in `0.0.5`.
+/// 0.5.0 delegates to the crate-internal `probe::platform::probe_memory`
+/// which reads `/proc/meminfo` (Linux), `GlobalMemoryStatusEx`
+/// (Windows), or `sysctlbyname` (macOS). Live, not cached — RAM
+/// availability moves constantly. Returns [`MemoryInfo::default`]
+/// (zeros) on probe failure (sandbox, missing capability).
 #[must_use]
 pub(super) fn probe() -> MemoryInfo {
-    // TODO(0.0.5): replace with real per-platform probes.
-    //  - Linux: parse /proc/meminfo (MemTotal, MemAvailable).
-    //  - Windows: GlobalMemoryStatusEx().
-    //  - macOS: host_statistics64() with HOST_VM_INFO64.
-    MemoryInfo::default()
+    super::probe::platform::probe_memory()
 }
 
 #[cfg(test)]
@@ -49,14 +48,32 @@ mod tests {
     }
 
     #[test]
-    fn test_probe_matches_default_in_foundation_phase() {
-        assert_eq!(probe(), MemoryInfo::default());
+    fn test_probe_returns_non_zero_total_on_real_platforms() {
+        // Linux/macOS/Windows produce real values; sandboxed
+        // unsupported targets fall back to default.
+        let m = probe();
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) {
+            assert!(
+                m.total_bytes > 0,
+                "real platforms must report >0 total memory"
+            );
+        } else {
+            assert_eq!(m, MemoryInfo::default());
+        }
     }
 
     #[test]
     fn test_probe_returns_owned_value_each_call() {
+        // 0.5.0: probe is live. `total_bytes` is stable across calls,
+        // but `available_bytes` drifts as the system runs. Assert
+        // that both probes succeed and that total is stable; allow
+        // any drift in available.
         let a = probe();
         let b = probe();
-        assert_eq!(a, b);
+        assert_eq!(a.total_bytes, b.total_bytes);
     }
 }

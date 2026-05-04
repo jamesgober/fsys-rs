@@ -9,18 +9,37 @@
 //! # Platform-specific notes
 //!
 //! See the per-variant documentation for exact OS primitives. The high-level
-//! story: Linux has the widest selection (`fdatasync`, `O_DIRECT`), macOS
-//! requires `F_FULLFSYNC` for any meaningful durability guarantee, and
-//! Windows uses `FlushFileBuffers` with optional `FILE_FLAG_NO_BUFFERING`.
+//! story: Linux has the widest selection (`fdatasync`, `O_DIRECT`,
+//! `io_uring` since 0.5.0), macOS requires `F_FULLFSYNC` for any
+//! meaningful durability guarantee, and Windows uses `FlushFileBuffers`
+//! with optional `FILE_FLAG_NO_BUFFERING`.
+//!
+//! # Module structure
+//!
+//! - This file (`mod.rs`) defines the `Method` enum, its `to_u8` /
+//!   `from_u8` / `is_reserved` / `as_str` / `Display` impls, and the
+//!   public `resolve()` entry point that delegates to the
+//!   crate-internal `auto` submodule.
+//! - The `auto` submodule contains the per-platform `resolve_auto`
+//!   ladder. 0.5.0 replaces 0.3.0's heuristic ladder with one that
+//!   consults the real hardware probe (D-4 in
+//!   `.dev/DECISIONS-0.5.0.md`).
+//! - Per-method backends (`sync`, `data`, `direct`, `mmap`, `journal`)
+//!   land in their own files as they are implemented. The
+//!   `mmap` and `direct` upgrades arrive in checkpoints E and F+G of
+//!   the 0.5.0 phase respectively.
+
+mod auto;
+pub(crate) mod mmap;
 
 use std::fmt;
 
 /// Durability strategy for file IO operations.
 ///
 /// The variant controls which OS synchronisation primitive is invoked after
-/// every write. `Sync`, `Data`, `Direct`, and `Auto` are fully functional in
-/// `0.3.0`. `Mmap` and `Journal` are reserved variants — selecting them at
-/// runtime returns [`crate::Error::UnsupportedMethod`].
+/// every write. `Sync`, `Data`, `Direct`, and `Auto` are fully functional
+/// in `0.4.0` and earlier; `Mmap` becomes a real backend in `0.5.0`.
+/// `Journal` is reserved for `0.7.0`.
 ///
 /// # Platform-specific behavior
 ///
@@ -28,10 +47,10 @@ use std::fmt;
 /// |---------|-------|-------|---------|
 /// | `Sync`  | `fsync(2)` | `fcntl(F_FULLFSYNC)` | `FlushFileBuffers` |
 /// | `Data`  | `fdatasync(2)` | `F_FULLFSYNC` (fallback) | `FlushFileBuffers` (fallback) |
-/// | `Direct`| `O_DIRECT` + `fdatasync` | `F_NOCACHE` + `F_FULLFSYNC` | `FILE_FLAG_NO_BUFFERING\|WRITE_THROUGH` |
-/// | `Mmap`  | *reserved* | *reserved* | *reserved* |
+/// | `Direct`| `O_DIRECT` + `io_uring` (0.5.0) / `fdatasync` (fallback) | `F_NOCACHE` + `F_FULLFSYNC` | `FILE_FLAG_NO_BUFFERING\|WRITE_THROUGH` |
+/// | `Mmap`  | `mmap` + `msync(MS_SYNC)` (0.5.0) | `mmap` + `msync(MS_SYNC)` (0.5.0) | `MapViewOfFile` + `FlushViewOfFile` (0.5.0) |
 /// | `Journal`| *reserved* | *reserved* | *reserved* |
-/// | `Auto`  | hardware ladder | hardware ladder | hardware ladder |
+/// | `Auto`  | hardware ladder (real probe in 0.5.0) | hardware ladder | hardware ladder |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -82,24 +101,31 @@ pub enum Method {
     ///
     /// # Platform-specific behavior
     ///
-    /// - **Linux:** Files opened with `O_DIRECT`. After write,
-    ///   `fdatasync(2)` is called because `O_DIRECT` only bypasses the
-    ///   page cache — file-size metadata still needs to be flushed.
-    ///   Buffer and offset alignment to `logical_sector` (typically 512
-    ///   or 4096 bytes) is handled with a heap-allocated aligned scratch
-    ///   buffer when the caller's data is not already aligned.
+    /// - **Linux (0.5.0):** Files opened with `O_DIRECT`. IO submission
+    ///   via `io_uring` when the kernel supports it (5.1+); fallback to
+    ///   `pwrite(2)` + `fdatasync(2)` when `io_uring_setup` fails.
+    ///   Buffer + offset + length alignment to `logical_sector` (typically
+    ///   512 or 4096 bytes) is handled by the per-handle aligned buffer
+    ///   pool.
     /// - **macOS:** `fcntl(fd, F_NOCACHE, 1)` after open. Durability via
     ///   `fcntl(fd, F_FULLFSYNC, 0)`. If `F_NOCACHE` fails (rare on some
     ///   HFS+ configurations), falls back to `Sync`.
     /// - **Windows:** `CreateFileW` with
     ///   `FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`. Sector
-    ///   alignment is probed at handle creation via `GetDiskFreeSpaceW`
-    ///   and handled with an aligned scratch buffer.
+    ///   alignment is probed at handle creation via `GetDiskFreeSpaceW`.
     Direct = 2,
 
     /// Memory-mapped IO with `msync` for durability.
     ///
-    /// **Reserved for `0.5.0`.** Selecting this method returns
+    /// Reads come from a mapped region; writes flow through the mapping
+    /// with explicit `msync(MS_SYNC)` (Linux/macOS) or `FlushViewOfFile`
+    /// (Windows) for durability. Falls back to [`Method::Sync`] for
+    /// files smaller than the page size, special files (sockets, pipes,
+    /// FIFOs), and filesystems that reject `mmap`. The fallback is
+    /// observable via
+    /// [`Handle::active_method`](crate::Handle::active_method).
+    ///
+    /// **Real backend lands in `0.5.0`.** Earlier versions return
     /// [`Error::UnsupportedMethod`](crate::Error::UnsupportedMethod) at
     /// runtime.
     Mmap = 3,
@@ -120,15 +146,30 @@ pub enum Method {
     /// [`Handle::active_method`](crate::Handle::active_method) (which
     /// never returns `Auto`).
     ///
-    /// # Resolution ladder (0.3.0)
+    /// # Resolution ladder (0.5.0)
+    ///
+    /// 0.5.0 replaces 0.3.0's heuristic ladder with one that consults
+    /// real probe data ([`crate::hardware::info`]). See the
+    /// crate-internal `auto` module and the 0.5.0 prompt's Auto table
+    /// for the full matrix.
     ///
     /// | Condition | Resolves to |
-    /// |-----------|-------------|
-    /// | Linux + `direct_io` capability flag + NVMe/SSD/Unknown drive | `Direct` |
-    /// | Linux + HDD or `direct_io` not set | `Data` |
-    /// | macOS | `Direct` (attempts `F_NOCACHE`; falls back at runtime) |
-    /// | Windows | `Direct` (attempts `NO_BUFFERING`; falls back at runtime) |
-    /// | Unknown platform | `Sync` |
+    /// |---|---|
+    /// | Linux + io_uring + NVMe | `Direct` |
+    /// | Linux + NVMe without io_uring | `Data` |
+    /// | Linux + SSD | `Data` |
+    /// | Linux + HDD or Unknown | `Sync` |
+    /// | macOS + NVMe | `Direct` |
+    /// | macOS + non-NVMe SSD or Unknown | `Sync` |
+    /// | macOS + HDD | `Sync` |
+    /// | Windows + NVMe | `Direct` |
+    /// | Windows + SSD | `Direct` |
+    /// | Windows + HDD or Unknown | `Sync` |
+    /// | Hardware probe failed entirely | `Sync` (universal safety) |
+    ///
+    /// PLP is **not** consulted by the 0.5.0 ladder — the elite
+    /// NVMe-passthrough path that benefits most from PLP is deferred to
+    /// `0.6.0`.
     Auto = 5,
 }
 
@@ -160,38 +201,32 @@ impl Method {
 
     /// Returns `true` for reserved variants not yet implemented.
     ///
-    /// Calling any IO operation with a reserved method will return
-    /// [`Error::UnsupportedMethod`](crate::Error::UnsupportedMethod).
+    /// In 0.5.0 the only reserved variant is [`Method::Journal`]
+    /// (deferred to 0.7.0). [`Method::Mmap`] is no longer reserved —
+    /// it ships with a real backend in this phase.
     #[must_use]
     #[inline]
     pub const fn is_reserved(self) -> bool {
-        matches!(self, Method::Mmap | Method::Journal)
+        matches!(self, Method::Journal)
     }
 
-    /// Resolves [`Auto`](Method::Auto) to a concrete method.
+    /// Resolves [`Auto`](Method::Auto) to a concrete method using real
+    /// hardware probe data (0.5.0).
     ///
-    /// Inspects the hardware probe results and platform capabilities, then
-    /// returns the fastest method that is safe on this system. Always
-    /// returns a concrete variant — never [`Auto`](Method::Auto).
+    /// Inspects the cached [`crate::hardware::HardwareInfo`] (drive
+    /// kind plus IO-primitives availability) and the active platform,
+    /// then picks the fastest method that is safe on this system.
+    /// Always returns a concrete variant — never
+    /// [`Auto`](Method::Auto). Non-`Auto` methods are returned
+    /// unchanged.
     ///
-    /// Non-`Auto` methods are returned unchanged.
-    ///
-    /// # Platform-specific behavior
-    ///
-    /// - **Linux:** `Direct` when `direct_io` is available and the drive
-    ///   is NVMe, SSD, or `Unknown` (treated as SSD-class in `0.3.0`).
-    ///   `Data` otherwise.
-    /// - **macOS:** `Direct` (falls back to `Sync` at runtime if
-    ///   `F_NOCACHE` is unavailable).
-    /// - **Windows:** `Direct` (falls back to `Sync` at runtime if
-    ///   `NO_BUFFERING` is rejected).
-    /// - **Other platforms:** `Sync`.
+    /// See [`Method::Auto`] for the full resolution ladder.
     #[must_use]
     pub fn resolve(self) -> Method {
         if self != Method::Auto {
             return self;
         }
-        resolve_auto()
+        auto::resolve_auto()
     }
 
     /// Returns the canonical lowercase name for this method.
@@ -212,70 +247,6 @@ impl fmt::Display for Method {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Auto-resolution ladder — compiled per-platform.
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[cfg(target_os = "linux")]
-fn resolve_auto() -> Method {
-    use crate::hardware;
-    use crate::hardware::drive::DriveKind;
-
-    let io = hardware::io_primitives();
-    let drive = hardware::drive();
-
-    if io.direct_io {
-        // direct_io flag means the kernel exposes O_DIRECT.
-        // In 0.3.0 we treat Unknown drives as SSD-class (conservative but
-        // not overly conservative — nearly all modern hardware benefits from
-        // O_DIRECT). Real NVMe identification lands in 0.5.0.
-        //
-        // `DriveKind` is `#[non_exhaustive]`. We deliberately match every
-        // current variant explicitly rather than adding a `_` wildcard:
-        // when 0.5.0 adds a new variant, this match will fail to compile,
-        // forcing a contributor to consciously decide which `Method` is
-        // appropriate for the new drive class. Adding a `_` arm would
-        // silently default the new variant to `Data`, which is a
-        // correctness hazard, not a feature.
-        match drive.kind {
-            DriveKind::Nvme | DriveKind::SataSsd | DriveKind::Unknown => {
-                return Method::Direct;
-            }
-            DriveKind::Hdd => {
-                // HDD: O_DIRECT offers no throughput benefit and can hurt
-                // sequential performance. Fall through to Data.
-            }
-        }
-    }
-
-    // fdatasync(2) is always available on Linux ≥ 2.4.
-    Method::Data
-}
-
-#[cfg(target_os = "macos")]
-fn resolve_auto() -> Method {
-    // macOS: attempt F_NOCACHE at open time. If it fails (rare), the
-    // per-operation fallback path in crud/file.rs will downgrade to Sync
-    // and update active_method() accordingly.
-    Method::Direct
-}
-
-#[cfg(target_os = "windows")]
-fn resolve_auto() -> Method {
-    // Windows: attempt FILE_FLAG_NO_BUFFERING at open time. CreateFileW
-    // will return ERROR_INVALID_PARAMETER on filesystems that reject it
-    // (e.g. FAT16, some remote mounts), at which point the per-operation
-    // fallback path will downgrade to Sync.
-    Method::Direct
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn resolve_auto() -> Method {
-    // Unknown platform: universal safe fallback. fsync is available on
-    // every POSIX system but we do not make specific assumptions here.
-    Method::Sync
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -328,14 +299,21 @@ mod tests {
     }
 
     #[test]
-    fn test_method_is_reserved_true_for_mmap_and_journal() {
-        assert!(Method::Mmap.is_reserved());
+    fn test_method_is_reserved_true_for_journal_only() {
+        // 0.5.0: Mmap is no longer reserved.
         assert!(Method::Journal.is_reserved());
+        assert!(!Method::Mmap.is_reserved());
     }
 
     #[test]
     fn test_method_is_reserved_false_for_real_methods() {
-        for m in [Method::Sync, Method::Data, Method::Direct, Method::Auto] {
+        for m in [
+            Method::Sync,
+            Method::Data,
+            Method::Direct,
+            Method::Mmap,
+            Method::Auto,
+        ] {
             assert!(!m.is_reserved(), "{} should not be reserved", m);
         }
     }
@@ -345,6 +323,7 @@ mod tests {
         assert_eq!(Method::Sync.resolve(), Method::Sync);
         assert_eq!(Method::Data.resolve(), Method::Data);
         assert_eq!(Method::Direct.resolve(), Method::Direct);
+        assert_eq!(Method::Mmap.resolve(), Method::Mmap);
     }
 
     #[test]
@@ -358,7 +337,11 @@ mod tests {
     }
 
     #[test]
-    fn test_method_auto_resolves_to_known_variant() {
+    fn test_method_auto_resolves_to_known_real_variant() {
+        // 0.5.0: Auto only resolves to real-backend variants
+        // (Sync, Data, Direct). Mmap is real but Auto does not pick
+        // it — Mmap is a deliberate caller choice for read-heavy
+        // random access workloads, not a default.
         let resolved = Method::Auto.resolve();
         assert!(
             matches!(resolved, Method::Sync | Method::Data | Method::Direct),

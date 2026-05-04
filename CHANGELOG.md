@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-04
+
+### Added
+
+- **Real hardware probe** replacing the 0.2.0 stub. Per-platform
+  implementations under `src/hardware/probe/`: Linux uses
+  `/proc/self/mountinfo` → `/sys/dev/block/`, `/proc/meminfo`,
+  `/proc/cpuinfo`; macOS uses `statvfs` + `sysctlbyname`; Windows
+  uses `GlobalMemoryStatusEx`, `GetLogicalProcessorInformationEx`,
+  `GetDiskFreeSpaceW`, and `IOCTL_STORAGE_QUERY_PROPERTY`.
+  `DriveInfo`, `MemoryInfo`, `CpuInfo`, and `IoPrimitives` now
+  return live values instead of constants.
+- `PlpStatus` (`Yes` / `No` / `Unknown`) replaces `DriveInfo::plp:
+  bool`. Tri-state surfaces the "we genuinely could not determine"
+  case instead of silently coercing it to `false`. **Breaking
+  change in 0.x** — see migration note below.
+- `Method::Mmap` upgraded from reserved to a real implementation
+  (`memmap2` + `msync` / `FlushViewOfFile` + atomic rename) with
+  per-handle suitability fallback to `Method::Sync` for sub-page
+  payloads, zero-length writes, and non-regular files (R-2'' in
+  `.dev/DECISIONS-0.5.0.md`). Fallback is observable via
+  `Handle::active_method()` and is permanent for the lifetime of
+  the handle.
+- `Method::Auto` is now genuinely hardware-aware. Resolution ladder
+  (per-platform, drive-class indexed) lives in `src/method/auto.rs`
+  and is locked in DECISIONS-0.5.0.md as decision #2.
+- Per-handle aligned buffer pool. `crossbeam-queue::ArrayQueue` for
+  the lock-free fast path with a `Mutex<()>` + `Condvar` slow path
+  for waiters. Lazily allocated on first use; no cost for handles
+  that never need aligned IO.
+- `Builder` knobs: `buffer_pool_size(usize)`,
+  `buffer_pool_block(usize)`, `io_uring_queue_depth(u32)`. Defaults
+  64 / 4096 / 128.
+- New error variants: `IoUringSetupFailed` (FS-00011),
+  `MmapFailed` (FS-00012), reserved `BufferPoolExhausted`
+  (FS-00013), `PlpDetectionUnavailable` (FS-00014).
+- 4 crash-safety integration test binaries (`tests/crash_sync.rs`,
+  `tests/crash_data.rs`, `tests/crash_direct.rs`,
+  `tests/crash_mmap.rs`) sharing `tests/crash_harness/mod.rs`. Each
+  binary covers `PreSyscall` / `MidSyscall` / `PostSyscall` kill
+  modes via subprocess + stdout-line-based deterministic
+  synchronisation (D-2). 100× pre-merge stability protocol from
+  D-4 verified locally — 400/400 binary runs (1 200 individual
+  test executions) green.
+- 3 new benchmarks: `method_payload_matrix` (4 methods × 4
+  payloads × 4 ops, the canonical 0.5.x regression surface),
+  `mmap_workloads` (page-aligned fast path vs sub-page Sync
+  fallback), `direct_iouring` (post-stub baseline for
+  `Method::Direct`).
+- `.dev/DECISIONS-0.5.0.md` — full architectural decision log for
+  this release: 7 locked decisions (D-1..D-7), R-2 / R-2' / R-2''
+  iteration notes for the Mmap suitability fallback, and the
+  io_uring blocker section.
+
+### Changed
+
+- New runtime dependencies: `crossbeam-queue = "0.3"` (buffer pool;
+  D-5), `memmap2 = "0.9"` (mmap implementation; D-6).
+- `windows-sys` features extended:
+  `Win32_System_SystemInformation`, `Win32_Storage_IscsiDisc`,
+  `Win32_System_Ioctl`, `Win32_System_Pipes` for the hardware
+  probe and crash-test harness.
+- `Method::Mmap` and `Method::Auto` are no longer reserved — both
+  are routable in 0.5.0.
+
+### Notes
+
+- **`io_uring` is stubbed in 0.5.0.** A rustc 1.95
+  `check_mod_deathness` ICE fires when `io_uring::IoUring` is
+  wrapped in any `std::sync` primitive; reproducible across
+  io-uring 0.6.x and 0.7.x and across `Mutex` / `RwLock` /
+  `UnsafeCell` wrappers. `Method::Direct` on Linux therefore
+  currently runs the `O_DIRECT` + `pwrite` + `fdatasync` fallback
+  path. The full lift checklist is in DECISIONS-0.5.0.md; the
+  `direct_iouring` bench is the post-stub baseline that the 0.5.x
+  patch will compare against.
+
+### Migration (0.4 → 0.5)
+
+- `DriveInfo::plp` changed type from `bool` to `PlpStatus`. Match
+  on the enum: `PlpStatus::Yes` is the only state that previously
+  read `true`; `PlpStatus::No` and `PlpStatus::Unknown` previously
+  read `false`. Code that treats "Unknown" as "No" should use
+  `matches!(info.plp, PlpStatus::Yes)`.
+
 ## [0.4.0] - 2026-05-04
 
 ### Added

@@ -106,6 +106,7 @@
 #![warn(clippy::all)]
 
 pub mod batch;
+pub(crate) mod buffer;
 pub mod builder;
 pub mod crud;
 pub mod error;

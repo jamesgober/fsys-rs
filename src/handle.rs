@@ -13,6 +13,7 @@
 //! when the `Handle` is dropped — idle handles cost zero threads.
 
 use crate::batch::Batch;
+use crate::buffer::AlignedBufferPool;
 use crate::error::BatchError;
 use crate::method::Method;
 use crate::path::Mode;
@@ -21,6 +22,18 @@ use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
+
+/// Pool configuration captured by [`Builder`] and consumed at
+/// [`Handle`] construction. Held opaquely in the Handle until the
+/// first Direct-method op triggers lazy pool allocation (locked
+/// decision #6 in `.dev/DECISIONS-0.5.0.md`).
+#[derive(Clone, Copy)]
+pub(crate) struct HandleBufferPoolConfig {
+    pub capacity: usize,
+    pub block_size: usize,
+    pub block_align: usize,
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Write-counter for unique temp-file names
@@ -90,6 +103,16 @@ pub struct Handle {
     /// depend on field-drop order (the dispatcher consumes only its
     /// `BatchJob`-supplied [`HandleSnapshot`]s, never the live state).
     pipeline: Pipeline,
+    /// Buffer pool config (capacity, block size, alignment). Captured
+    /// at construction and used by [`Handle::buffer_pool`] for lazy
+    /// allocation.
+    pool_config: HandleBufferPoolConfig,
+    /// Lazy aligned buffer pool. `None` until the first Direct-method
+    /// op leases a buffer; `Some(...)` for the rest of this Handle's
+    /// lifetime. The Mutex is held only briefly during lazy init —
+    /// once the pool is constructed, leasing is lock-free on the
+    /// fast path.
+    pool_slot: Mutex<Option<AlignedBufferPool>>,
 }
 
 impl Handle {
@@ -103,6 +126,7 @@ impl Handle {
         mode: Mode,
         sector_size: u32,
         pipeline: Pipeline,
+        pool_config: HandleBufferPoolConfig,
     ) -> Self {
         Self {
             configured_method: AtomicU8::new(configured_method.to_u8()),
@@ -111,7 +135,39 @@ impl Handle {
             mode,
             sector_size,
             pipeline,
+            pool_config,
+            pool_slot: Mutex::new(None),
         }
+    }
+
+    /// Returns a clone of the per-handle aligned buffer pool,
+    /// allocating it on first call.
+    ///
+    /// The pool itself is `Arc<PoolInner>`-cloned cheaply; the
+    /// underlying allocations are shared across all clones. Idle
+    /// handles cost zero buffer memory beyond the `Mutex<Option<…>>`
+    /// slot until this method is called.
+    ///
+    /// Returns the pool's lazy-construction error
+    /// ([`Error::AlignmentRequired`]) when the configured
+    /// `buffer_pool_size`/`buffer_pool_block` is invalid against the
+    /// probed sector size.
+    #[allow(dead_code)] // wired into Direct path in 0.5.x patch alongside io_uring lift
+    pub(crate) fn buffer_pool(&self) -> Result<AlignedBufferPool> {
+        let mut guard = match self.pool_slot.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(pool) = guard.as_ref() {
+            return Ok(pool.clone());
+        }
+        let pool = AlignedBufferPool::new(
+            self.pool_config.capacity,
+            self.pool_config.block_size,
+            self.pool_config.block_align,
+        )?;
+        *guard = Some(pool.clone());
+        Ok(pool)
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -464,6 +520,14 @@ mod tests {
     use crate::path::Mode;
     use crate::pipeline::PipelineConfig;
 
+    fn default_pool_config() -> HandleBufferPoolConfig {
+        HandleBufferPoolConfig {
+            capacity: 64,
+            block_size: 4096,
+            block_align: 512,
+        }
+    }
+
     fn make_handle(method: Method) -> Handle {
         Handle::new_raw(
             method,
@@ -472,6 +536,7 @@ mod tests {
             Mode::Dev,
             512,
             Pipeline::new(PipelineConfig::DEFAULT),
+            default_pool_config(),
         )
     }
 
@@ -497,11 +562,13 @@ mod tests {
 
     #[test]
     fn test_set_reserved_method_returns_error() {
+        // 0.5.0: Mmap is no longer reserved — Method::Journal is the
+        // only remaining reserved variant (still 0.7.0 work).
         let h = make_handle(Method::Sync);
-        let err = h.set_method(Method::Mmap);
+        let err = h.set_method(Method::Journal);
         assert!(err.is_err());
         if let Err(Error::UnsupportedMethod { method }) = err {
-            assert_eq!(method, "mmap");
+            assert_eq!(method, "journal");
         } else {
             panic!("expected UnsupportedMethod");
         }
@@ -516,6 +583,7 @@ mod tests {
             Mode::Dev,
             512,
             Pipeline::new(PipelineConfig::DEFAULT),
+            default_pool_config(),
         );
         assert!(h.use_direct());
         let h2 = make_handle(Method::Sync);
@@ -539,6 +607,7 @@ mod tests {
             Mode::Dev,
             512,
             Pipeline::new(PipelineConfig::DEFAULT),
+            default_pool_config(),
         );
         let resolved = h
             .resolve_path(Path::new("subdir/file.txt"))
@@ -556,6 +625,7 @@ mod tests {
             Mode::Dev,
             512,
             Pipeline::new(PipelineConfig::DEFAULT),
+            default_pool_config(),
         );
         let result = h.resolve_path(Path::new("../../etc/passwd"));
         assert!(result.is_err(), "path escape must be rejected");
@@ -578,6 +648,7 @@ mod tests {
             Mode::Dev,
             4096,
             Pipeline::new(PipelineConfig::DEFAULT),
+            default_pool_config(),
         );
         assert_eq!(h.sector_size(), 4096);
     }

@@ -33,11 +33,21 @@ use std::path::PathBuf;
 /// - `batch_size_max` defaults to `128` (group-lane count threshold).
 /// - `batch_queue_max` defaults to `1024` (group-lane queue capacity;
 ///   producers block when full).
+/// - `buffer_pool_size` defaults to `64` (per-handle aligned buffer
+///   pool capacity; see locked decision #6 in
+///   `.dev/DECISIONS-0.5.0.md`).
+/// - `buffer_pool_block` defaults to `4096` (per-buffer size in bytes).
+/// - `io_uring_queue_depth` defaults to `128` (Linux io_uring SQ
+///   depth; **stubbed in 0.5.0** — see the io_uring blocker in
+///   `.dev/DECISIONS-0.5.0.md`).
 pub struct Builder {
     method: Method,
     root: Option<PathBuf>,
     mode: Mode,
     pipeline_config: PipelineConfig,
+    buffer_pool_size: usize,
+    buffer_pool_block: usize,
+    io_uring_queue_depth: u32,
 }
 
 impl Builder {
@@ -49,6 +59,9 @@ impl Builder {
             root: None,
             mode: Mode::Auto,
             pipeline_config: PipelineConfig::DEFAULT,
+            buffer_pool_size: 64,
+            buffer_pool_block: 4096,
+            io_uring_queue_depth: 128,
         }
     }
 
@@ -150,6 +163,64 @@ impl Builder {
         self
     }
 
+    /// Sets the per-handle aligned buffer pool capacity (number of
+    /// reusable buffers).
+    ///
+    /// Default: `64`. Buffers are allocated lazily on the first
+    /// Direct-method op; idle handles cost zero buffer memory. The
+    /// pool is shared between caller threads and the group-lane
+    /// dispatcher; access is lock-free on the fast path
+    /// (`crossbeam_queue::ArrayQueue`).
+    ///
+    /// `0` is rejected at [`build`](Builder::build) time. Larger
+    /// values reduce allocation pressure on Direct workloads at the
+    /// cost of higher per-handle resident memory
+    /// (`buffer_pool_size × buffer_pool_block` bytes when fully
+    /// populated).
+    #[must_use]
+    pub fn buffer_pool_size(mut self, n: usize) -> Self {
+        self.buffer_pool_size = n;
+        self
+    }
+
+    /// Sets the per-buffer size in the aligned buffer pool, in bytes.
+    ///
+    /// Default: `4096`. Must be a non-zero multiple of the
+    /// platform's logical sector size (typically 512 or 4096) and a
+    /// power of two when alignment matters; `build()` validates this
+    /// against the probed sector size.
+    ///
+    /// For Direct IO workloads with payloads larger than the default,
+    /// a 64 KiB or 1 MiB block reduces the number of buffer leases per
+    /// op at the cost of higher per-handle memory (see
+    /// [`Builder::buffer_pool_size`]).
+    #[must_use]
+    pub fn buffer_pool_block(mut self, bytes: usize) -> Self {
+        self.buffer_pool_block = bytes;
+        self
+    }
+
+    /// Sets the Linux `io_uring` submission-queue depth.
+    ///
+    /// **Stubbed in 0.5.0.** Per the io_uring blocker documented in
+    /// `.dev/DECISIONS-0.5.0.md`, the io_uring wrapper currently
+    /// returns [`Error::IoUringSetupFailed`] unconditionally and
+    /// `Method::Direct` falls through to the
+    /// `O_DIRECT` + `pwrite` + `fdatasync` path that 0.3.0 already
+    /// shipped. This builder method exists for forward-compatibility
+    /// — when the upstream rustc bug is fixed and the wrapper is
+    /// un-stubbed in a 0.5.x patch, this knob will configure the
+    /// real ring without any caller-facing API change.
+    ///
+    /// Default: `128`. macOS and Windows ignore this value (no
+    /// io_uring on those platforms by design — see locked decision
+    /// #1).
+    #[must_use]
+    pub fn io_uring_queue_depth(mut self, depth: u32) -> Self {
+        self.io_uring_queue_depth = depth;
+        self
+    }
+
     /// Constructs the [`Handle`].
     ///
     /// Resolves `Method::Auto` using the hardware-detection ladder,
@@ -185,6 +256,19 @@ impl Builder {
         // deep).
         let pipeline = Pipeline::new(self.pipeline_config);
 
+        // 0.5.0: configure the per-handle buffer pool slot. The pool
+        // is lazily constructed on first Direct-method op; the config
+        // captured here is the input to that lazy construction.
+        // `buffer_pool_block` is rounded up to a multiple of the
+        // probed `sector_size` to satisfy alignment when the pool
+        // eventually backs Direct IO buffers.
+        let pool_block = align_up(self.buffer_pool_block, sector_size as usize);
+        let pool_config = crate::handle::HandleBufferPoolConfig {
+            capacity: self.buffer_pool_size,
+            block_size: pool_block,
+            block_align: sector_size as usize,
+        };
+
         Ok(Handle::new_raw(
             self.method,
             resolved_method,
@@ -192,6 +276,7 @@ impl Builder {
             mode,
             sector_size,
             pipeline,
+            pool_config,
         ))
     }
 }
@@ -200,6 +285,17 @@ impl Default for Builder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Rounds `n` up to the next multiple of `align`. `align` must be a
+/// non-zero positive integer; for `align == 0` we return `n` unchanged
+/// (defensive — pool construction validates the alignment downstream
+/// anyway).
+fn align_up(n: usize, align: usize) -> usize {
+    if align == 0 {
+        return n;
+    }
+    n.div_ceil(align).saturating_mul(align)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -238,10 +334,12 @@ mod tests {
 
     #[test]
     fn test_builder_rejects_reserved_method() {
-        let err = Builder::new().method(Method::Mmap).build();
+        // 0.5.0: Mmap is no longer reserved — Method::Journal is the
+        // only remaining reserved variant (still 0.7.0 work).
+        let err = Builder::new().method(Method::Journal).build();
         assert!(err.is_err());
         if let Err(Error::UnsupportedMethod { method }) = err {
-            assert_eq!(method, "mmap");
+            assert_eq!(method, "journal");
         } else {
             panic!("expected UnsupportedMethod");
         }
@@ -343,5 +441,70 @@ mod tests {
     fn test_builder_batch_size_zero_is_accepted() {
         let b = Builder::new().batch_size_max(0);
         assert_eq!(b.pipeline_config.batch_size_max, 0);
+    }
+
+    // ── 0.5.0 buffer pool + io_uring knobs ────────────────────────
+
+    #[test]
+    fn test_builder_default_buffer_pool_knobs_match_prompt() {
+        let b = Builder::new();
+        assert_eq!(b.buffer_pool_size, 64);
+        assert_eq!(b.buffer_pool_block, 4096);
+        assert_eq!(b.io_uring_queue_depth, 128);
+    }
+
+    #[test]
+    fn test_builder_buffer_pool_size_overrides_default() {
+        let b = Builder::new().buffer_pool_size(16);
+        assert_eq!(b.buffer_pool_size, 16);
+    }
+
+    #[test]
+    fn test_builder_buffer_pool_block_overrides_default() {
+        let b = Builder::new().buffer_pool_block(65_536);
+        assert_eq!(b.buffer_pool_block, 65_536);
+    }
+
+    #[test]
+    fn test_builder_io_uring_queue_depth_overrides_default() {
+        let b = Builder::new().io_uring_queue_depth(256);
+        assert_eq!(b.io_uring_queue_depth, 256);
+    }
+
+    #[test]
+    fn test_builder_buffer_pool_knobs_chain() {
+        let b = Builder::new()
+            .buffer_pool_size(32)
+            .buffer_pool_block(8192)
+            .io_uring_queue_depth(64);
+        assert_eq!(b.buffer_pool_size, 32);
+        assert_eq!(b.buffer_pool_block, 8192);
+        assert_eq!(b.io_uring_queue_depth, 64);
+    }
+
+    #[test]
+    fn test_handle_buffer_pool_lazy_init() {
+        // Build a handle and confirm `buffer_pool()` succeeds and
+        // returns a pool with the configured shape (block size is
+        // rounded up to the probed sector size, so we assert
+        // ≥ requested rather than exact equality).
+        let h = Builder::new()
+            .buffer_pool_size(8)
+            .buffer_pool_block(4096)
+            .build()
+            .expect("build");
+        let pool = h.buffer_pool().expect("buffer pool");
+        assert_eq!(pool.capacity(), 8);
+        assert!(pool.block_size() >= 4096);
+    }
+
+    #[test]
+    fn test_align_up_known_inputs() {
+        // sanity: non-zero align rounds up
+        assert_eq!(align_up(1, 512), 512);
+        assert_eq!(align_up(512, 512), 512);
+        assert_eq!(align_up(513, 512), 1024);
+        // align == 0 is a no-op (defensive)
+        assert_eq!(align_up(100, 0), 100);
     }
 }

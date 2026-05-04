@@ -43,38 +43,17 @@ pub struct IoPrimitives {
     pub mmap: bool,
 }
 
-/// Runs the IO-primitives probe.
+/// Runs the per-platform IO-primitives probe.
 ///
-/// Returns a static snapshot derived from the build target's
-/// `target_os`. Conservative for primitives that need a kernel
-/// version check (`io_uring`, `nvme_passthrough`).
+/// 0.5.0 delegates to the crate-internal
+/// `probe::platform::probe_io_primitives`. On Linux the `io_uring`
+/// field is now a real runtime check (attempts to construct a 1-entry
+/// submission ring; success means the kernel supports
+/// `io_uring_setup(2)` for this process). NVMe passthrough remains
+/// `false` until 0.6.0.
 #[must_use]
 pub(super) fn probe() -> IoPrimitives {
-    IoPrimitives {
-        // TODO(0.0.5): probe `io_uring_setup` to confirm kernel 5.1+
-        // and check for ring registration.
-        io_uring: false,
-        iocp: cfg!(target_os = "windows"),
-        kqueue: cfg!(any(
-            target_os = "macos",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "dragonfly",
-        )),
-        // TODO(0.0.5): require NVMe + appropriate caps/admin rights.
-        nvme_passthrough: false,
-        // The flag exists on every supported target; the *filesystem*
-        // may still reject it at open time. Callers fall back as
-        // documented in PLANNING.md when that happens.
-        direct_io: cfg!(any(
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "windows",
-        )),
-        // mmap / MapViewOfFile is universal across the supported set.
-        mmap: cfg!(any(unix, windows)),
-    }
+    super::probe::platform::probe_io_primitives()
 }
 
 #[cfg(test)]
@@ -124,12 +103,18 @@ mod tests {
     }
 
     #[test]
-    fn test_probe_does_not_lie_about_io_uring_in_foundation_phase() {
-        assert!(!probe().io_uring);
+    fn test_probe_io_uring_runtime_check_does_not_panic() {
+        // 0.5.0: io_uring is a real runtime probe on Linux. Just
+        // confirm the call returns a bool without panicking. On
+        // non-Linux it is always false.
+        let p = probe();
+        if !cfg!(target_os = "linux") {
+            assert!(!p.io_uring);
+        }
     }
 
     #[test]
-    fn test_probe_does_not_lie_about_nvme_passthrough_in_foundation_phase() {
+    fn test_probe_does_not_lie_about_nvme_passthrough_in_0_5_0() {
         assert!(!probe().nvme_passthrough);
     }
 }
