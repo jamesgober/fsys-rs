@@ -351,7 +351,6 @@ fn path_to_cstr(path: &Path) -> Result<std::ffi::CString> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
