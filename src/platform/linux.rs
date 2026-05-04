@@ -10,7 +10,7 @@
 
 use crate::{Error, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 
@@ -90,9 +90,14 @@ pub(crate) fn open_append(path: &Path) -> Result<File> {
 }
 
 pub(crate) fn open_write_at(path: &Path) -> Result<File> {
+    // `truncate(false)` is the explicit "preserve existing content" intent
+    // for `write_at`: random-access writes overlay specific byte ranges
+    // and must not destroy the rest of the file. Required by clippy's
+    // `suspicious_open_options` when `create(true)` is set.
     OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)
         .map_err(Error::Io)
 }
@@ -186,10 +191,11 @@ pub(crate) fn write_at(file: &File, offset: u64, data: &[u8]) -> Result<()> {
 pub(crate) fn read_all(file: &File) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut buf = Vec::new();
-    // We need a mutable borrow; use a scoped reborrow via try_clone → read.
-    // To avoid cloning the fd, read via the immutable reference using the
-    // Read impl on &File (available on Unix).
-    (&*file).read_to_end(&mut buf).map_err(Error::Io)?;
+    // Read via the immutable reference using the `Read` impl on `&File`
+    // (available on Unix). The returned byte count is redundant with
+    // `buf.len()` once the call returns; explicit `_` discard satisfies
+    // `unused_results`.
+    let _ = (&*file).read_to_end(&mut buf).map_err(Error::Io)?;
     Ok(buf)
 }
 
@@ -328,13 +334,15 @@ pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 pub(crate) fn probe_sector_size(path: &Path) -> u32 {
-    use std::ffi::CString;
-
     let path_cstr = match path_to_cstr(path) {
         Ok(c) => c,
         Err(_) => return 512,
     };
 
+    // SAFETY: `libc::statfs` is plain old data — every field is an
+    // integer or array of integers — so an all-zero bit pattern is a
+    // valid value. The struct is then fully written by `libc::statfs`
+    // below before any fields are read.
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: path_cstr is a valid NUL-terminated string; st is properly
     // sized and zero-initialised.
@@ -344,7 +352,7 @@ pub(crate) fn probe_sector_size(path: &Path) -> u32 {
         // size for Direct IO alignment purposes.
         let bs = st.f_bsize as u64;
         // Clamp to the range [512, 65536].
-        if bs >= 512 && bs <= 65536 {
+        if (512..=65536).contains(&bs) {
             return bs as u32;
         }
     }

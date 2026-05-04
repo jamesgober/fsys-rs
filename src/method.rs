@@ -231,6 +231,14 @@ fn resolve_auto() -> Method {
         // In 0.3.0 we treat Unknown drives as SSD-class (conservative but
         // not overly conservative — nearly all modern hardware benefits from
         // O_DIRECT). Real NVMe identification lands in 0.5.0.
+        //
+        // `DriveKind` is `#[non_exhaustive]`. We deliberately match every
+        // current variant explicitly rather than adding a `_` wildcard:
+        // when 0.5.0 adds a new variant, this match will fail to compile,
+        // forcing a contributor to consciously decide which `Method` is
+        // appropriate for the new drive class. Adding a `_` arm would
+        // silently default the new variant to `Data`, which is a
+        // correctness hazard, not a feature.
         match drive.kind {
             DriveKind::Nvme | DriveKind::SataSsd | DriveKind::Unknown => {
                 return Method::Direct;
@@ -239,7 +247,6 @@ fn resolve_auto() -> Method {
                 // HDD: O_DIRECT offers no throughput benefit and can hurt
                 // sequential performance. Fall through to Data.
             }
-            _ => {}
         }
     }
 
