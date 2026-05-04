@@ -68,7 +68,7 @@ impl Handle {
 
         // Step 2: write data.
         let write_result = if direct_ok {
-            platform::write_all_direct(&file, data, self.sector_size())
+            self.direct_write(&file, data)
         } else {
             platform::write_all(&file, data)
         };
@@ -200,7 +200,7 @@ impl Handle {
 
         if direct_ok {
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            platform::read_all_direct(&file, size, self.sector_size())
+            self.direct_read(&file, size)
         } else {
             platform::read_all(&file)
         }
@@ -343,6 +343,107 @@ impl Handle {
             _ => platform::sync_full(file),
         }
     }
+
+    /// Direct-IO write helper.
+    ///
+    /// On Linux, routes through the per-handle `io_uring` ring when
+    /// available. On `io_uring_setup(2)` rejection (cached on the
+    /// Handle as `Disabled`), or when the ring path errors at
+    /// runtime, falls through to the existing `O_DIRECT`+`pwrite`
+    /// path. On macOS / Windows / unknown, always uses the existing
+    /// platform `write_all_direct`.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(clippy::needless_pass_by_value, unused_imports)
+    )]
+    fn direct_write(&self, file: &std::fs::File, data: &[u8]) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(ring) = self.io_uring_ring() {
+                if iouring_write_direct(&ring, file, data, self.sector_size()).is_ok() {
+                    return Ok(());
+                }
+                // Ring submit failed at runtime — surface the
+                // `pwrite` path's error so the caller observes a
+                // single, comparable error class regardless of which
+                // path produced it.
+            }
+        }
+        platform::write_all_direct(file, data, self.sector_size())
+    }
+
+    /// Direct-IO read helper. Mirror of [`direct_write`].
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(clippy::needless_pass_by_value, unused_imports)
+    )]
+    fn direct_read(&self, file: &std::fs::File, file_size: u64) -> Result<Vec<u8>> {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(ring) = self.io_uring_ring() {
+                if let Ok(buf) = iouring_read_direct(&ring, file, file_size, self.sector_size()) {
+                    return Ok(buf);
+                }
+            }
+        }
+        platform::read_all_direct(file, file_size, self.sector_size())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn iouring_write_direct(
+    ring: &crate::platform::linux_iouring::IoUringRing,
+    file: &std::fs::File,
+    data: &[u8],
+    sector_size: u32,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let ss = sector_size as usize;
+    let aligned_len = data.len().div_ceil(ss).saturating_mul(ss);
+    let mut buf = crate::platform::AlignedBuf::new(aligned_len, ss)?;
+    buf.as_mut_slice()[..data.len()].copy_from_slice(data);
+
+    let n = ring.write_at(file.as_raw_fd(), buf.as_slice(), 0)?;
+    if n != aligned_len {
+        return Err(Error::Io(std::io::Error::other(
+            "io_uring short write on Direct path",
+        )));
+    }
+    // O_DIRECT minimises cache effects but does not imply durability.
+    // The atomic-replace contract requires the bytes to be on stable
+    // storage before the rename, so issue an explicit
+    // `Fsync(DATASYNC)` SQE through the same ring.
+    ring.fdatasync(file.as_raw_fd())?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn iouring_read_direct(
+    ring: &crate::platform::linux_iouring::IoUringRing,
+    file: &std::fs::File,
+    file_size: u64,
+    sector_size: u32,
+) -> Result<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+
+    if file_size == 0 {
+        return Ok(Vec::new());
+    }
+    let ss = sector_size as usize;
+    let len = file_size as usize;
+    let aligned_len = len.div_ceil(ss).saturating_mul(ss);
+    let mut buf = crate::platform::AlignedBuf::new(aligned_len, ss)?;
+
+    let n = ring.read_at(file.as_raw_fd(), buf.as_mut_slice(), 0)?;
+    if n < len {
+        return Err(Error::Io(std::io::Error::other(
+            "io_uring short read on Direct path",
+        )));
+    }
+    let mut out = Vec::with_capacity(len);
+    out.extend_from_slice(&buf.as_slice()[..len]);
+    Ok(out)
 }
 
 // Convert a `crate::Error` to a `std::io::Error` for use in

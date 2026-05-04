@@ -202,19 +202,17 @@ impl Builder {
 
     /// Sets the Linux `io_uring` submission-queue depth.
     ///
-    /// **Stubbed in 0.5.0.** Per the io_uring blocker documented in
-    /// `.dev/DECISIONS-0.5.0.md`, the io_uring wrapper currently
-    /// returns [`Error::IoUringSetupFailed`] unconditionally and
-    /// `Method::Direct` falls through to the
-    /// `O_DIRECT` + `pwrite` + `fdatasync` path that 0.3.0 already
-    /// shipped. This builder method exists for forward-compatibility
-    /// — when the upstream rustc bug is fixed and the wrapper is
-    /// un-stubbed in a 0.5.x patch, this knob will configure the
-    /// real ring without any caller-facing API change.
+    /// On Linux the [`Handle`] constructs a per-handle io_uring
+    /// ring lazily on the first [`crate::Method::Direct`] op. SQEs
+    /// for `write` / `read` / `fsync(DATASYNC)` route through the
+    /// ring; on `io_uring_setup(2)` rejection (kernel < 5.1,
+    /// SECCOMP, container restriction) the Direct path falls back
+    /// to `O_DIRECT` + `pwrite` + `fdatasync` — same durability
+    /// contract, slower path. macOS and Windows ignore this value
+    /// (no io_uring on those platforms by design — see locked
+    /// decision #1 in `.dev/DECISIONS-0.5.0.md`).
     ///
-    /// Default: `128`. macOS and Windows ignore this value (no
-    /// io_uring on those platforms by design — see locked decision
-    /// #1).
+    /// Default: `128`.
     #[must_use]
     pub fn io_uring_queue_depth(mut self, depth: u32) -> Self {
         self.io_uring_queue_depth = depth;
@@ -277,6 +275,7 @@ impl Builder {
             sector_size,
             pipeline,
             pool_config,
+            self.io_uring_queue_depth,
         ))
     }
 }

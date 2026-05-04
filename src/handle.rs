@@ -24,6 +24,29 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 
+#[cfg(target_os = "linux")]
+use crate::platform::linux_iouring::IoUringRing;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
+
+/// Per-handle io_uring ring slot (Linux only).
+///
+/// Three states:
+/// - `Untried`: no Direct op has run yet; the ring has not been
+///   probed.
+/// - `Active(ring)`: ring construction succeeded; subsequent Direct
+///   ops route through it.
+/// - `Disabled`: ring construction failed (kernel < 5.1, SECCOMP,
+///   container restriction, etc.). Cached so we don't retry on every
+///   op; the Direct path falls through to the existing
+///   `pwrite`+`fdatasync` fallback.
+#[cfg(target_os = "linux")]
+enum IoUringState {
+    Untried,
+    Active(Arc<IoUringRing>),
+    Disabled,
+}
+
 /// Pool configuration captured by [`Builder`] and consumed at
 /// [`Handle`] construction. Held opaquely in the Handle until the
 /// first Direct-method op triggers lazy pool allocation (locked
@@ -113,12 +136,25 @@ pub struct Handle {
     /// once the pool is constructed, leasing is lock-free on the
     /// fast path.
     pool_slot: Mutex<Option<AlignedBufferPool>>,
+    /// Linux-only: requested `io_uring` SQ depth (from
+    /// [`crate::Builder::io_uring_queue_depth`]). Captured at
+    /// construction; consumed by [`Handle::io_uring_ring`] on the
+    /// first Direct-method op.
+    #[cfg(target_os = "linux")]
+    iouring_queue_depth: u32,
+    /// Linux-only: lazy `io_uring` ring slot. `Untried` until the
+    /// first Direct op probes; `Active(...)` or `Disabled` for the
+    /// rest of this Handle's lifetime.
+    #[cfg(target_os = "linux")]
+    iouring_slot: Mutex<IoUringState>,
 }
 
 impl Handle {
     /// Creates a `Handle` from raw components.
     ///
     /// This is `pub(crate)` — external callers use [`crate::Builder`].
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    #[allow(clippy::too_many_arguments)] // every arg is load-bearing handle state — splitting would obscure the struct shape
     pub(crate) fn new_raw(
         configured_method: Method,
         active_method: Method,
@@ -127,6 +163,7 @@ impl Handle {
         sector_size: u32,
         pipeline: Pipeline,
         pool_config: HandleBufferPoolConfig,
+        iouring_queue_depth: u32,
     ) -> Self {
         Self {
             configured_method: AtomicU8::new(configured_method.to_u8()),
@@ -137,6 +174,41 @@ impl Handle {
             pipeline,
             pool_config,
             pool_slot: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            iouring_queue_depth,
+            #[cfg(target_os = "linux")]
+            iouring_slot: Mutex::new(IoUringState::Untried),
+        }
+    }
+
+    /// Returns the per-handle io_uring ring, constructing it on the
+    /// first call. Cached `None` after a construction failure so
+    /// subsequent Direct ops don't retry the syscall.
+    ///
+    /// Linux only. On every other platform the analogous code path
+    /// in `crud/file.rs` is `#[cfg]`-gated and never calls this
+    /// method.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn io_uring_ring(&self) -> Option<Arc<IoUringRing>> {
+        let mut guard = match self.iouring_slot.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match &*guard {
+            IoUringState::Active(r) => return Some(r.clone()),
+            IoUringState::Disabled => return None,
+            IoUringState::Untried => {}
+        }
+        match IoUringRing::new(self.iouring_queue_depth) {
+            Ok(ring) => {
+                let arc = Arc::new(ring);
+                *guard = IoUringState::Active(arc.clone());
+                Some(arc)
+            }
+            Err(_) => {
+                *guard = IoUringState::Disabled;
+                None
+            }
         }
     }
 
@@ -537,6 +609,7 @@ mod tests {
             512,
             Pipeline::new(PipelineConfig::DEFAULT),
             default_pool_config(),
+            128,
         )
     }
 
@@ -584,6 +657,7 @@ mod tests {
             512,
             Pipeline::new(PipelineConfig::DEFAULT),
             default_pool_config(),
+            128,
         );
         assert!(h.use_direct());
         let h2 = make_handle(Method::Sync);
@@ -608,6 +682,7 @@ mod tests {
             512,
             Pipeline::new(PipelineConfig::DEFAULT),
             default_pool_config(),
+            128,
         );
         let resolved = h
             .resolve_path(Path::new("subdir/file.txt"))
@@ -626,6 +701,7 @@ mod tests {
             512,
             Pipeline::new(PipelineConfig::DEFAULT),
             default_pool_config(),
+            128,
         );
         let result = h.resolve_path(Path::new("../../etc/passwd"));
         assert!(result.is_err(), "path escape must be rejected");
@@ -649,6 +725,7 @@ mod tests {
             4096,
             Pipeline::new(PipelineConfig::DEFAULT),
             default_pool_config(),
+            128,
         );
         assert_eq!(h.sector_size(), 4096);
     }
