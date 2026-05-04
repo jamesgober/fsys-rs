@@ -1,28 +1,39 @@
+######################################################
+# FSYS: File System IO for Rust
+# Copyright (c) 2024 James Gober <
+######################################################
 [package]
-name = "fsys"
-version = "0.1.0"
-edition = "2021"
+name    = "fsys"
+version = "0.3.0"
+
+# METADATA
 readme  = "README.md"
 license = "Apache-2.0 OR MIT"
+
+# RUST VERSION
+edition = "2021"
 rust-version = "1.75"
 
-description   = "Adaptive file and directory IO for Rust — fast, hardware-aware, multi-strategy."
+# LINKS
 documentation = "https://docs.rs/fsys"
 repository    = "https://github.com/jamesgober/fsys-rs"
 homepage      = "https://github.com/jamesgober/fsys-rs"
 
-authors = [
-    "James Gober <me@jamesgober.com>"
-]
-
+# INCLUDES
 include = [
     "src/**/*",
+    "tests/**/*",
+    "benches/**/*",
     "Cargo.toml",
     "README.md",
     "LICENSE-APACHE",
     "LICENSE-MIT",
     "CHANGELOG.md",
 ]
+# DESCRIPTION
+description  = "Adaptive file and directory IO for Rust — fast, hardware-aware, multi-strategy."
+
+# KEYWORDS
 keywords = [
     "io", 
     "filesystem", 
@@ -30,35 +41,98 @@ keywords = [
     "durability", 
     "nvme"
 ]
+
+# CATEGORIES
 categories = [
     "filesystem", 
     "hardware-support", 
     "os"
 ]
 
+# AUTHORS
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
 
+
+###########################
+# LIBRARY
+###########################
 [lib]
 name = "fsys"
 path = "src/lib.rs"
 
 
+###########################
+# FEATURES
+###########################
 [features]
 default = []
+async = ["dep:tokio"]
 
 
+###########################
+# DEPENDENCIES
+###########################
 [dependencies]
+tokio = { version = "1", features = ["fs", "rt"], optional = true }
+
+# Syscall wrappers for Unix platforms (Linux, macOS).
+# Required for O_DIRECT, pread/pwrite, fdatasync, F_FULLFSYNC, F_NOCACHE,
+# and platform-specific atomic rename primitives.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", default-features = false }
+
+# Win32 API bindings for Windows IO primitives:
+# CreateFileW (FILE_FLAG_NO_BUFFERING / WRITE_THROUGH), FlushFileBuffers,
+# MoveFileExW, GetDiskFreeSpaceW, ReadFile/WriteFile, SetFilePointerEx.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_System_IO",
+    "Win32_Security",
+] }
 
 
+###########################
+# DEV DEPENDENCIES
+###########################
 [dev-dependencies]
+# Criterion is the standard micro-benchmarking framework for Rust.
+# Used for write/read/method-comparison benchmarks required by the 0.3.0 spec.
+criterion = { version = "0.5", features = ["html_reports"] }
 
 
+###########################
+# BENCHMARKS
+###########################
+[[bench]]
+name    = "single_write"
+harness = false
+
+[[bench]]
+name    = "single_read"
+harness = false
+
+[[bench]]
+name    = "method_comparison"
+harness = false
+
+
+
+###########################
+# PROFILE RELEASE
+###########################
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
-
+###########################
+# PROFILE BENCH
+###########################
 [profile.bench]
 opt-level = 3
 lto = "thin"

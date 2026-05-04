@@ -45,18 +45,19 @@ It exists because the standard library's file IO is general-purpose by design, i
 
 ## Status & roadmap
 
-Current state: **scaffolding only**. The crate compiles; the API surface is empty. Active development is targeting:
+Current state: **early but usable core**. `0.3.0` ships foundational construction
+APIs including `Builder`/`Handle`, file and directory CRUD, metadata,
+platform-specific IO paths, and convenience quick helpers.
 
-- `0.1.x` — [**DEV**]: **Initial Setup** - Project planning and basic setup.
-- `0.2.x` — [**DEV**]: **Scaffolding** - Structure, configuration, and system information.
-- `0.3.x` — [**DEV**]: **Foundation** - Module libraries and base functionality.
-- `0.4.x` — [**DEV**]: **Construction** - IO Pipelines, directory control, and file access.
-- `0.5.x` — [**DEV**]: **Development** - Advanced API and final features.
-- `0.6.x` — [**DEV**]: **Optimization** - Testing, performance tuning, and error hardening.
-- `0.7.x` — [**ALPHA**]: **Completion** - Final adjustments, optimizations, and polishing.
-- `0.8.x` — [**BETA**]: **Public Testing** - Issue tracking, performance monitoring,and patches.
-- `0.9.x` — [**RC**]: **Release Candidate** - Production-ready (pending further issues).
-- `1.0.0` — Stable API - public release.
+- `0.1.x` — [**DONE**]: Initial setup.
+- `0.2.x` — [**DONE**]: Scaffolding and foundation modules.
+- `0.3.x` — [**CURRENT**]: Construction core (CRUD + Handle + cross-platform IO).
+- `0.4.x` — [**NEXT**]: Advanced API refinements and capability expansion.
+- `0.5.x` — [**NEXT**]: Performance tuning, hardening, and broader test coverage.
+- `0.6.x` — [**ALPHA**]: Stabilization and polish.
+- `0.7.x` — [**BETA**]: Public testing and compatibility validation.
+- `0.8.x` — [**RC**]: Release candidate.
+- `1.0.0` — Stable API release.
 
 The roadmap is aspirational, not a schedule. Versions ship when they're right, not when the calendar agrees.
 
@@ -67,7 +68,7 @@ The roadmap is aspirational, not a schedule. Versions ship when they're right, n
 
 ```toml
 [dependencies]
-fsys = "0.1.0"
+fsys = "0.3.0"
 ```
 
 > The crate is published to reserve the name. **Do not depend on it for production work** until at least `0.8.0`.
