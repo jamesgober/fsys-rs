@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-04
+
+### Added
+
+- **Real `io_uring` integration on Linux.** `Method::Direct` writes
+  and reads route through a per-handle io_uring ring (lazy-
+  constructed on the first Direct op via the existing
+  [`Builder::io_uring_queue_depth`] knob). Atomic-replace path
+  submits `Write` + `Fsync(DATASYNC)` SQEs through the ring; reads
+  use a single `Read` SQE.
+- New module [`crate::platform::linux_iouring`] implementing the
+  ring as an owner-thread design: the `io_uring::IoUring` value is
+  owned by a dedicated thread, and submitters forward operations
+  through a bounded `crossbeam_channel`. Caller blocks on a per-op
+  reply channel, which keeps borrowed buffers alive across the
+  syscall. New unit tests
+  (`ring_construction_returns_ring_or_setup_failed`,
+  `write_at_round_trip`, `read_at_round_trip`,
+  `concurrent_submitters_serialise_through_owner`) validate the
+  wrapper on every Linux CI run.
+
+### Fixed
+
+- `tests/foundation.rs::hardware_helpers_return_consistent_data`
+  now accepts drift in `DriveInfo::available_bytes` between two
+  consecutive live probes (free-disk movement on the runner caused
+  CI flakes). Same accommodation that was already in place for
+  `MemoryInfo::available_bytes` since 0.5.0.
+
+### Notes
+
+- `Method::Direct` on Linux now has two execution paths:
+  1. **io_uring** (preferred) — used when `io_uring_setup(2)` and
+     ring construction succeed.
+  2. **`O_DIRECT` + `pwrite` + `fdatasync`** (fallback) — used when
+     the ring is unavailable (kernel < 5.1, SECCOMP/AppArmor block,
+     container restriction, runtime submit failure).
+  Both paths satisfy the same atomic-replace + durability contract;
+  `active_method()` is **not** downgraded for the io_uring fallback
+  alone (this differs from the Mmap fallback per R-2''' in
+  `.dev/DECISIONS-0.5.0.md`).
+- Cached failure: once `IoUringRing::new` fails for a Handle, the
+  ring slot transitions to `Disabled` and subsequent Direct ops
+  skip the construction attempt — they go straight to the
+  `pwrite`+`fdatasync` fallback.
+
+### Internal
+
+- The rustc 1.95 ICE that blocked the 0.5.0 lift was diagnosed as a
+  panic in the `dead_code` (`check_mod_deathness`) analysis pass
+  (`slice index starts at 23 but ends at 21`), specifically when
+  the `linux_iouring` module's items are scanned. Module-level
+  `#![allow(dead_code)]` skips the buggy lint path entirely without
+  affecting correctness — every public item in the module is
+  reachable from `Handle::io_uring_ring`. The owner-thread design
+  is also preserved as the architectural choice for !Sync resources
+  (it generalises to per-thread sharded rings in 0.6.0 without an
+  API break).
+
 ## [0.5.0] - 2026-05-04
 
 ### Added
