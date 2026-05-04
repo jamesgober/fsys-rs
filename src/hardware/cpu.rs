@@ -122,75 +122,16 @@ impl Default for CpuInfo {
     }
 }
 
-/// Runs the foundation-layer CPU probe.
+/// Runs the per-platform CPU probe.
 ///
-/// Reports real `cores_logical` and compile-time CPU features. All
-/// other fields default. Real probing (`is_x86_feature_detected!`,
-/// physical-core counts, per-cache sizes) is deferred to `0.0.5`.
+/// Delegates to the crate-internal `probe::platform::probe_cpu` which
+/// reads `/proc/cpuinfo` + `/sys/devices/system/cpu/.../cache/...`
+/// (Linux), `GetLogicalProcessorInformationEx` (Windows), or
+/// `sysctlbyname` (macOS) for accurate physical-core counts and cache
+/// sizes.
 #[must_use]
 pub(super) fn probe() -> CpuInfo {
-    let cores_logical = detect_cores_logical();
-    CpuInfo {
-        cores_logical,
-        cores_physical: cores_logical,
-        features: detect_compile_time_features(),
-        // TODO(0.0.5): cpuid leaf 0x4 / sysconf(_SC_LEVEL*_*CACHE_*).
-        cache_l1: 0,
-        cache_l2: 0,
-        cache_l3: 0,
-    }
-}
-
-fn detect_cores_logical() -> u32 {
-    // `available_parallelism` is the canonical std-lib answer. It
-    // already accounts for cgroup quotas on Linux and `SetProcess
-    // AffinityMask` on Windows. Saturate on the (impossible) overflow
-    // case and default to 1 if the platform refuses to answer.
-    match std::thread::available_parallelism() {
-        Ok(n) => u32::try_from(n.get()).unwrap_or(u32::MAX),
-        Err(_) => 1,
-    }
-}
-
-fn detect_compile_time_features() -> CpuFeatures {
-    let mut f = CpuFeatures::empty();
-    if cfg!(target_feature = "sse") {
-        f |= CpuFeatures::SSE;
-    }
-    if cfg!(target_feature = "sse2") {
-        f |= CpuFeatures::SSE2;
-    }
-    if cfg!(target_feature = "sse3") {
-        f |= CpuFeatures::SSE3;
-    }
-    if cfg!(target_feature = "ssse3") {
-        f |= CpuFeatures::SSSE3;
-    }
-    if cfg!(target_feature = "sse4.1") {
-        f |= CpuFeatures::SSE4_1;
-    }
-    if cfg!(target_feature = "sse4.2") {
-        f |= CpuFeatures::SSE4_2;
-    }
-    if cfg!(target_feature = "avx") {
-        f |= CpuFeatures::AVX;
-    }
-    if cfg!(target_feature = "avx2") {
-        f |= CpuFeatures::AVX2;
-    }
-    if cfg!(target_feature = "avx512f") {
-        f |= CpuFeatures::AVX512F;
-    }
-    if cfg!(target_feature = "aes") {
-        f |= CpuFeatures::AES;
-    }
-    if cfg!(target_feature = "pclmulqdq") {
-        f |= CpuFeatures::PCLMULQDQ;
-    }
-    if cfg!(target_feature = "neon") {
-        f |= CpuFeatures::NEON;
-    }
-    f
+    super::probe::platform::probe_cpu()
 }
 
 #[cfg(test)]
@@ -244,9 +185,18 @@ mod tests {
 
     #[test]
     fn test_probe_reports_at_least_one_logical_core() {
+        // 0.5.0: probe is real per-platform. Physical and logical
+        // counts differ on SMT/Hyper-Threaded CPUs and only need to
+        // satisfy `physical <= logical` and both `>= 1`.
         let i = probe();
         assert!(i.cores_logical >= 1);
-        assert_eq!(i.cores_physical, i.cores_logical);
+        assert!(i.cores_physical >= 1);
+        assert!(
+            i.cores_physical <= i.cores_logical,
+            "physical cores ({}) cannot exceed logical cores ({})",
+            i.cores_physical,
+            i.cores_logical,
+        );
     }
 
     #[test]

@@ -41,25 +41,33 @@ fn hardware_info_is_populated() {
     // CPU has at least one logical core.
     assert!(hw.cpu.cores_logical >= 1);
     assert!(hw.cpu.cores_physical >= 1);
+    assert!(hw.cpu.cores_physical <= hw.cpu.cores_logical);
 
-    // Drive defaults are stable: probe stubs always return them in
-    // 0.0.2.
-    assert_eq!(hw.drive.queue_depth, 1);
-    assert_eq!(hw.drive.logical_sector, 512);
-    assert_eq!(hw.drive.physical_sector, 4_096);
-    assert!(!hw.drive.plp);
-    assert_eq!(hw.drive.kind, hardware::DriveKind::Unknown);
+    // 0.5.0: drive probe returns real values per platform. We can
+    // only assert basic well-formedness — exact numbers vary by
+    // hardware. Sandboxed environments degrade to defaults.
+    assert!(hw.drive.queue_depth >= 1);
+    assert!(hw.drive.logical_sector >= 512);
+    assert!(hw.drive.physical_sector >= 512);
+    assert_eq!(hw.drive.plp, fsys::hardware::PlpStatus::Unknown); // 0.6.0: real
 
-    // Memory probe is stubbed: zeros are expected in 0.0.2.
-    assert_eq!(hw.memory.total_bytes, 0);
-    assert_eq!(hw.memory.available_bytes, 0);
+    // 0.5.0: memory probe is real on Linux/macOS/Windows. Sandboxed
+    // unknown-platform builds still report zeros.
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    )) {
+        assert!(hw.memory.total_bytes > 0);
+    }
 
-    // IO primitives report platform-derived booleans.
+    // IO primitives report platform-derived booleans. io_uring is
+    // now a real runtime check on Linux (may be true or false
+    // depending on kernel/sandbox).
     let io = hw.io_primitives;
     assert_eq!(io.iocp, cfg!(target_os = "windows"));
     assert!(io.mmap);
-    assert!(!io.io_uring); // 0.0.2: never claims true.
-    assert!(!io.nvme_passthrough); // 0.0.2: never claims true.
+    assert!(!io.nvme_passthrough); // 0.5.0: NVMe IOCTL deferred to 0.6.0.
 }
 
 #[test]
@@ -69,8 +77,11 @@ fn hardware_helpers_return_consistent_data() {
     assert_eq!(*hardware::cpu(), info.cpu);
     assert_eq!(*hardware::io_primitives(), info.io_primitives);
 
-    // memory() is live; in 0.0.2 it returns the same default each call.
-    assert_eq!(hardware::memory(), info.memory);
+    // 0.5.0: memory() is live, so two consecutive calls may differ
+    // slightly (free memory moves under load). Total memory is
+    // stable, so we assert that and accept drift in available.
+    let m_now = hardware::memory();
+    assert_eq!(m_now.total_bytes, info.memory.total_bytes);
 }
 
 #[test]

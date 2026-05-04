@@ -4,7 +4,7 @@
 ######################################################
 [package]
 name    = "fsys"
-version = "0.4.0"
+version = "0.5.0"
 
 # METADATA
 readme  = "README.md"
@@ -87,20 +87,61 @@ tokio = { version = "1", features = ["fs", "rt"], optional = true }
 # is API-stable across the 0.5.x series, and carries no transitive deps.
 crossbeam-channel = "0.5"
 
+# Bounded lock-free `ArrayQueue` for the 0.5.0 per-handle aligned
+# buffer pool. Selected over the `crossbeam` umbrella crate (D-5 in
+# `.dev/DECISIONS-0.5.0.md`): same maintainers and security posture as
+# `crossbeam-channel`, ~2K LOC vs the umbrella's 10–20× larger surface,
+# version-pinnable independently. No transitive deps.
+crossbeam-queue = "0.3"
+
+# Cross-platform memory-mapped IO for `Method::Mmap` (D-6 +
+# `CHANGELOG.md`). The original `memmap` crate is unmaintained;
+# `memmap2` is the maintained successor, widely vetted in production
+# Rust storage projects (RocksDB-rs bindings, sled, etc.). Minimal
+# transitive deps.
+memmap2 = "0.9"
+
 # Syscall wrappers for Unix platforms (Linux, macOS).
 # Required for O_DIRECT, pread/pwrite, fdatasync, F_FULLFSYNC, F_NOCACHE,
 # and platform-specific atomic rename primitives.
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", default-features = false }
 
+# Linux-only: io_uring submission/completion ring for the elite
+# `Method::Direct` path (locked decision #1 in
+# `.dev/DECISIONS-0.5.0.md`). Hard dep on Linux — no Cargo feature
+# flag — with graceful runtime fallback to `O_DIRECT` + `pwrite` +
+# `fdatasync` when `io_uring_setup` fails. Selected over the multiple
+# alternative crates (`io_uring` underscored, `linux-io-uring`, `rio`,
+# `tokio-uring`, `glommio`) per D-1: `io-uring` (tokio-rs) is the
+# canonical low-level binding with no async-runtime opinions, used by
+# quinn, monoio, glommio internally and the Linux kernel test
+# infrastructure. Pure Rust over `libc`, ~zero transitive deps.
+[target.'cfg(target_os = "linux")'.dependencies]
+# Pinned to 0.6.x. The 0.7.x line triggers a known rustc 1.95 ICE
+# (`check_mod_deathness` panic) when the `IoUring` type is wrapped
+# in `std::sync::Mutex` or `RwLock`. 0.6.x is the latest line not
+# affected by this interaction. Re-evaluate when 0.7.y bumps to a
+# fixed rustc.
+io-uring = "0.6"
+
 # Win32 API bindings for Windows IO primitives:
 # CreateFileW (FILE_FLAG_NO_BUFFERING / WRITE_THROUGH), FlushFileBuffers,
 # MoveFileExW, GetDiskFreeSpaceW, ReadFile/WriteFile, SetFilePointerEx.
+# 0.5.0 additionally uses:
+# - IOCTL_STORAGE_QUERY_PROPERTY (StorageDeviceWriteCacheProperty,
+#   StorageAccessAlignmentProperty) for hardware probe.
+# - CreateNamedPipeW for the crash-test harness's deterministic
+#   sync-primitive kill points (D-2).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
+    "Win32_Storage_IscsiDisc",
     "Win32_Foundation",
     "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
     "Win32_Security",
 ] }
 
@@ -145,6 +186,24 @@ harness = false
 name    = "concurrent_batches"
 harness = false
 
+# 0.5.0 method-matrix and per-method workload benchmarks. The
+# `method_payload_matrix` is the canonical regression surface
+# (4 methods × 4 payloads × 4 ops). `mmap_workloads` validates the
+# Mmap suitability fallback (R-2'') and the page-aligned fast path.
+# `direct_iouring` is the post-stub baseline for `Method::Direct` —
+# re-run after the io_uring path is unstubbed in 0.5.x to measure
+# the io_uring uplift.
+[[bench]]
+name    = "method_payload_matrix"
+harness = false
+
+[[bench]]
+name    = "mmap_workloads"
+harness = false
+
+[[bench]]
+name    = "direct_iouring"
+harness = false
 
 
 ###########################

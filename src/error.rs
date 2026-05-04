@@ -152,6 +152,67 @@ pub enum Error {
     /// (BackpressureMode::Error)`) that has not landed yet. Match it to
     /// satisfy exhaustiveness even though it cannot occur today.
     QueueFull,
+
+    /// `io_uring_setup(2)` failed when constructing a per-handle ring.
+    ///
+    /// **Code:** `FS-00011`. Caller action: the Linux Direct path's
+    /// io_uring branch is unavailable for this handle; fsys silently
+    /// falls back to the `O_DIRECT` + `pwrite` + `fdatasync` path
+    /// (locked decision #1 in `.dev/DECISIONS-0.5.0.md`). The fallback
+    /// is observable via [`crate::Handle::active_method`]. This variant
+    /// surfaces only when a caller explicitly requests ring diagnostics
+    /// — normal handle creation does not return it. Common causes:
+    /// kernel < 5.1, `io_uring_setup` disabled by a security profile
+    /// (SECCOMP, AppArmor), container runtime restrictions.
+    IoUringSetupFailed {
+        /// Underlying `io::Error` returned by the failing `io_uring_setup`
+        /// (or equivalent) syscall.
+        source: std::io::Error,
+    },
+
+    /// A memory-mapped IO operation failed.
+    ///
+    /// **Code:** `FS-00012`. Caller action: when emitted from
+    /// [`crate::Method::Mmap`] write/read paths, fsys has already
+    /// attempted the documented fallback to [`crate::Method::Sync`].
+    /// This variant surfaces only when fallback also fails — typically
+    /// because the underlying file is on a filesystem that rejects both
+    /// `mmap` and standard `write` (rare; usually a pseudo-filesystem
+    /// like `procfs`).
+    MmapFailed {
+        /// Human-readable explanation of what failed (mapping creation,
+        /// `msync`, page-size alignment, etc.).
+        reason: String,
+    },
+
+    /// The per-handle aligned buffer pool is exhausted and a
+    /// non-blocking lease was rejected.
+    ///
+    /// **Code:** `FS-00013`. **Reserved variant — never emitted in
+    /// `0.5.0`.** Default lease semantics block until a buffer is
+    /// returned to the pool (mirrors the bounded-queue blocking-submit
+    /// contract from `0.4.0` decision #4). This variant is reserved
+    /// for a future opt-in error-mode (e.g.
+    /// `Builder::buffer_pool_mode(BufferPoolMode::Error)`). Match it
+    /// to satisfy exhaustiveness even though it cannot occur today.
+    BufferPoolExhausted,
+
+    /// A PLP (Power Loss Protection) probe failed or is unavailable on
+    /// this platform.
+    ///
+    /// **Code:** `FS-00014`. **Informational variant — `0.5.0`'s
+    /// public API does not return it.** Per locked decision #3, PLP
+    /// probe failures degrade [`crate::hardware::DriveInfo::plp`] to
+    /// `Unknown` and log via the metrics placeholder; they do not fail
+    /// handle creation. The variant exists in the enum so a future
+    /// `probe_plp() -> Result<bool>` API can surface the underlying
+    /// reason on request (out of scope for `0.5.0` per follow-up F-8
+    /// in `.dev/DECISIONS-0.5.0.md`).
+    PlpDetectionUnavailable {
+        /// Human-readable explanation: missing capability, unsupported
+        /// platform, IOCTL failure, etc.
+        detail: String,
+    },
 }
 
 impl Error {
@@ -182,6 +243,10 @@ impl Error {
             Error::PartialDirectoryOp { .. } => "FS-00008",
             Error::ShutdownInProgress => "FS-00009",
             Error::QueueFull => "FS-00010",
+            Error::IoUringSetupFailed { .. } => "FS-00011",
+            Error::MmapFailed { .. } => "FS-00012",
+            Error::BufferPoolExhausted => "FS-00013",
+            Error::PlpDetectionUnavailable { .. } => "FS-00014",
         }
     }
 }
@@ -254,6 +319,22 @@ impl fmt::Display for Error {
                     self.code()
                 )
             }
+            Error::IoUringSetupFailed { source } => {
+                write!(f, "[{}] io_uring_setup failed: {}", self.code(), source)
+            }
+            Error::MmapFailed { reason } => {
+                write!(f, "[{}] mmap operation failed: {}", self.code(), reason)
+            }
+            Error::BufferPoolExhausted => {
+                write!(
+                    f,
+                    "[{}] aligned buffer pool exhausted (reserved variant; never emitted in 0.5.0)",
+                    self.code()
+                )
+            }
+            Error::PlpDetectionUnavailable { detail } => {
+                write!(f, "[{}] PLP detection unavailable: {}", self.code(), detail)
+            }
         }
     }
 }
@@ -263,6 +344,7 @@ impl std::error::Error for Error {
         match self {
             Error::Io(e) => Some(e),
             Error::AtomicReplaceFailed { source, .. } => Some(source),
+            Error::IoUringSetupFailed { source } => Some(source),
             Error::InvalidPath { .. }
             | Error::HardwareProbeFailed { .. }
             | Error::UnsupportedPlatform { .. }
@@ -270,7 +352,10 @@ impl std::error::Error for Error {
             | Error::AlignmentRequired { .. }
             | Error::PartialDirectoryOp { .. }
             | Error::ShutdownInProgress
-            | Error::QueueFull => None,
+            | Error::QueueFull
+            | Error::MmapFailed { .. }
+            | Error::BufferPoolExhausted
+            | Error::PlpDetectionUnavailable { .. } => None,
         }
     }
 }
@@ -641,5 +726,105 @@ mod tests {
         };
         let unboxed: Box<Error> = be.into_inner();
         assert_eq!(unboxed.code(), "FS-00009");
+    }
+
+    // ── 0.5.0 additions ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_error_code_io_uring_setup_failed_returns_fs00011() {
+        let err = Error::IoUringSetupFailed {
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        };
+        assert_eq!(err.code(), "FS-00011");
+    }
+
+    #[test]
+    fn test_error_display_io_uring_setup_failed_includes_source() {
+        let err = Error::IoUringSetupFailed {
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        };
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00011]"));
+        assert!(s.contains("io_uring_setup"));
+    }
+
+    #[test]
+    fn test_error_source_io_uring_setup_failed_returns_inner() {
+        let err = Error::IoUringSetupFailed {
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        };
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn test_error_code_mmap_failed_returns_fs00012() {
+        let err = Error::MmapFailed {
+            reason: "page-size alignment failed".into(),
+        };
+        assert_eq!(err.code(), "FS-00012");
+    }
+
+    #[test]
+    fn test_error_display_mmap_failed_includes_reason() {
+        let err = Error::MmapFailed {
+            reason: "fallback to Sync also failed on procfs".into(),
+        };
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00012]"));
+        assert!(s.contains("procfs"));
+    }
+
+    #[test]
+    fn test_error_source_mmap_failed_returns_none() {
+        let err = Error::MmapFailed {
+            reason: "test".into(),
+        };
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_error_code_buffer_pool_exhausted_returns_fs00013() {
+        let err = Error::BufferPoolExhausted;
+        assert_eq!(err.code(), "FS-00013");
+    }
+
+    #[test]
+    fn test_error_display_buffer_pool_exhausted_marked_reserved() {
+        let err = Error::BufferPoolExhausted;
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00013]"));
+        assert!(s.to_ascii_lowercase().contains("reserved"));
+    }
+
+    #[test]
+    fn test_error_source_buffer_pool_exhausted_returns_none() {
+        let err = Error::BufferPoolExhausted;
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_error_code_plp_detection_unavailable_returns_fs00014() {
+        let err = Error::PlpDetectionUnavailable {
+            detail: "CAP_SYS_ADMIN required".into(),
+        };
+        assert_eq!(err.code(), "FS-00014");
+    }
+
+    #[test]
+    fn test_error_display_plp_detection_unavailable_includes_detail() {
+        let err = Error::PlpDetectionUnavailable {
+            detail: "IOKit property missing".into(),
+        };
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00014]"));
+        assert!(s.contains("IOKit property missing"));
+    }
+
+    #[test]
+    fn test_error_source_plp_detection_unavailable_returns_none() {
+        let err = Error::PlpDetectionUnavailable {
+            detail: "test".into(),
+        };
+        assert!(std::error::Error::source(&err).is_none());
     }
 }

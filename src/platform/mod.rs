@@ -26,6 +26,13 @@ mod linux;
 #[cfg(target_os = "linux")]
 use linux as imp;
 
+// io_uring wrapper — Linux only. Lazy-init per-Handle ring used by
+// `Method::Direct`'s elite path (locked decision #1 in
+// `.dev/DECISIONS-0.5.0.md`). Falls back to `pwrite` + `fdatasync`
+// when `io_uring_setup(2)` is unavailable.
+#[cfg(target_os = "linux")]
+pub(crate) mod linux_iouring;
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]

@@ -36,6 +36,21 @@ impl Handle {
     ///   fails.
     pub fn write(&self, path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
         let path = self.resolve_path(path.as_ref())?;
+
+        // 0.5.0: route Method::Mmap through the mmap atomic-replace
+        // path when the payload is suitable. Sub-page payloads (and
+        // zero-length writes) fall back permanently to Sync per
+        // R-2'' in `.dev/DECISIONS-0.5.0.md`. The fallback updates
+        // the Handle's active_method so subsequent ops on this
+        // Handle take the Sync path directly without the
+        // suitability check.
+        if self.active_method() == Method::Mmap {
+            if crate::method::mmap::is_suitable_for_write(data.len()) {
+                return crate::method::mmap::write(&path, data);
+            }
+            self.update_active_method(Method::Sync);
+        }
+
         let temp = Self::gen_temp_path(&path);
 
         // Step 1: open the temp file.
@@ -161,6 +176,22 @@ impl Handle {
     /// - [`Error::Io`] on any IO error.
     pub fn read(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
         let path = self.resolve_path(path.as_ref())?;
+
+        // 0.5.0: Method::Mmap reads consult metadata first to check
+        // suitability. Files smaller than the page size, zero-byte
+        // files, and non-regular files (sockets/pipes/FIFOs) cause a
+        // permanent fallback to Sync per R-2'' in
+        // `.dev/DECISIONS-0.5.0.md`.
+        if self.active_method() == Method::Mmap {
+            let suitable = std::fs::metadata(&path)
+                .map(|m| crate::method::mmap::is_suitable_for_read(&m))
+                .unwrap_or(false);
+            if suitable {
+                return crate::method::mmap::read(&path);
+            }
+            self.update_active_method(Method::Sync);
+        }
+
         let (file, direct_ok) = platform::open_read(&path, self.use_direct())?;
 
         if self.use_direct() && !direct_ok {

@@ -1,14 +1,11 @@
-//! Storage-device probe.
+//! Storage-device probe — public types + delegation to per-platform
+//! implementations.
 //!
-//! Real device interrogation (NVMe Identify, sector-size lookup, PLP
-//! detection, capacity probing) requires platform-specific syscalls
-//! and IOCTLs that fsys does not yet pull in. The `0.0.2` foundation
-//! returns a [`DriveInfo`] populated with conservative, universally
-//! safe defaults so the rest of the crate can rely on the struct
-//! always being shaped correctly.
-//!
-//! Real probing lands in `0.0.5`; each deferred field is marked with a
-//! `TODO(0.0.5)` comment.
+//! 0.5.0 replaces the 0.2.0 stubs with real probes implemented in
+//! the crate-internal `probe` module (Linux: `/sys/block/`; Windows:
+//! Win32 file APIs; macOS: `statvfs` + sysctl). PLP detection is
+//! best-effort with `Unknown` returned when reliability cannot be
+//! established — see [`super::PlpStatus`] for the rationale.
 
 /// Coarse classification of the storage device.
 ///
@@ -44,17 +41,20 @@ impl DriveKind {
 
 /// Snapshot of the storage device fsys currently sees.
 ///
-/// All fields are populated with conservative defaults in `0.0.2`.
-/// Real values arrive in `0.0.5` once the per-platform device probes
-/// land. The struct is shaped final — only the values change.
+/// 0.5.0 populates these fields from real per-platform probes
+/// (the crate-internal `probe` module) rather than the 0.2.0 stub
+/// defaults. The probe
+/// runs once per process (cached via [`super::info`]) and never fails
+/// the handle — fields the probe couldn't determine fall back to the
+/// values returned by [`DriveInfo::default`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriveInfo {
     /// Coarse drive classification.
     pub kind: DriveKind,
-    /// Whether the device has Power Loss Protection (a battery / cap
-    /// that lets the controller flush its cache on power loss).
-    /// Defaults to `false` until probed.
-    pub plp: bool,
+    /// Power Loss Protection status as a tri-state. `Unknown` is the
+    /// honest answer when the probe cannot reliably determine PLP
+    /// (see [`super::PlpStatus`] for full rationale).
+    pub plp: super::PlpStatus,
     /// Logical sector size in bytes. `512` is the safest default and
     /// is reported by every commodity device at the OS level even
     /// when the underlying physical sector is `4096`.
@@ -78,7 +78,7 @@ impl Default for DriveInfo {
     fn default() -> Self {
         Self {
             kind: DriveKind::Unknown,
-            plp: false,
+            plp: super::PlpStatus::Unknown,
             logical_sector: 512,
             physical_sector: 4_096,
             optimal_block: 65_536,
@@ -89,19 +89,13 @@ impl Default for DriveInfo {
     }
 }
 
-/// Runs the foundation-layer drive probe.
+/// Runs the per-platform drive probe.
 ///
-/// Always returns the [`DriveInfo`] default in `0.0.2`. Real
-/// platform-specific probing (NVMe Identify on Linux, IOCTL on
-/// Windows, IOKit on macOS) is implemented in `0.0.5`.
+/// Delegates to the crate-internal `probe::platform::probe_drive`.
+/// The probe never panics; failures degrade to [`DriveInfo::default`].
 #[must_use]
 pub(super) fn probe() -> DriveInfo {
-    // TODO(0.0.5): replace with real per-platform probes.
-    //  - Linux: open the block device under /sys/block, parse queue
-    //    parameters, issue NVMe Identify via ioctl when applicable.
-    //  - Windows: DeviceIoControl with IOCTL_STORAGE_QUERY_PROPERTY.
-    //  - macOS: IOKit IORegistry queries.
-    DriveInfo::default()
+    super::probe::platform::probe_drive()
 }
 
 #[cfg(test)]
@@ -134,8 +128,8 @@ mod tests {
     }
 
     #[test]
-    fn test_default_plp_is_false() {
-        assert!(!DriveInfo::default().plp);
+    fn test_default_plp_is_unknown() {
+        assert_eq!(DriveInfo::default().plp, super::super::PlpStatus::Unknown);
     }
 
     #[test]
@@ -147,7 +141,16 @@ mod tests {
     }
 
     #[test]
-    fn test_probe_matches_default_in_foundation_phase() {
-        assert_eq!(probe(), DriveInfo::default());
+    fn test_probe_returns_well_formed_info() {
+        // 0.5.0: probe is real per-platform. We cannot assert exact
+        // values (they vary by hardware), but we can assert basic
+        // well-formedness: sector sizes are at least 512, queue depth
+        // is at least 1, and any reported total/available capacity is
+        // non-zero on a real machine (degrades to default in
+        // sandboxed CI without /sys/proc access — accept either).
+        let info = probe();
+        assert!(info.logical_sector >= 512);
+        assert!(info.physical_sector >= 512);
+        assert!(info.queue_depth >= 1);
     }
 }
