@@ -10,7 +10,6 @@
 
 use crate::{Error, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 
