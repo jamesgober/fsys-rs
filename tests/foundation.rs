@@ -73,13 +73,23 @@ fn hardware_info_is_populated() {
 #[test]
 fn hardware_helpers_return_consistent_data() {
     let info = hardware::info();
-    assert_eq!(*hardware::drive(), info.drive);
     assert_eq!(*hardware::cpu(), info.cpu);
     assert_eq!(*hardware::io_primitives(), info.io_primitives);
 
-    // 0.5.0: memory() is live, so two consecutive calls may differ
-    // slightly (free memory moves under load). Total memory is
-    // stable, so we assert that and accept drift in available.
+    // 0.5.0: probes are live, so two consecutive calls may differ
+    // slightly in the bytes-available fields (free disk / free memory
+    // move while tests run on the host). Assert the stable
+    // identification + capacity fields and accept drift in the
+    // available counters.
+    let d_now = hardware::drive();
+    assert_eq!(d_now.kind, info.drive.kind);
+    assert_eq!(d_now.plp, info.drive.plp);
+    assert_eq!(d_now.logical_sector, info.drive.logical_sector);
+    assert_eq!(d_now.physical_sector, info.drive.physical_sector);
+    assert_eq!(d_now.optimal_block, info.drive.optimal_block);
+    assert_eq!(d_now.queue_depth, info.drive.queue_depth);
+    assert_eq!(d_now.total_bytes, info.drive.total_bytes);
+
     let m_now = hardware::memory();
     assert_eq!(m_now.total_bytes, info.memory.total_bytes);
 }
