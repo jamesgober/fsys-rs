@@ -29,7 +29,7 @@
 //! - Async-runtime integration (this is a synchronous core; async wrappers
 //!   may live in a separate crate).
 
-#![doc(html_root_url = "https://docs.rs/fsys/0.0.1")]
+#![doc(html_root_url = "https://docs.rs/fsys/0.1.0")]
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(rust_2018_idioms)]

@@ -3,7 +3,7 @@ name = "fsys"
 version = "0.1.0"
 edition = "2021"
 readme  = "README.md"
-license = "APACHE-2.0 OR MIT"
+license = "Apache-2.0 OR MIT"
 rust-version = "1.75"
 
 description   = "Adaptive file and directory IO for Rust — fast, hardware-aware, multi-strategy."
