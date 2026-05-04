@@ -8,7 +8,7 @@
 
 use crate::{Error, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 
@@ -174,7 +174,10 @@ pub(crate) fn write_at(file: &File, offset: u64, data: &[u8]) -> Result<()> {
 
 pub(crate) fn read_all(file: &File) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    (&*file).read_to_end(&mut buf).map_err(Error::Io)?;
+    // `read_to_end` returns the byte count, redundant with `buf.len()`
+    // once the call returns; explicit `_` discard satisfies
+    // `unused_results`.
+    let _ = (&*file).read_to_end(&mut buf).map_err(Error::Io)?;
     Ok(buf)
 }
 
