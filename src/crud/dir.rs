@@ -186,24 +186,26 @@ impl Handle {
         self.exists(path)
     }
 
-    /// Walks the directory at `path`, returning every entry.
+    /// Walks the directory at `path` non-recursively, returning
+    /// every immediate entry.
     ///
-    /// When `recursive` is `false`, this is equivalent to
-    /// [`Handle::list`]. When `recursive` is `true`, descendants are
-    /// included. Order is OS-dependent; do not rely on it.
+    /// Equivalent to [`Handle::list`] but with the `_all` /
+    /// non-`_all` naming pair that runs throughout fsys's
+    /// directory API ([`mkdir`](Handle::mkdir) /
+    /// [`mkdir_all`](Handle::mkdir_all) etc.). Use
+    /// [`Handle::scan_all`] for the recursive variant.
     ///
-    /// Symlinks are **not** followed in `0.6.0`. Symlink-following as
-    /// an opt-in option is filed as F-14 for `0.7.0+` (see
-    /// `.dev/DECISIONS-0.6.0.md`).
+    /// Renamed from `scan(path, recursive: bool)` in `0.7.0` per
+    /// the API audit (see `.dev/API-AUDIT-0.7.0.md` H.5
+    /// reconciliation #3).
+    ///
+    /// Order is OS-dependent; do not rely on it. Symlinks are
+    /// **not** followed.
     ///
     /// # Errors
     ///
     /// - [`Error::InvalidPath`] if `path` escapes the handle root.
     /// - [`Error::Io`] if the root directory cannot be read.
-    /// - [`Error::PartialDirectoryOp`] if a recursive walk fails part-
-    ///   way through (e.g. permission denied on a subdirectory). The
-    ///   variant carries the entries enumerated successfully before
-    ///   the failure.
     ///
     /// # Examples
     ///
@@ -211,16 +213,53 @@ impl Handle {
     /// use fsys::builder;
     ///
     /// let fs = builder().build()?;
-    /// let entries = fs.scan("/var/log", true)?;
+    /// let entries = fs.scan("/var/log")?;
     /// for e in entries {
     ///     println!("{}", e.path.display());
     /// }
     /// # Ok::<(), fsys::Error>(())
     /// ```
-    pub fn scan(&self, path: impl AsRef<Path>, recursive: bool) -> Result<Vec<DirEntry>> {
+    pub fn scan(&self, path: impl AsRef<Path>) -> Result<Vec<DirEntry>> {
         let root = self.resolve_path(path.as_ref())?;
         let mut out: Vec<DirEntry> = Vec::new();
-        scan_into(&root, recursive, &mut out)?;
+        scan_into(&root, false, &mut out)?;
+        Ok(out)
+    }
+
+    /// Recursively walks the directory tree at `path`, returning
+    /// every entry (immediate children + all descendants).
+    ///
+    /// Recursive variant of [`Handle::scan`]. Order is OS-dependent;
+    /// do not rely on it. Symlinks are **not** followed.
+    ///
+    /// New in `0.7.0` (split out of the previous
+    /// `scan(path, recursive)` per API-audit reconciliation #3).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidPath`] if `path` escapes the handle root.
+    /// - [`Error::Io`] if the root directory cannot be read.
+    /// - [`Error::PartialDirectoryOp`] if a recursive walk fails
+    ///   part-way through (e.g. permission denied on a
+    ///   subdirectory). The variant carries the entries enumerated
+    ///   successfully before the failure.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use fsys::builder;
+    ///
+    /// let fs = builder().build()?;
+    /// let all_entries = fs.scan_all("/var/log")?;
+    /// for e in all_entries {
+    ///     println!("{}", e.path.display());
+    /// }
+    /// # Ok::<(), fsys::Error>(())
+    /// ```
+    pub fn scan_all(&self, path: impl AsRef<Path>) -> Result<Vec<DirEntry>> {
+        let root = self.resolve_path(path.as_ref())?;
+        let mut out: Vec<DirEntry> = Vec::new();
+        scan_into(&root, true, &mut out)?;
         Ok(out)
     }
 
@@ -231,6 +270,22 @@ impl Handle {
     /// the [`glob`](https://docs.rs/glob) crate. Patterns that
     /// escape the base directory (e.g. `../../etc/passwd`) are
     /// rejected with [`Error::InvalidPath`].
+    ///
+    /// # Recursion semantics
+    ///
+    /// **`find` recurses based on the pattern itself, not a flag.**
+    /// This is intentionally asymmetric with [`Handle::scan`] /
+    /// [`Handle::scan_all`] and [`Handle::count`] /
+    /// [`Handle::count_all`] (which split flat vs. recursive into
+    /// distinct methods). Glob patterns express recursion natively
+    /// via `**`, so a recursive flag would be redundant:
+    ///
+    /// - `*.log` — immediate children only (non-recursive).
+    /// - `**/*.log` — every `.log` under the tree (recursive).
+    /// - `sub/**/*.log` — every `.log` under the `sub/` subtree.
+    ///
+    /// If you want "every entry under this tree" without filtering,
+    /// use [`Handle::scan_all`] instead of `find("**")`.
     ///
     /// Symlinks are not followed in `0.6.0`.
     ///
@@ -300,11 +355,15 @@ impl Handle {
         Ok(out)
     }
 
-    /// Counts the number of regular files within `path`.
+    /// Counts the number of regular files immediately within
+    /// `path` (non-recursive).
     ///
-    /// Implemented in terms of [`Handle::scan`] with a counter — no
-    /// separate optimised path. Cost is O(file count). When
-    /// `recursive` is `true`, descendants are counted.
+    /// Implemented in terms of [`Handle::scan`] with a filter.
+    /// Cost is O(immediate-child count).
+    ///
+    /// Renamed from `count(path, recursive: bool)` in `0.7.0` per
+    /// the API audit reconciliation. Use [`Handle::count_all`] for
+    /// the recursive variant.
     ///
     /// # Errors
     ///
@@ -316,12 +375,39 @@ impl Handle {
     /// use fsys::builder;
     ///
     /// let fs = builder().build()?;
-    /// let n = fs.count("/var/log", true)?;
-    /// println!("log tree has {} files", n);
+    /// let n = fs.count("/var/log")?;
+    /// println!("immediate children of /var/log: {n}");
     /// # Ok::<(), fsys::Error>(())
     /// ```
-    pub fn count(&self, path: impl AsRef<Path>, recursive: bool) -> Result<usize> {
-        let entries = self.scan(path, recursive)?;
+    pub fn count(&self, path: impl AsRef<Path>) -> Result<usize> {
+        let entries = self.scan(path)?;
+        Ok(entries.iter().filter(|e| e.is_file).count())
+    }
+
+    /// Recursively counts every regular file at or below `path`.
+    ///
+    /// Implemented in terms of [`Handle::scan_all`] with a filter.
+    /// Cost is O(total-file count under `path`).
+    ///
+    /// New in `0.7.0` (split out of the previous
+    /// `count(path, recursive)` per API-audit reconciliation).
+    ///
+    /// # Errors
+    ///
+    /// - Same as [`Handle::scan_all`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use fsys::builder;
+    ///
+    /// let fs = builder().build()?;
+    /// let n = fs.count_all("/var/log")?;
+    /// println!("log tree has {n} files (recursive)");
+    /// # Ok::<(), fsys::Error>(())
+    /// ```
+    pub fn count_all(&self, path: impl AsRef<Path>) -> Result<usize> {
+        let entries = self.scan_all(path)?;
         Ok(entries.iter().filter(|e| e.is_file).count())
     }
 }

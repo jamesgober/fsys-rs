@@ -166,6 +166,7 @@ pub(crate) mod pipeline;
 pub(crate) mod platform;
 pub mod primitive;
 pub mod quick;
+pub mod substrate;
 
 #[cfg(feature = "async")]
 pub mod async_io;
@@ -177,6 +178,7 @@ pub use crate::handle::Handle;
 pub use crate::meta::{DirEntry, FileMeta, Permissions};
 pub use crate::method::Method;
 pub use crate::path::Mode;
+pub use crate::substrate::AsyncSubstrate;
 
 /// Creates a default [`Handle`] using [`Method::Auto`] and no root scope.
 ///

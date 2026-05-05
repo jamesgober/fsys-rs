@@ -91,10 +91,34 @@ pub(crate) fn probe_drive() -> DriveInfo {
         info.available_bytes = avail;
     }
 
-    // PLP — see crate-level docs; deferred to 0.6.0.
-    let _: PlpStatus = PlpStatus::Unknown;
+    // PLP detection (0.7.0 R-2 in `.dev/DECISIONS-0.7.0.md`):
+    // lookup-table over `vendor` + `model` from sysfs. False
+    // positives are conservatively avoided; false negatives stay
+    // `Unknown` (which costs performance, not correctness — the
+    // Auto ladder picks `Direct + fdatasync` instead of
+    // `Direct + NVMe FLUSH`).
+    info.plp = probe_plp_linux(&block_dir);
 
     info
+}
+
+/// Reads `vendor` and `model` from sysfs and consults the
+/// `crate::hardware::plp` lookup table. Returns
+/// [`PlpStatus::Unknown`] on any error or table miss.
+///
+/// On NVMe drives, `vendor`/`model` live at
+/// `/sys/block/.../device/{vendor,model}` (the device subdirectory
+/// under the block dir). For SATA/SCSI devices the same paths
+/// apply via the SCSI subsystem.
+fn probe_plp_linux(block_dir: &std::path::Path) -> PlpStatus {
+    let device_dir = block_dir.join("device");
+    let vendor = std::fs::read_to_string(device_dir.join("vendor"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let model = std::fs::read_to_string(device_dir.join("model"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    crate::hardware::plp::lookup_table(&vendor, &model)
 }
 
 fn classify_drive_kind(dev_name: &str, rotational: u32) -> DriveKind {

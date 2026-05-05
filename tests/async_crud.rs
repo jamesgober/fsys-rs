@@ -74,7 +74,7 @@ async fn write_at_async_overlays_at_offset() {
 }
 
 #[tokio::test]
-async fn read_range_async_returns_subslice() {
+async fn read_at_async_returns_subslice() {
     let path = tmp_path("range");
     let _g = Cleanup(path.clone());
 
@@ -86,9 +86,9 @@ async fn read_range_async_returns_subslice() {
 
     let slice = fs
         .clone()
-        .read_range_async(&path, 3, 4)
+        .read_at_async(&path, 3, 4)
         .await
-        .expect("read_range");
+        .expect("read_at");
     assert_eq!(slice, b"defg");
 }
 
@@ -254,13 +254,13 @@ async fn scan_find_count_async() {
 
     let fs = Arc::new(builder().build().expect("handle"));
 
-    let scanned = fs.clone().scan_async(&dir, true).await.expect("scan");
+    let scanned = fs.clone().scan_all_async(&dir).await.expect("scan_all");
     assert_eq!(scanned.iter().filter(|e| e.is_file).count(), 3);
 
     let logs = fs.clone().find_async(&dir, "**/*.log").await.expect("find");
     assert_eq!(logs.len(), 2);
 
-    let count = fs.clone().count_async(&dir, true).await.expect("count");
+    let count = fs.clone().count_all_async(&dir).await.expect("count_all");
     assert_eq!(count, 3);
 }
 

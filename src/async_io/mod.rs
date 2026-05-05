@@ -43,6 +43,12 @@ pub mod crud_dir;
 pub mod crud_file;
 pub mod quick;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod completion_driver;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod iouring_substrate;
+
 /// Returns an [`crate::Error::AsyncRuntimeRequired`] error when the
 /// caller invokes an `_async` method outside a tokio runtime.
 ///

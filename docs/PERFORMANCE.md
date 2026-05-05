@@ -1,4 +1,10 @@
-# Performance
+<h1 align="center">
+  <img width="99" alt="Rust logo" src="https://raw.githubusercontent.com/jamesgober/rust-collection/72baabd71f00e14aa9184efcb16fa3deddda3a0a/assets/rust-logo.svg">
+  <br>
+  <code>FSYS &plus; RUST</code>
+  <br>
+  PERFORMANCE
+</h1>
 
 fsys is designed for predictable latency on storage-engine
 workloads. Numbers below are floor targets — values lower than
@@ -79,9 +85,9 @@ Soak success criteria:
 - `io_uring_queue_depth(u32)` — Linux io_uring SQ depth. Default
   128. Higher depths help when the workload has many in-flight
   ops; lower depths reduce kernel memory.
-- `buffer_pool_size(usize)` — number of aligned buffers in the
+- `buffer_pool_count(usize)` — number of aligned buffers in the
   per-handle pool. Default 64.
-- `buffer_pool_block(usize)` — size of each buffer (in bytes,
+- `buffer_pool_block_size(usize)` — size of each buffer (in bytes,
   rounded up to the probed sector size). Default 4096.
 - `batch_window_ms(u64)`, `batch_size_max(usize)`,
   `batch_queue_max(usize)` — group-lane dispatcher knobs from 0.4.0.

@@ -12,6 +12,18 @@
 //! spawned lazily on the first batch submission and shut down cleanly
 //! when the `Handle` is dropped — idle handles cost zero threads.
 
+// rustc 1.95 ICE workaround (extension of the 0.5.1 + 0.7.0
+// `linux_iouring.rs` / `completion_driver.rs` pattern). The
+// `async_iouring_slot: Mutex<AsyncIoUringState>` field references
+// `AsyncIoUring`, which transitively touches `io_uring::IoUring`;
+// the dead-code analysis pass on this module then ICEs with
+// `slice index starts at N but ends at M`. Module-level allow
+// skips the buggy lint without affecting correctness — every
+// public item here is live by definition (it's the public Handle
+// API). Filed as part of the io_uring blocker record in
+// `.dev/DECISIONS-0.5.0.md`.
+#![allow(dead_code)]
+
 use crate::batch::Batch;
 use crate::buffer::AlignedBufferPool;
 use crate::error::BatchError;
@@ -28,6 +40,9 @@ use std::sync::Mutex;
 use crate::platform::linux_iouring::{IoUringRing, NvmeAccess};
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
+
+#[cfg(all(target_os = "linux", feature = "async"))]
+use crate::async_io::completion_driver::AsyncIoUring;
 
 #[cfg(target_os = "windows")]
 use crate::platform::windows_nvme::NvmeAccess as WinNvmeAccess;
@@ -64,6 +79,19 @@ enum IoUringState {
 enum NvmeState {
     Untried,
     Active(Arc<NvmeAccess>),
+    Disabled,
+}
+
+/// Per-handle native async io_uring substrate slot (Linux + async
+/// feature only). Same three-state pattern. Constructed on the
+/// first async Direct op. Once `Disabled`, the substrate caches
+/// the failure and async ops fall through to `spawn_blocking`.
+///
+/// New in `0.7.0`.
+#[cfg(all(target_os = "linux", feature = "async"))]
+enum AsyncIoUringState {
+    Untried,
+    Active(Arc<AsyncIoUring>),
     Disabled,
 }
 
@@ -191,6 +219,10 @@ pub struct Handle {
     /// resolved volume root (handles are reopened per-op).
     #[cfg(target_os = "windows")]
     nvme_slot_win: Mutex<NvmeStateWin>,
+    /// Linux + `async` feature only: lazy native io_uring async
+    /// substrate slot. New in `0.7.0`.
+    #[cfg(all(target_os = "linux", feature = "async"))]
+    async_iouring_slot: Mutex<AsyncIoUringState>,
 }
 
 impl Handle {
@@ -226,6 +258,40 @@ impl Handle {
             nvme_slot: Mutex::new(NvmeState::Untried),
             #[cfg(target_os = "windows")]
             nvme_slot_win: Mutex::new(NvmeStateWin::Untried),
+            #[cfg(all(target_os = "linux", feature = "async"))]
+            async_iouring_slot: Mutex::new(AsyncIoUringState::Untried),
+        }
+    }
+
+    /// Returns the per-handle native async io_uring substrate,
+    /// constructing it on first call. Cached `None` after a
+    /// construction failure so subsequent native-substrate
+    /// submissions don't retry the syscall every op.
+    ///
+    /// Linux + `async` feature only. Must be called from inside a
+    /// tokio runtime context (the constructor spawns the
+    /// completion-driver task on the current runtime).
+    #[cfg(all(target_os = "linux", feature = "async"))]
+    pub(crate) fn async_io_uring(&self) -> Option<Arc<AsyncIoUring>> {
+        let mut guard = match self.async_iouring_slot.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match &*guard {
+            AsyncIoUringState::Active(a) => return Some(a.clone()),
+            AsyncIoUringState::Disabled => return None,
+            AsyncIoUringState::Untried => {}
+        }
+        match AsyncIoUring::new(self.iouring_queue_depth) {
+            Ok(ring) => {
+                let arc = Arc::new(ring);
+                *guard = AsyncIoUringState::Active(arc.clone());
+                Some(arc)
+            }
+            Err(_) => {
+                *guard = AsyncIoUringState::Disabled;
+                None
+            }
         }
     }
 
@@ -413,6 +479,86 @@ impl Handle {
         }
     }
 
+    /// Returns which async runtime substrate this handle currently
+    /// uses. New in `0.7.0`.
+    ///
+    /// The substrate is computed on each call (no probing — pure
+    /// read of cached state). It transitions from
+    /// [`crate::AsyncSubstrate::SpawnBlocking`] to
+    /// [`crate::AsyncSubstrate::NativeIoUring`] automatically when the
+    /// per-handle io_uring ring is lazily constructed (typically on
+    /// the first [`Method::Direct`] op).
+    ///
+    /// On non-Linux platforms, on Linux without the `async` Cargo
+    /// feature, when `Method::Direct` is not active, when the
+    /// io_uring ring failed to construct, or when
+    /// `FSYS_DISABLE_NATIVE_ASYNC=1` is set, this returns
+    /// [`crate::AsyncSubstrate::SpawnBlocking`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use fsys::AsyncSubstrate;
+    ///
+    /// # fn example() -> fsys::Result<()> {
+    /// let fs = fsys::builder().method(fsys::Method::Direct).build()?;
+    /// match fs.async_substrate() {
+    ///     AsyncSubstrate::NativeIoUring => println!("native fast path"),
+    ///     AsyncSubstrate::SpawnBlocking => println!("portable fallback"),
+    ///     // `AsyncSubstrate` is `#[non_exhaustive]`.
+    ///     _ => unreachable!(),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn async_substrate(&self) -> crate::AsyncSubstrate {
+        if self.substrate_is_native() {
+            crate::AsyncSubstrate::NativeIoUring
+        } else {
+            crate::AsyncSubstrate::SpawnBlocking
+        }
+    }
+
+    /// Linux + `async` feature substrate-selection check. Pure
+    /// read of cached state; does NOT trigger probe construction.
+    /// On Linux without the `async` feature (or non-Linux), this
+    /// always returns `false` — the native substrate is unreachable.
+    #[cfg(all(target_os = "linux", feature = "async"))]
+    fn substrate_is_native(&self) -> bool {
+        if std::env::var_os("FSYS_DISABLE_NATIVE_ASYNC").is_some() {
+            return false;
+        }
+        if self.active_method() != Method::Direct {
+            return false;
+        }
+        // Only report native when the ASYNC ring is constructed and
+        // its driver isn't poisoned. The first async Direct op finds
+        // SpawnBlocking (async ring not yet constructed), routes
+        // through spawn_blocking; the next op finds the cached
+        // result. We also check the poisoned flag — a panicked
+        // driver is functionally fallback even if the slot says
+        // Active.
+        let guard = match self.async_iouring_slot.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        matches!(&*guard, AsyncIoUringState::Active(ring) if !ring.is_poisoned())
+    }
+
+    /// Linux without async feature: native substrate is gated by
+    /// the feature, never reachable.
+    #[cfg(all(target_os = "linux", not(feature = "async")))]
+    fn substrate_is_native(&self) -> bool {
+        false
+    }
+
+    /// Non-Linux: native substrate is never available.
+    #[cfg(not(target_os = "linux"))]
+    fn substrate_is_native(&self) -> bool {
+        false
+    }
+
     /// Returns the per-handle io_uring ring, constructing it on the
     /// first call. Cached `None` after a construction failure so
     /// subsequent Direct ops don't retry the syscall.
@@ -454,7 +600,7 @@ impl Handle {
     ///
     /// Returns the pool's lazy-construction error
     /// ([`Error::AlignmentRequired`]) when the configured
-    /// `buffer_pool_size`/`buffer_pool_block` is invalid against the
+    /// `buffer_pool_count`/`buffer_pool_block_size` is invalid against the
     /// probed sector size.
     #[allow(dead_code)] // wired into Direct path in 0.5.x patch alongside io_uring lift
     pub(crate) fn buffer_pool(&self) -> Result<AlignedBufferPool> {

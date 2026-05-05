@@ -277,6 +277,51 @@ pub enum Error {
         /// Human-readable explanation of the syntax error.
         reason: String,
     },
+
+    /// A handle's native io_uring async substrate has been poisoned —
+    /// typically because the per-handle completion driver task panicked.
+    ///
+    /// **Code:** `FS-00019`. Caller action: subsequent async
+    /// operations on this handle are rejected with this error. The
+    /// handle's **sync** operations continue to work normally — only
+    /// the native async substrate is poisoned. Construct a fresh
+    /// handle for further async work, or set
+    /// `FSYS_DISABLE_NATIVE_ASYNC=1` and rely on the
+    /// [`spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html)
+    /// fallback. Diagnostic detail (e.g. the panic message) is in
+    /// `reason`. Only emitted when the `async` Cargo feature is
+    /// enabled and the platform is Linux.
+    HandlePoisoned {
+        /// Human-readable explanation of why the substrate is poisoned.
+        reason: String,
+    },
+
+    /// An io_uring submission failed at the kernel boundary.
+    ///
+    /// **Code:** `FS-00020`. Caller action: this is a syscall-level
+    /// failure (kernel rejected the submission queue entry — invalid
+    /// fd, alignment violation, ring exhaustion that backpressure
+    /// failed to absorb). Inspect `errno` to distinguish recoverable
+    /// (`EAGAIN`, `EINTR`) from non-recoverable (`EINVAL`, `EBADF`)
+    /// causes. Only emitted on Linux when the native async substrate
+    /// is active.
+    IoUringSubmitFailed {
+        /// Raw `errno` from the failing submit. `0` when the failure
+        /// was internal (e.g. SQE allocation rejected by our
+        /// backpressure wrapper).
+        errno: i32,
+    },
+
+    /// The per-handle completion driver task is no longer alive,
+    /// but the substrate has not yet been marked
+    /// [`HandlePoisoned`](Error::HandlePoisoned).
+    ///
+    /// **Code:** `FS-00021`. Caller action: this is a transient
+    /// state observed when an async op submits *during* handle
+    /// shutdown — the driver has exited but the handle hasn't
+    /// fully drained yet. Treat it as `HandlePoisoned` for
+    /// recovery purposes. Construct a fresh handle.
+    CompletionDriverDead,
 }
 
 impl Error {
@@ -315,6 +360,9 @@ impl Error {
             Error::NvmePassthroughDenied { .. } => "FS-00016",
             Error::AsyncRuntimeRequired => "FS-00017",
             Error::GlobPatternInvalid { .. } => "FS-00018",
+            Error::HandlePoisoned { .. } => "FS-00019",
+            Error::IoUringSubmitFailed { .. } => "FS-00020",
+            Error::CompletionDriverDead => "FS-00021",
         }
     }
 }
@@ -424,6 +472,24 @@ impl fmt::Display for Error {
             Error::GlobPatternInvalid { reason } => {
                 write!(f, "[{}] invalid glob pattern: {}", self.code(), reason)
             }
+            Error::HandlePoisoned { reason } => {
+                write!(f, "[{}] async substrate poisoned: {}", self.code(), reason)
+            }
+            Error::IoUringSubmitFailed { errno } => {
+                write!(
+                    f,
+                    "[{}] io_uring submit failed (errno {})",
+                    self.code(),
+                    errno
+                )
+            }
+            Error::CompletionDriverDead => {
+                write!(
+                    f,
+                    "[{}] io_uring completion driver task is no longer running",
+                    self.code()
+                )
+            }
         }
     }
 }
@@ -448,7 +514,10 @@ impl std::error::Error for Error {
             | Error::NvmePassthroughUnsupported { .. }
             | Error::NvmePassthroughDenied { .. }
             | Error::AsyncRuntimeRequired
-            | Error::GlobPatternInvalid { .. } => None,
+            | Error::GlobPatternInvalid { .. }
+            | Error::HandlePoisoned { .. }
+            | Error::IoUringSubmitFailed { .. }
+            | Error::CompletionDriverDead => None,
         }
     }
 }
@@ -1018,6 +1087,74 @@ mod tests {
         let err = Error::GlobPatternInvalid {
             reason: "test".into(),
         };
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    // ── 0.7.0 additions ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_error_code_handle_poisoned_returns_fs00019() {
+        let err = Error::HandlePoisoned {
+            reason: "completion driver panicked".into(),
+        };
+        assert_eq!(err.code(), "FS-00019");
+    }
+
+    #[test]
+    fn test_error_display_handle_poisoned_includes_reason() {
+        let err = Error::HandlePoisoned {
+            reason: "driver task aborted".into(),
+        };
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00019]"));
+        assert!(s.contains("driver task aborted"));
+    }
+
+    #[test]
+    fn test_error_source_handle_poisoned_returns_none() {
+        let err = Error::HandlePoisoned {
+            reason: "test".into(),
+        };
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_error_code_iouring_submit_failed_returns_fs00020() {
+        let err = Error::IoUringSubmitFailed { errno: 22 };
+        assert_eq!(err.code(), "FS-00020");
+    }
+
+    #[test]
+    fn test_error_display_iouring_submit_failed_includes_errno() {
+        let err = Error::IoUringSubmitFailed { errno: 9 };
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00020]"));
+        assert!(s.contains("9"));
+    }
+
+    #[test]
+    fn test_error_source_iouring_submit_failed_returns_none() {
+        let err = Error::IoUringSubmitFailed { errno: 0 };
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_error_code_completion_driver_dead_returns_fs00021() {
+        let err = Error::CompletionDriverDead;
+        assert_eq!(err.code(), "FS-00021");
+    }
+
+    #[test]
+    fn test_error_display_completion_driver_dead_mentions_driver() {
+        let err = Error::CompletionDriverDead;
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00021]"));
+        assert!(s.to_ascii_lowercase().contains("driver"));
+    }
+
+    #[test]
+    fn test_error_source_completion_driver_dead_returns_none() {
+        let err = Error::CompletionDriverDead;
         assert!(std::error::Error::source(&err).is_none());
     }
 }

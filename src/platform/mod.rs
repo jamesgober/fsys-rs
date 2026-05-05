@@ -127,6 +127,18 @@ impl Drop for AlignedBuf {
     }
 }
 
+// SAFETY: `AlignedBuf` owns its allocation exclusively (the
+// pointer is never duplicated; `Drop` is the only deallocator),
+// so transferring ownership across threads is sound — same
+// reasoning as `Vec<u8>`. `NonNull<u8>` is `!Send + !Sync` by
+// default only because it might in general represent an aliased
+// pointer; here it does not.
+unsafe impl Send for AlignedBuf {}
+// SAFETY: shared `&AlignedBuf` access is read-only via
+// `as_slice`, which is the same access shape as `&[u8]`. No
+// interior mutability is possible.
+unsafe impl Sync for AlignedBuf {}
+
 /// Rounds `n` up to the next multiple of `align`.
 ///
 /// `align` must be a power of two and non-zero.

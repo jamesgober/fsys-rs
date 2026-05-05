@@ -1,0 +1,66 @@
+{
+    "_README": "Performance regression baselines per locked decision D-11 in .dev/DECISIONS-0.7.0.md. Baseline numbers are populated by the release-prep tier-3 run on a blessed bare-metal benchmark machine, NOT by CI or developer dev-machine runs. Until that run happens, every entry has placeholder values; the regression harness in tests/regression/benchmarks.rs short-circuits placeholder comparisons with a CI warning rather than a failure. To populate real baselines: run `cargo bench` on the blessed machine, parse the criterion output, commit the resulting JSON in a single 'record baselines from blessed machine' commit. Subsequent updates require a commit message that explains why the baseline moved (intentional perf change vs hardware refresh vs measurement methodology change).",
+    "_schema_version": 1,
+    "_generated_at": null,
+    "_generated_machine_class": null,
+    "machine_classes": {
+        "linux-x86_64-consumer-nvme": {
+            "_status": "placeholder",
+            "_description": "Linux x86_64 with consumer NVMe (e.g. Samsung 980 Pro / WD SN850 / Crucial P5 Plus). Recorded on blessed bare-metal Linux box with kernel >= 6.0, mainline io_uring path enabled, FS = ext4.",
+            "single_write_sync_4k_p50_us": null,
+            "single_write_sync_4k_p99_us": null,
+            "single_write_sync_4k_p999_us": null,
+            "single_write_data_4k_p50_us": null,
+            "single_write_data_4k_p99_us": null,
+            "single_write_data_4k_p999_us": null,
+            "single_write_direct_4k_p50_us": null,
+            "single_write_direct_4k_p99_us": null,
+            "single_write_direct_4k_p999_us": null,
+            "single_write_mmap_4k_p50_us": null,
+            "single_write_mmap_4k_p99_us": null,
+            "single_write_mmap_4k_p999_us": null,
+            "batch_throughput_128_1k_total_ms": null,
+            "async_native_write_4k_p50_us": null,
+            "async_native_write_4k_p99_us": null,
+            "async_native_write_4k_p999_us": null,
+            "async_blocking_write_4k_p50_us": null,
+            "async_blocking_write_4k_p99_us": null,
+            "async_blocking_write_4k_p999_us": null
+        },
+        "linux-x86_64-enterprise-nvme-plp": {
+            "_status": "placeholder",
+            "_description": "Linux x86_64 with enterprise NVMe + Power Loss Protection (e.g. Intel D7-P5520 / Samsung PM9A3 / Micron 7450). PLP-equipped drives unlock the < 50 us p50 target on Direct + NVMe FLUSH.",
+            "single_write_direct_nvme_flush_4k_p50_us": null,
+            "single_write_direct_nvme_flush_4k_p99_us": null,
+            "single_write_direct_nvme_flush_4k_p999_us": null,
+            "async_native_write_direct_nvme_flush_4k_p50_us": null,
+            "async_native_write_direct_nvme_flush_4k_p99_us": null,
+            "async_native_write_direct_nvme_flush_4k_p999_us": null
+        },
+        "windows-x86_64-consumer-nvme": {
+            "_status": "placeholder",
+            "_description": "Windows 11 x86_64 with consumer NVMe. FS = NTFS, Direct path uses FILE_FLAG_WRITE_THROUGH (NVMe IOCTL not exercised on consumer drives).",
+            "single_write_sync_4k_p50_us": null,
+            "single_write_data_4k_p50_us": null,
+            "single_write_direct_4k_p50_us": null,
+            "single_write_mmap_4k_p50_us": null
+        },
+        "macos-aarch64-internal-ssd": {
+            "_status": "placeholder",
+            "_description": "macOS aarch64 (M1/M2/M3) with internal SSD. FS = APFS, Direct uses F_NOCACHE + F_FULLFSYNC.",
+            "single_write_sync_4k_p50_us": null,
+            "single_write_direct_4k_p50_us": null,
+            "single_write_mmap_4k_p50_us": null
+        }
+    },
+    "regression_thresholds": {
+        "_doc": "Per locked decision D-4: hybrid strictness. Critical paths fail CI on > 5%; standard on > 10%; loose only warn on > 25%.",
+        "critical_pct": 5,
+        "standard_pct": 10,
+        "loose_pct": 25
+    },
+    "tail_target": {
+        "_doc": "Per locked decision D-5: p99.9 must be within 10x of p50 on every benchmark. Portable across hardware. Failures investigated; unfixable failures documented in docs/PERFORMANCE.md.",
+        "p999_over_p50_max_ratio": 10.0
+    }
+}
