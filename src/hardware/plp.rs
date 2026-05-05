@@ -51,6 +51,7 @@ use crate::hardware::PlpStatus;
 /// `fdatasync` cycle on an unprotected drive, which IS a
 /// correctness regression. False-negative is the safe direction
 /// of travel.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const PLP_DRIVE_TABLE: &[(&str, &str)] = &[
     // Intel / Solidigm enterprise SATA SSDs (D3 series).
     ("INTEL", "SSDSC2KB"),    // D3-S4510 / S4520 family
@@ -85,6 +86,7 @@ const PLP_DRIVE_TABLE: &[(&str, &str)] = &[
 ///
 /// Matching is case-insensitive substring.
 #[must_use]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn lookup_table(vendor: &str, model: &str) -> PlpStatus {
     let v_upper = vendor.to_ascii_uppercase();
     let m_upper = model.to_ascii_uppercase();
