@@ -87,14 +87,22 @@ pub(crate) struct AlignedBuf {
 impl AlignedBuf {
     /// Allocates `size` bytes aligned to `align` bytes, zero-initialised.
     ///
-    /// Returns an error if `align` is not a power of two, if the size
-    /// overflows, or if the allocator returns null.
+    /// Returns an error if `align` is not a power of two, if `size` is
+    /// zero, or if the allocator returns null. Zero size is rejected
+    /// because `alloc_zeroed` requires `layout.size() > 0` — call sites
+    /// must short-circuit empty input before reaching this function.
     pub(crate) fn new(size: usize, align: usize) -> crate::Result<Self> {
+        if size == 0 {
+            return Err(crate::Error::AlignmentRequired {
+                detail: "AlignedBuf::new called with size=0; callers must short-circuit empty Direct IO before reaching the buffer allocator",
+            });
+        }
         let layout =
             Layout::from_size_align(size, align).map_err(|_| crate::Error::AlignmentRequired {
                 detail: "invalid size/align combination for Direct IO buffer",
             })?;
-        // SAFETY: layout has non-zero size (Direct IO always writes ≥ 1 sector).
+        // SAFETY: layout.size() > 0 enforced by the guard above; align
+        // is a power of two enforced by Layout::from_size_align.
         let ptr = unsafe { alloc::alloc_zeroed(layout) };
         let ptr = NonNull::new(ptr).ok_or(crate::Error::Io(std::io::Error::new(
             std::io::ErrorKind::OutOfMemory,
@@ -251,6 +259,21 @@ pub(crate) fn write_at(file: &std::fs::File, offset: u64, data: &[u8]) -> crate:
     imp::write_at(file, offset, data)
 }
 
+/// Sector-aligned positioned write for Direct IO file handles.
+///
+/// **Pre-conditions** (caller-enforced — not validated here on the
+/// hot path; violations surface as kernel `EINVAL`):
+/// - `data.as_ptr()` is sector-aligned.
+/// - `data.len()` is a multiple of the underlying device's sector size.
+/// - `offset` is a multiple of the sector size.
+///
+/// Used by the direct-IO journal log buffer (`JournalOptions::direct(true)`),
+/// which owns an `AlignedBuf` and flushes only at sector boundaries.
+#[inline]
+pub(crate) fn write_at_direct(file: &std::fs::File, offset: u64, data: &[u8]) -> crate::Result<()> {
+    imp::write_at_direct(file, offset, data)
+}
+
 /// Reads the entire content of `file` into a `Vec<u8>`.
 #[inline]
 pub(crate) fn read_all(file: &std::fs::File) -> crate::Result<Vec<u8>> {
@@ -344,6 +367,62 @@ pub(crate) fn probe_sector_size(path: &std::path::Path) -> u32 {
 #[inline]
 pub(crate) fn probe_direct_io_available() -> bool {
     imp::probe_direct_io_available()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Storage-engine primitives — extent preallocation + access-pattern hints
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Pre-allocates `len` bytes of disk space for `file` starting at
+/// `offset`. Reserves filesystem extents up-front so subsequent writes
+/// don't trigger allocation in the IO hot path. Critical for
+/// high-throughput WAL workloads where allocation jitter creates
+/// long-tail latency.
+///
+/// # Platform-specific behavior
+///
+/// - **Linux:** `fallocate(fd, FALLOC_FL_KEEP_SIZE, offset, len)` —
+///   reserves extents without changing the logical file size. The
+///   journal can then write into the pre-allocated region knowing the
+///   filesystem won't need to allocate blocks mid-write. On
+///   filesystems that don't support fallocate (some FUSE, network),
+///   falls back to `posix_fallocate` which writes zeros.
+/// - **macOS:** `fcntl(fd, F_PREALLOCATE, ...)` with
+///   `F_ALLOCATECONTIG | F_ALLOCATEALL` flags. Falls back to
+///   `F_ALLOCATEALL` alone if contiguous allocation fails.
+/// - **Windows:** `SetEndOfFile` to extend the logical size. True
+///   physical preallocation requires `SetFileValidData` which
+///   needs the `SE_MANAGE_VOLUME_NAME` privilege; we use it only
+///   when the privilege is detected (caller running as
+///   administrator). Without the privilege the kernel allocates
+///   on the first write — same as not calling preallocate.
+/// - **Unknown:** no-op (succeeds; the OS allocates on write).
+///
+/// # Errors
+///
+/// - [`Error::Io`](crate::Error::Io) on the underlying syscall failure.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn preallocate(file: &std::fs::File, offset: u64, len: u64) -> crate::Result<()> {
+    imp::preallocate(file, offset, len)
+}
+
+/// Hints the kernel about how `file` will be accessed in the
+/// `[offset, offset+len)` byte range. The kernel uses these hints
+/// to drive page-cache pre-fetch, eviction, and read-ahead policy.
+///
+/// `len = 0` means "the rest of the file from `offset` onward."
+///
+/// See [`Advice`] for the available hint variants.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn advise(
+    file: &std::fs::File,
+    offset: u64,
+    len: u64,
+    advice: crate::Advice,
+) -> crate::Result<()> {
+    imp::advise(file, offset, len, advice)
 }
 
 #[cfg(test)]

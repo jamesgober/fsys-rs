@@ -35,6 +35,14 @@ impl Handle {
     /// - [`Error::AtomicReplaceFailed`] if any step in the atomic sequence
     ///   fails.
     pub fn write(&self, path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::trace_span!(
+            "fsys::Handle::write",
+            payload_bytes = data.len(),
+            method = self.active_method().as_str(),
+        )
+        .entered();
+
         let path = self.resolve_path(path.as_ref())?;
 
         // 0.5.0: route Method::Mmap through the mmap atomic-replace
@@ -81,22 +89,25 @@ impl Handle {
         }
 
         if direct_ok {
-            // Step 3 (Direct IO path): FILE_FLAG_NO_BUFFERING writes are
-            // sector-padded. Drop the NO_BUFFERING handle (WRITE_THROUGH
-            // already ensures bytes are on disk), then reopen buffered solely
-            // to truncate the file back to the actual data length.
-            drop(file);
-            if let Err(e) = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&temp)
-                .and_then(|f| f.set_len(data.len() as u64))
-            {
+            // Step 3 (Direct IO path): FILE_FLAG_NO_BUFFERING /
+            // O_DIRECT writes are sector-padded. Truncate to the
+            // actual data length on the SAME open file handle —
+            // `set_len` on the original `file` calls `ftruncate`
+            // (Unix) or `SetFilePointerEx + SetEndOfFile` (Windows).
+            // Both work regardless of the open flags. Earlier
+            // versions dropped the file and reopened buffered just
+            // to call `set_len` — that wasted two syscalls
+            // (close + open) per Direct write. (0.8.0 I-checkpoint
+            // perf fix.)
+            if let Err(e) = file.set_len(data.len() as u64) {
+                drop(file);
                 let _ = std::fs::remove_file(&temp);
                 return Err(Error::AtomicReplaceFailed {
                     step: "truncate",
                     source: e,
                 });
             }
+            drop(file);
         } else {
             // Step 3 (Buffered path): explicit flush for durability.
             let flush_result = self.flush_file(&file, false);
@@ -610,6 +621,21 @@ fn iouring_write_direct(
     nvme: Option<&crate::platform::linux_iouring::NvmeAccess>,
 ) -> Result<()> {
     use std::os::fd::AsRawFd;
+
+    // Empty input — skip the buffer-pool allocation entirely. The
+    // file is already created at size 0 by the caller's `open()`;
+    // we only need the durability fence below.
+    if data.is_empty() {
+        if let Some(access) = nvme {
+            crate::platform::linux_iouring::nvme_flush_ioctl(
+                access.char_dev.as_raw_fd(),
+                access.nsid,
+            )?;
+        } else {
+            ring.fdatasync(file.as_raw_fd())?;
+        }
+        return Ok(());
+    }
 
     let ss = sector_size as usize;
     let aligned_len = data.len().div_ceil(ss).saturating_mul(ss);

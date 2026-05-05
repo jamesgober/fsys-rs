@@ -118,6 +118,12 @@ pub(crate) fn write_all(file: &File, data: &[u8]) -> Result<()> {
 pub(crate) fn write_all_direct(file: &File, data: &[u8], sector_size: u32) -> Result<()> {
     use super::{round_up, AlignedBuf};
 
+    // Empty input — no-op. See linux.rs::write_all_direct for the
+    // rationale (AlignedBuf::new rejects size=0).
+    if data.is_empty() {
+        return Ok(());
+    }
+
     // macOS F_NOCACHE does not require strict sector alignment from the
     // application (the kernel handles alignment internally), but we still
     // pad to the sector boundary for consistency with the Linux path.
@@ -127,12 +133,38 @@ pub(crate) fn write_all_direct(file: &File, data: &[u8], sector_size: u32) -> Re
     buf.as_mut_slice()[..data.len()].copy_from_slice(data);
 
     let fd = file.as_raw_fd();
-    let ptr = buf.as_slice().as_ptr().cast::<libc::c_void>();
-    // SAFETY: fd is valid. buf is aligned, zero-padded, and has aligned_len
-    // bytes. pwrite does not advance the file position.
-    let n = unsafe { libc::pwrite(fd, ptr, aligned_len, 0) };
-    if n < 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
+    let base = buf.as_slice().as_ptr();
+
+    // Loop on partial writes. See linux.rs::write_all_direct for
+    // the rationale — `pwrite` may return less than requested on
+    // EINTR or short-write conditions; without a loop a Direct
+    // write of a large payload can silently truncate.
+    let mut written = 0usize;
+    while written < aligned_len {
+        // SAFETY: fd is valid; buf is sector-aligned and has
+        // aligned_len bytes available; the offset (written) and
+        // length (aligned_len - written) stay within bounds.
+        let n = unsafe {
+            libc::pwrite(
+                fd,
+                base.add(written).cast::<libc::c_void>(),
+                aligned_len - written,
+                written as libc::off_t,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(Error::Io(err));
+        }
+        if n == 0 {
+            return Err(Error::Io(std::io::Error::other(
+                "pwrite returned 0 in write_all_direct (no progress)",
+            )));
+        }
+        written += n as usize;
     }
     Ok(())
 }
@@ -166,6 +198,12 @@ pub(crate) fn write_at(file: &File, offset: u64, data: &[u8]) -> Result<()> {
         written += n as usize;
     }
     Ok(())
+}
+
+/// Sector-aligned positioned write for `F_NOCACHE` files. See
+/// `linux.rs::write_at_direct` for the pre-condition contract.
+pub(crate) fn write_at_direct(file: &File, offset: u64, data: &[u8]) -> Result<()> {
+    write_at(file, offset, data)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -308,6 +346,107 @@ pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
 // ──────────────────────────────────────────────────────────────────────────────
 // Probes
 // ──────────────────────────────────────────────────────────────────────────────
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Storage-engine primitives — preallocate + advise
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// macOS preallocate via `fcntl(F_PREALLOCATE)`. Tries
+/// contiguous allocation first (`F_ALLOCATECONTIG`); falls back
+/// to non-contiguous (`F_ALLOCATEALL`) if the contiguous request
+/// can't be satisfied.
+pub(crate) fn preallocate(file: &File, offset: u64, len: u64) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    // F_PREALLOCATE struct fstore_t:
+    //   u32 fst_flags;     // F_ALLOCATECONTIG (0x2) | F_ALLOCATEALL (0x4)
+    //   i32 fst_posmode;   // F_PEOFPOSMODE (3) for relative-to-EOF, F_VOLPOSMODE (4) for absolute
+    //   off_t fst_offset;
+    //   off_t fst_length;
+    //   off_t fst_bytesalloc; // out
+    #[repr(C)]
+    struct Fstore {
+        fst_flags: u32,
+        fst_posmode: i32,
+        fst_offset: libc::off_t,
+        fst_length: libc::off_t,
+        fst_bytesalloc: libc::off_t,
+    }
+    const F_PREALLOCATE: libc::c_int = 42;
+    const F_ALLOCATECONTIG: u32 = 0x0000_0002;
+    const F_ALLOCATEALL: u32 = 0x0000_0004;
+    const F_VOLPOSMODE: i32 = 4;
+
+    let fd = file.as_raw_fd();
+    let mut store = Fstore {
+        fst_flags: F_ALLOCATECONTIG | F_ALLOCATEALL,
+        fst_posmode: F_VOLPOSMODE,
+        fst_offset: offset as libc::off_t,
+        fst_length: len as libc::off_t,
+        fst_bytesalloc: 0,
+    };
+    // SAFETY: fd is valid; F_PREALLOCATE expects an fstore_t pointer.
+    let ret = unsafe { libc::fcntl(fd, F_PREALLOCATE, &mut store) };
+    if ret == 0 {
+        return Ok(());
+    }
+    // Contiguous allocation failed — retry without F_ALLOCATECONTIG.
+    store.fst_flags = F_ALLOCATEALL;
+    store.fst_bytesalloc = 0;
+    // SAFETY: same as above.
+    let ret = unsafe { libc::fcntl(fd, F_PREALLOCATE, &mut store) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::last_os_error()))
+    }
+}
+
+/// macOS advise — limited surface vs Linux. Sequential / WillNeed
+/// map to `F_RDADVISE`; DontNeed maps to a temporary `F_NOCACHE`
+/// flip; Random and Normal are best-effort no-ops.
+pub(crate) fn advise(file: &File, offset: u64, len: u64, advice: crate::Advice) -> Result<()> {
+    let fd = file.as_raw_fd();
+    match advice {
+        crate::Advice::Sequential | crate::Advice::WillNeed => {
+            // F_RDADVISE: struct radvisory { off_t ra_offset; int ra_count; }
+            #[repr(C)]
+            struct Radvisory {
+                ra_offset: libc::off_t,
+                ra_count: libc::c_int,
+            }
+            const F_RDADVISE: libc::c_int = 44;
+            let count = if len == 0 || len > i32::MAX as u64 {
+                i32::MAX
+            } else {
+                len as i32
+            };
+            let mut adv = Radvisory {
+                ra_offset: offset as libc::off_t,
+                ra_count: count,
+            };
+            // SAFETY: fd is valid; F_RDADVISE expects a radvisory pointer.
+            let ret = unsafe { libc::fcntl(fd, F_RDADVISE, &mut adv) };
+            if ret == 0 {
+                Ok(())
+            } else {
+                // Best-effort: failure isn't fatal.
+                Ok(())
+            }
+        }
+        crate::Advice::DontNeed => {
+            // No direct equivalent on macOS; closest is
+            // toggling F_NOCACHE which affects the *handle*'s
+            // future reads, not a region. We accept this as a
+            // best-effort no-op rather than mutating handle
+            // state silently.
+            let _ = (fd, offset, len);
+            Ok(())
+        }
+        crate::Advice::Random | crate::Advice::Normal => Ok(()),
+    }
+}
 
 pub(crate) fn probe_sector_size(path: &Path) -> u32 {
     use libc::statfs;

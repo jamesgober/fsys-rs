@@ -5,7 +5,445 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.0] - 2026-05-05
+
+> **0.9.0 — release candidate for 1.0.** Adds the journal
+> substrate (open-once append-only log with explicit LSN
+> reservation, group-commit fsync, and a CRC-32C-protected frame
+> format) and an opt-in Direct-IO mode for the journal that
+> routes appends through a sector-aligned in-memory log buffer.
+> Tier-1 through tier-3 of the journal substrate ship in this
+> release; tier-4 (io_uring registered buffers + SQPOLL) is
+> deferred to the 0.9.x polish series pending real-world
+> bottleneck data. The public API surface documented in
+> [`docs/API.md`](docs/API.md) is the 1.0 target shape: from
+> this tag forward, only genuine bugs change names or signatures.
+> The 1.0 stable release follows once the long-running soak
+> certification, the peer-comparison benchmark capture on
+> bare-metal Linux + NVMe, and an independent reproduction of
+> the crash-safety harness all complete.
+
+### Added — 0.9.0
+
+- **Direct-IO journal opt-in** (R-2 — `JournalOptions::direct(true)`).
+  Opens the journal file with the platform's `O_DIRECT` /
+  `F_NOCACHE` / `FILE_FLAG_NO_BUFFERING` flag and routes appends
+  through a sector-aligned in-memory log buffer (the InnoDB /
+  WiredTiger log-buffer pattern). Records are coalesced into
+  sector-aligned chunks and written via DMA, bypassing the kernel
+  page cache and the page-cache memcpy that buffered-mode writes
+  pay on every record. Trade-off: appends serialise through a
+  buffer mutex (no lock-free fast path), in exchange for zero-copy
+  device writes. New public types:
+  - `pub struct JournalOptions` — `new()`, `direct(bool)`,
+    `log_buffer_kib(u32)` (clamped to 4..=65 536 KiB).
+  - `Handle::journal_with(path, options) -> Result<JournalHandle>`
+    — opens with caller-supplied options; `Handle::journal(path)`
+    is a shorthand for `journal_with(path, JournalOptions::default())`.
+  - `JournalHandle::is_direct_active()` — observability for the
+    direct path. Returns `false` when the filesystem rejected
+    `O_DIRECT` (tmpfs / FUSE / certain CIFS configurations) and
+    the journal silently downgraded to buffered mode.
+  - Resume after clean shutdown rehydrates the partial trailing
+    sector into the buffer so subsequent flushes overwrite the
+    zero-pad cleanly. Resume after crash scans to the LSN
+    immediately past the last cleanly-decoded frame; surfaces an
+    error for non-recoverable tail states (`BadMagic` /
+    `LengthOverflow`).
+  - Reader handles zero-magic-as-pad transparently — sees zero
+    magic, advances to the next 512-byte boundary, retries
+    decode (capped at `MAX_PAD_SKIP_SECTORS = 16` to bound the
+    cost on pathological all-zero input). Buffered and direct
+    journals share the same on-disk format; mixed-mode reopen
+    (write-buffered → reopen-direct → write more) round-trips
+    cleanly.
+
+- **Crash-safety integration tests for the journal substrate**
+  (R-3 — `tests/crash_journal.rs`). Spawns a victim subprocess
+  that appends N records, calls `sync_through` to make the first
+  `SYNCED_COUNT` durable, then keeps appending without syncing.
+  Parent kills the victim mid-burst (Windows
+  `TerminateProcess` / Unix `SIGKILL`), reopens the journal,
+  and verifies:
+  - **Durability invariant.** All synced records are present
+    and intact after the kill.
+  - **Tail-truncation safety.** The reader detects torn frames
+    via `JournalTailState` (clean end, truncated header,
+    truncated payload, or checksum mismatch — all are
+    recoverable; `BadMagic` / `LengthOverflow` would indicate
+    format corruption and surface as a non-recoverable error).
+  - **No torn frames surface as records.** Records past the
+    sync barrier may or may not be visible, but any that ARE
+    visible match their expected content byte-for-byte. This is
+    the load-bearing safety invariant of the frame format's
+    CRC-32C check.
+  - Runs for both `JournalOptions::default()` (buffered /
+    lock-free) and `JournalOptions::direct(true)` (direct-IO /
+    log-buffer); both pass under repeated kill timing.
+
+- **Property-based test suite for the frame format**
+  (`src/journal/format.rs::property_*`):
+  - `property_random_round_trips` — 10 000 deterministic-PRNG
+    encode/decode round-trips with payload sizes from 0 B to
+    64 KiB. Catches any encoder/decoder disagreement
+    statistically without adding a `proptest` dependency.
+  - `property_single_bit_flip_detected` — exhaustive
+    single-bit-flip detection across multiple payload sizes.
+    Pins the load-bearing CRC-32C contract: no single-bit flip
+    in any frame may produce a 'valid' decode with the original
+    payload, OR with any other payload. CRC-32C provides this
+    by construction; the test pins it empirically.
+
+- **Fuzz target for the frame format**
+  (`fuzz/fuzz_targets/journal_frame.rs`). Validates:
+  1. Decoder never panics on any byte sequence.
+  2. Encode → decode round-trip produces the same payload.
+  3. Concatenated frames decode in order.
+
+  Gated behind `cargo fuzz build journal_frame --features fuzz`
+  + a dedicated `__fuzz` re-export module in the parent crate.
+  Produces no warnings or trips of the existing
+  `unsafe_op_in_unsafe_fn` / `unused_results` deny-list.
+
+- **Cross-platform `write_at_direct` platform primitive**
+  (`platform::write_at_direct`) — sector-aligned positioned
+  write for Direct-IO file handles. Pre-conditions are
+  caller-enforced: data pointer + length sector-aligned,
+  offset sector-aligned. Used by the Direct-IO journal log
+  buffer to flush sector-aligned chunks without copying through
+  an intermediate aligned buffer.
+
+### Added — 0.8.0 alpha (carried forward)
+
+
+- **Journal substrate** (R-1) — open-once append-only log file with
+  atomic LSN reservation and group-commit fsync. Solves the
+  database / queue / ledger workload that the atomic-replace
+  primitive (`Handle::write`) cannot reach. New public types:
+  - `pub struct JournalHandle` — open-once journal, `Send + Sync`,
+    shareable via `Arc`.
+  - `pub struct Lsn(pub u64)` — log sequence number, byte-offset of
+    the next-write position.
+  - `Handle::journal(path) -> Result<JournalHandle>` — opens the
+    journal at `path`, with the same handle-root scope and security
+    checks as `Handle::write`. Resumes at the existing file size
+    if the journal already exists.
+  - `JournalHandle::append(record) -> Result<Lsn>` — appends a
+    record without fsync, returns the LSN immediately past the
+    record. Concurrent append from multiple threads is safe via
+    atomic LSN reservation + `pwrite`.
+  - `JournalHandle::sync_through(lsn) -> Result<()>` — group-commit
+    fsync. Concurrent calls from many threads coalesce into one
+    `fsync` syscall via a sync-gate mutex; callers waiting for an
+    LSN ≤ the synced frontier wake immediately when the in-flight
+    fsync completes.
+  - `JournalHandle::synced_lsn()` / `next_lsn()` — observability.
+  - `JournalHandle::close(self)` — explicit final-sync + close.
+
+  **Measured throughput on `windows-ntfs-nvme`** (full table in
+  [`docs/BENCH.md`](docs/BENCH.md)):
+
+  | Payload | Atomic-replace | Journal (sync-at-end) | Speedup |
+  |---------|---------------:|----------------------:|--------:|
+  | 64 B | 634 ops/s | 462.9 K ops/s | **730×** |
+  | 4 KiB | 891 ops/s | 189.3 K ops/s | **212×** |
+
+  Three tiers shipped:
+  - **Tier 1** — cross-platform sync, atomic LSN cursor,
+    group-commit fsync via standard `pwrite` + `fdatasync`.
+  - **Tier 2** — lock-free append path. POSIX uses concurrent
+    `pwrite` directly against `&File` (no `Mutex<File>` on the
+    hot path); Windows uses `WriteFile` with an `OVERLAPPED`
+    struct carrying the offset (concurrent-safe per call;
+    bounded above by NTFS's per-file write coordination).
+  - **Tier 3** — native io_uring async substrate on Linux +
+    `async` feature. `append_async` submits `IORING_OP_WRITE`
+    SQEs; `sync_through_async` submits
+    `IORING_OP_FSYNC(DATASYNC)` SQEs through the per-journal
+    completion driver. No `spawn_blocking` thread-pool hop.
+    Engagement observable via
+    `JournalHandle::native_iouring_active()`. On non-Linux
+    platforms or when io_uring construction fails (kernel
+    without the syscall, sandboxed container), async ops fall
+    back to `spawn_blocking` against the sync API
+    transparently.
+
+  Tier-4 (io_uring registered buffers + registered files +
+  polling completion driver — the path to 5–10 M durable
+  ops/sec on bare-metal Linux + NVMe) is deferred to the
+  **0.9.x polish series**, to be attacked once real-world
+  benchmarks identify it as the actual bottleneck rather than
+  added on speculation.
+
+- **Journal record framing — production-grade self-identifying
+  format** (R-2). Every record written by
+  `JournalHandle::append` is wrapped in a 12-byte frame: 4-byte
+  big-endian magic+version (`0x46535901` = "FSY\x01"), 4-byte
+  little-endian length, payload, 4-byte little-endian CRC-32C
+  (Castagnoli). The CRC implementation is a software
+  lookup-table that matches RFC 3720 known-answer vectors. Frame
+  overhead is constant 12 bytes per record — 19% at 64 B,
+  0.3% at 4 KiB, 0.02% at 64 KiB. Self-identification catches
+  format-confusion attacks; CRC catches torn writes from a
+  crash; magic-version byte allows future on-disk format
+  evolution.
+
+- **`JournalReader`** for journal replay — the read-side
+  companion to `JournalHandle`. Forward-streaming iterator
+  with checksum validation per record; `read_at_lsn` for
+  positioned reads; `seek_to(lsn)` for reposition; tail-state
+  classification distinguishes `CleanEnd` / `TruncatedHeader`
+  / `TruncatedPayload` / `ChecksumMismatch` / `BadMagic` /
+  `LengthOverflow` so recovery code can decide whether to
+  truncate-and-resume or surface to a human operator.
+  Buffered 64 KiB chunked reads; auto-grows for records
+  larger than the buffer; concurrent-safe with a writer
+  (reader sees records up to its captured file_size).
+
+- **Storage-engine primitives — preallocate + advise.**
+  `JournalHandle::preallocate(offset, len)` reserves
+  filesystem extents up-front so subsequent appends don't
+  trigger allocation jitter — critical for long-tail
+  latency on high-throughput WAL workloads. Linux uses
+  `fallocate(FALLOC_FL_KEEP_SIZE)` (no zero-write); macOS
+  uses `fcntl(F_PREALLOCATE)` with contiguous-then-fallback;
+  Windows uses `SetFileInformationByHandle(FileAllocationInfo)`
+  — the proper Windows analog to Linux's keep-size fallocate
+  (preserves logical EOF). `JournalHandle::advise` /
+  `JournalReader::advise` / `JournalReader::advise_sequential`
+  hint the kernel about access patterns. New public `Advice`
+  enum: `Sequential`, `Random`, `WillNeed`, `DontNeed`,
+  `Normal`. Linux maps to `posix_fadvise(2)`; macOS uses
+  `F_RDADVISE` for sequential/will-need; Windows is
+  best-effort no-op (lacks per-range advisory API).
+
+- **Optional `tracing` feature.** Adds `tracing::trace_span!`
+  and event instrumentation on the journal append /
+  sync_through paths and the atomic-replace `Handle::write`
+  hot path. Off by default; the dep is gated behind the
+  `tracing` feature flag so non-tracing builds incur zero
+  overhead. Production observability environments (with
+  `tokio-console` / OpenTelemetry / etc. subscribers wired)
+  enable the feature for end-to-end IO trace visibility.
+
+- **`docs/EXAMPLES.md`** — catalogue of the 16 runnable examples in
+  [`examples/`](examples/), each with a "when to use this pattern"
+  guide. Run any example with `cargo run --example NN_name`.
+- **`benches/matrix_with_peers.rs`** — end-to-end performance matrix
+  bench against `std::fs` and `tokio::fs::read` (via
+  `spawn_blocking`). Produces a markdown table on stdout; certified
+  results recorded in [`docs/BENCH.md`](docs/BENCH.md) per the
+  checkpoint-D-5 protocol.
+- **`FSYS_SOAK_HOURS=N`** environment override on the soak harness
+  (`tests/stress.rs`). Existing `--features stress` flag still
+  selects the 1-hour CI run; the env var lets the 0.8.0 D-3
+  pragmatic 4-hour cert run be triggered without rebuilding.
+- **Three new test files**: `tests/critical_fixes_0_8_0.rs` (9
+  regression tests pinning the B-checkpoint Critical-fix changeset),
+  `tests/path_security.rs` (9 path-jail-escape tests including a
+  Unix-only symlink-escape regression).
+
+### Fixed (security — checkpoint J)
+
+- **Symlink escape from `Builder::root` jail.** The pre-0.8.0
+  `Handle::resolve_path` was purely lexical: a symlink **inside**
+  the root pointing **outside** it slipped past the
+  `starts_with(root)` check, defeating the entire root-scope
+  feature. **Fix:** `resolve_path` now performs a third pass
+  after lexical normalisation that canonicalises the longest
+  existing prefix of the resolved path and verifies the canonical
+  form lies inside the canonical root. Combined with `Builder::build`
+  canonicalising the configured root at construction time, this
+  closes the symlink-escape vector. **TOCTOU caveat documented** —
+  a hostile local actor could race a symlink swap between
+  resolution and `open`; closing that gap requires platform-specific
+  primitives (`openat2(RESOLVE_BENEATH)` / `O_NOFOLLOW`-walked
+  openat / `FILE_FLAG_OPEN_REPARSE_POINT`) filed for **0.9.0+**.
+- **`Builder::root` canonicalisation at build time.** Previously,
+  `Builder::root("data/../jail")` or a root containing symlinks
+  defeated `starts_with(root)` because the stored root itself
+  was non-canonical. **Fix:** `Builder::build` now calls
+  `std::fs::canonicalize` on the root and stores the canonical
+  form. Roots that don't exist or that fail canonicalisation
+  return `Error::InvalidPath` at build time rather than allowing
+  through with a broken jail.
+- **`Handle::find` brace-expansion exponential blowup.** A
+  pattern like `{a,b}^20` produced ≈ 1 M expansions, each its
+  own string allocation — denial-of-service via memory pressure.
+  **Fix:** `MAX_BRACE_EXPANSIONS = 1024` cap; pathological
+  patterns bounded, benign patterns unaffected.
+
+### Fixed (correctness — checkpoint B)
+
+The B-checkpoint internal audit (parallel code-quality + hot-path
+agents) produced **5 Critical findings**, all fixed:
+
+- **Windows `write_at` 64-bit offset truncation.** Offsets above
+  2 GiB silently went to the wrong location because the offset
+  was split into `dist_lo: i32` and `dist_hi: i32` and only the
+  low half was passed to `SetFilePointerEx`. Cross-platform
+  contract violation vs. `pwrite` on Linux/macOS. **Fix:** pass
+  the full `i64` offset directly; range-check against `i64::MAX`
+  with `Error::Io(InvalidInput)` on overflow.
+- **Zero-byte `Direct` IO undefined behaviour.** `AlignedBuf::new(0,
+  …)` called `alloc_zeroed` whose precondition is
+  `layout.size() > 0`. Reachable from public API
+  (`quick::write(p, b"")`). **Fix:** `AlignedBuf::new` rejects
+  `size == 0` with `Error::AlignmentRequired`; every Direct call
+  site short-circuits empty input to produce a valid 0-byte file
+  via a no-data path.
+- **eventfd leak window in completion-driver `owner_loop`.** The
+  raw eventfd was registered with the io_uring ring before
+  ownership was established; a panic between registration and
+  `OwnedFd::from_raw_fd` leaked the fd. **Fix:** wrap the raw fd
+  in `OwnedFd` as the first thing in `owner_loop`, before any
+  fallible construction. Unwind drops `OwnedFd` and closes the
+  fd exactly once.
+- **`AsyncMutex<Option<UnboundedSender<Op>>>` on the native-async
+  hot path.** Every concurrent submit had to contend on this
+  mutex even though `mpsc::UnboundedSender` is already
+  `Send + Sync` and supports concurrent send. **Fix:** replaced
+  with plain `mpsc::UnboundedSender<Op>` plus an `AtomicBool
+  shutdown` flag for fast-path early-exit on shutdown.
+  Removes one async-mutex acquire per op.
+- **`poisoned` flag doc/code disagreement.** Doc claimed the
+  owner task wrote the flag on panic via `catch_unwind`; code
+  uses structural drop and the `_poisoned` parameter was unused.
+  **Fix:** rewrote the doc to match actual mechanism (submit
+  itself transitions the flag when its recv errors out).
+
+### Fixed (correctness — checkpoint I)
+
+- **`mmap` write missing `fsync` after `msync(MS_SYNC)`.** On
+  Linux/macOS, `msync(MS_SYNC)` flushes data pages but does NOT
+  include a metadata sync. The renamed file could have data on
+  disk but stale size metadata after a power-loss event. **Fix:**
+  added `temp_file.sync_all()` between `msync` and `rename`.
+- **`write_all_direct` partial-write looping.** `pwrite(2)` may
+  return less than requested on EINTR or short-write conditions.
+  The 0.7.0 code did a single pwrite and trusted the return value;
+  large Direct writes could silently truncate. **Fix:** loop on
+  partial writes with EINTR retry on Linux + macOS.
+
+### Performance (checkpoint I)
+
+- **Direct-IO truncate via in-place `set_len`** (I round 1) —
+  replaced the post-write "drop the `O_DIRECT` /
+  `FILE_FLAG_NO_BUFFERING` handle, reopen buffered, call
+  `set_len`" pattern with an in-place `set_len` on the
+  already-open file handle. `set_len` works regardless of the
+  open flags. Saves two syscalls (close + open) per Direct
+  write. **Measured 2.4–3.5× speedup at 4 KiB single writes**
+  on `windows-ntfs-nvme`.
+- **Group-lane dispatcher fast-flush** (I round 2) — the
+  dispatcher's 1 ms accumulation window was adding ~500 µs of
+  fixed latency to every batch when there was no concurrent
+  contention to amortise it across. The fix scoops any
+  already-queued jobs via a non-blocking `try_recv` drain;
+  when the drain finds nothing (single-submitter workload),
+  the dispatcher flushes immediately instead of waiting for
+  the window to expire. Concurrent-submitter workloads still
+  get the original window batching. **Closed the
+  batch-slower-than-solo gap** that the F bench surfaced as a
+  real finding: 4 KiB batch-of-8 went from 0.42× of solo to
+  1.00× (full latency parity); 64 KiB and 1 MiB batches both
+  went to 0.95× of solo (essentially tied). Per-batch median
+  ≈ 2× faster across all payload sizes.
+- **`gen_temp_path` alloc reduction** (I round 2) — replaced
+  `format!()` + `to_string_lossy().into_owned()` +
+  `parent.join(String)` (3 string allocs + 1 PathBuf per call)
+  with direct `OsString` construction (1 OsString + 1 PathBuf).
+  Stays in `OsStr`-land for non-UTF-8 filenames. ~50–100 ns
+  saved per write call.
+- **Lock-free buffer-pool fast path** (I round 3) — replaced
+  `pool_slot: Mutex<Option<AlignedBufferPool>>` with
+  `OnceLock<AlignedBufferPool>`. Every Direct write previously
+  paid a mutex acquire to read the pool; now it pays a single
+  atomic load + `Arc::clone`. ~20–50 ns saved per Direct op,
+  scales linearly with throughput — meaningful at million-op-
+  per-second workloads.
+- **`resolve_path` fast path for root-scoped handles** (I round 3) —
+  the security-fix Pass 3 (canonicalize syscall) is now skipped
+  when the resolved path's parent equals the canonical root AND
+  the leaf is verified non-symlink via a cheap
+  `symlink_metadata` (`lstat`) check. The common shape —
+  `fs.write("file.txt")` on a root-scoped handle — pays one
+  `lstat` (~1–5 µs) instead of one `canonicalize` (~50–200 µs
+  on Windows). 10×+ speedup for root-scoped writes;
+  no security regression (the canonical-prefix check still runs
+  for any path where the fast path doesn't apply, e.g. nested
+  writes or symlinked leaves).
+- **Async submit non-blocking under saturation** (I round 3) —
+  `Pipeline::submit_async` previously blocked the tokio worker
+  via synchronous `crossbeam_channel::send` when the
+  dispatcher's bounded queue was full, stalling the entire
+  runtime. Replaced with a `try_send` retry loop using
+  `tokio::task::yield_now`. Backpressure preserved (the calling
+  task is suspended); the runtime worker is no longer held
+  hostage.
+- **Honest finding documented in `docs/BENCH.md`**: at 4 KiB
+  median, `std::fs::write` is still ≈ 5× faster than
+  `fsys::Auto` because `std::fs::write` does **no durability
+  fence**. The fair comparison is `Method::Sync` vs.
+  `std::fs + manual atomic-replace dance`. At p99 latency
+  `fsys` wins decisively at every payload size. At 64 KiB and
+  1 MiB `fsys` beats `std::fs::write` even on the median.
+
+### Documentation
+
+- Comprehensive **`docs/BENCH.md`** rewrite with certified results
+  per the checkpoint-D-5 protocol: date + hardware class +
+  methodology + median + p99 + comparison cells against
+  `std::fs` and `tokio::fs`.
+- New **`docs/EXAMPLES.md`** catalogue + 16 runnable examples in
+  `examples/` covering every feature matrix entry.
+- New decision log: [`.dev/DECISIONS-0.8.0.md`](.dev/DECISIONS-0.8.0.md).
+- New audit reconciliation docs:
+  [`.dev/CODE-AUDIT-0.8.0.md`](.dev/CODE-AUDIT-0.8.0.md) (B) and
+  [`.dev/SECURITY-REVIEW-0.8.0.md`](.dev/SECURITY-REVIEW-0.8.0.md) (J).
+
+### Stability (release-candidate freeze contract)
+
+The public API surface as documented in
+[`docs/API.md`](docs/API.md) is frozen at the **0.9.0 git tag**.
+Changes after that tag require:
+
+- A name or signature change → only for genuine bugs, with
+  rationale in the CHANGELOG.
+- A new method, variant, or field → wait for `1.0` or a later
+  minor release.
+- An error variant addition → permitted (errors are
+  `#[non_exhaustive]`).
+- A docstring tightening → permitted at any time.
+
+This contract is what callers can rely on for the
+release-candidate-to-1.0 runway.
+
+### Out of scope — deferred to 0.9.x polish or 1.0
+
+- **Tier-4 io_uring** — registered buffers, registered files,
+  and SQPOLL polling completion driver. The path to 5–10 M
+  durable ops/sec on bare-metal Linux + NVMe. Tier-3 native
+  combined with the Direct-IO log buffer already saturates
+  most realistic workloads; tier-4 is a measured-bottleneck
+  optimisation worth attacking once real-world benchmarks
+  identify it as the actual ceiling.
+- **24-hour soak certification** — long-running CI / dedicated-
+  box workload. The harness supports it via
+  `FSYS_SOAK_HOURS=24`; capture is a 0.9.x post-RC task.
+- **Bare-metal Linux native-substrate measurement** — the WSL2
+  measurement (1.46×) holds. Bare-metal validation (expected
+  2×+) requires hardware access deferred to 0.9.x.
+- **Forced-unmount crash harness** — the 0.9.0 process-kill
+  harness covers the documented durability contract; a
+  separate forced-unmount harness with privileged teardown is
+  a 0.9.x companion.
+- **`openat2(RESOLVE_BENEATH)` TOCTOU mitigation** — closes
+  the residual symlink-race gap in `Handle::resolve_path`
+  not covered by the existing canonical-prefix check.
+- **`cap-std` peer comparison** — `std::fs` and `tokio::fs`
+  comparisons shipped in 0.8.0; `cap-std` is the closest
+  capability-based peer and is a 0.9.x item.
 
 ## [0.7.0] - 2026-05-04
 

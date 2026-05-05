@@ -59,7 +59,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, oneshot};
 
 /// Op submitted to the owner task. The owner task pulls from the
 /// `mpsc` channel and processes one op per submission cycle.
@@ -92,17 +92,33 @@ pub(crate) enum Op {
 /// Owns the `mpsc::Sender` for submission, the `AtomicBool` poison
 /// flag (shared with the owner task), and the `JoinHandle`.
 pub(crate) struct AsyncIoUring {
-    /// Submission channel. `None` after [`AsyncIoUring::shutdown`]
-    /// has been called and the sender is dropped (so the owner
-    /// task observes channel close and exits).
-    submit_tx: AsyncMutex<Option<mpsc::UnboundedSender<Op>>>,
-    /// Set to `true` by the owner task when it panics in its main
-    /// loop (caught via `catch_unwind`). Subsequent `submit` calls
-    /// see this and return [`Error::HandlePoisoned`].
+    /// Submission channel. `mpsc::UnboundedSender` is already
+    /// `Send + Sync` and supports concurrent `send` from multiple
+    /// owners — no Mutex is needed on the hot path. (Earlier
+    /// 0.7.0 versions wrapped this in `AsyncMutex<Option<...>>`
+    /// to support setting it to `None` on shutdown; the audit
+    /// pass for 0.8.0 removed that overhead — shutdown signalling
+    /// now goes via the `shutdown` flag below + sending
+    /// `Op::Shutdown` through the channel.)
+    submit_tx: mpsc::UnboundedSender<Op>,
+    /// Set to `true` by [`AsyncIoUring::shutdown`]. Submit checks
+    /// this before sending and returns
+    /// [`Error::CompletionDriverDead`] if set, avoiding the
+    /// channel-send overhead on already-shut-down handles.
+    shutdown: AtomicBool,
+    /// Set to `true` by `submit` itself when the owner task has
+    /// dropped its receiver mid-op (panic) or its `oneshot::Sender`
+    /// has been dropped before the reply landed. The owner task
+    /// does NOT write this directly — panic resilience is achieved
+    /// via structural drop (see [`owner_main`] doc), and `submit`
+    /// is the witness that translates the structural failure into
+    /// the `poisoned` signal.
     poisoned: Arc<AtomicBool>,
-    /// JoinHandle for the owner task. Joined on drop as a backstop;
-    /// normal shutdown happens via channel close.
-    join: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// JoinHandle for the owner task. Locked only by `shutdown` /
+    /// Drop, never on the hot path. `std::sync::Mutex` is fine
+    /// because lock duration is bounded by `shutdown`'s 5-second
+    /// timeout or by `JoinHandle::abort` (~µs).
+    join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl AsyncIoUring {
@@ -128,16 +144,16 @@ impl AsyncIoUring {
 
         let (tx, rx) = mpsc::unbounded_channel::<Op>();
         let poisoned = Arc::new(AtomicBool::new(false));
-        let poisoned_clone = poisoned.clone();
 
         let join = tokio::task::spawn(async move {
-            owner_main(queue_depth, eventfd_raw, rx, poisoned_clone).await;
+            owner_main(queue_depth, eventfd_raw, rx).await;
         });
 
         Ok(Self {
-            submit_tx: AsyncMutex::new(Some(tx)),
+            submit_tx: tx,
+            shutdown: AtomicBool::new(false),
             poisoned,
-            join: AsyncMutex::new(Some(join)),
+            join: std::sync::Mutex::new(Some(join)),
         })
     }
 
@@ -153,27 +169,24 @@ impl AsyncIoUring {
     /// with the sentinel `i32::MIN` so the caller sees
     /// `Error::HandlePoisoned` rather than a hang.
     pub(crate) async fn submit(&self, op: Op, reply: oneshot::Receiver<i32>) -> Result<i32> {
-        // Fast-path: poisoned flag short-circuits without taking
-        // any locks or touching the channel.
+        // Fast-path: poisoned/shutdown flags short-circuit without
+        // touching the channel. Both are pure atomic loads.
         if self.is_poisoned() {
             return Err(Error::HandlePoisoned {
                 reason: "io_uring completion driver panicked".to_string(),
             });
         }
-        let tx_guard = self.submit_tx.lock().await;
-        let tx = match tx_guard.as_ref() {
-            Some(t) => t,
-            None => return Err(Error::CompletionDriverDead),
-        };
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(Error::CompletionDriverDead);
+        }
         // Channel-closed → owner task dropped the receiver
         // (typically because it panicked). Mark poisoned so future
         // submits short-circuit; surface this submission as
         // CompletionDriverDead.
-        if tx.send(op).is_err() {
+        if self.submit_tx.send(op).is_err() {
             self.poisoned.store(true, Ordering::Release);
             return Err(Error::CompletionDriverDead);
         }
-        drop(tx_guard);
 
         match reply.await {
             Ok(code) if code == i32::MIN => {
@@ -200,30 +213,33 @@ impl AsyncIoUring {
     /// its termination. Drops the submission sender so the task's
     /// `mpsc::Receiver::recv` returns `None` and the loop exits.
     pub(crate) async fn shutdown(&self) {
-        // Send the explicit Shutdown op first so the task gets a
-        // clean exit signal even if there are queued submissions
-        // ahead of the shutdown in the channel.
-        {
-            let mut tx_guard = self.submit_tx.lock().await;
-            if let Some(tx) = tx_guard.as_ref() {
-                let _ = tx.send(Op::Shutdown);
-            }
-            // Drop the sender so future submits get
-            // `CompletionDriverDead` and `recv` eventually returns
-            // None.
-            *tx_guard = None;
-        }
+        // Mark shutdown active so subsequent `submit`s short-circuit
+        // on the atomic check before reaching the channel.
+        self.shutdown.store(true, Ordering::Release);
 
-        // Await the task's natural exit. If it doesn't exit within
-        // 5s, we abort.
-        let mut join_guard = self.join.lock().await;
-        if let Some(join) = join_guard.take() {
+        // Send Op::Shutdown so the owner task gets a clean exit
+        // signal even with queued submissions ahead of it.
+        // `send` failure here means the channel is already closed
+        // (owner task already exited) — that's fine.
+        let _ = self.submit_tx.send(Op::Shutdown);
+
+        // Take the JoinHandle out of the slot and await the task's
+        // natural exit. The lock here is sync and contended at most
+        // once (this fn + Drop). If `lock()` is poisoned (Mutex
+        // poisoning from a panicked holder) we fall through to the
+        // None path, which is safe — Drop will abort if anything
+        // remains.
+        let join_opt = match self.join.lock() {
+            Ok(mut g) => g.take(),
+            Err(p) => p.into_inner().take(),
+        };
+        if let Some(join) = join_opt {
             let abort_handle = join.abort_handle();
-            match tokio::time::timeout(std::time::Duration::from_secs(5), join).await {
-                Ok(_) => {}
-                Err(_timeout) => {
-                    abort_handle.abort();
-                }
+            if tokio::time::timeout(std::time::Duration::from_secs(5), join)
+                .await
+                .is_err()
+            {
+                abort_handle.abort();
             }
         }
     }
@@ -236,7 +252,11 @@ impl Drop for AsyncIoUring {
         // drop path we just abort the task and let the runtime
         // clean up. Pending oneshot receivers will see
         // RecvError → `Error::HandlePoisoned`.
-        if let Ok(mut g) = self.join.try_lock() {
+        //
+        // `try_lock` would still work here, but since this is
+        // `&mut self`, there are no other holders by definition —
+        // `get_mut` is contention-free.
+        if let Ok(g) = self.join.get_mut() {
             if let Some(j) = g.take() {
                 j.abort();
             }
@@ -263,20 +283,17 @@ impl Drop for AsyncIoUring {
 ///    `Error::HandlePoisoned`.
 /// 3. The `mpsc::Receiver` drops too, closing the channel. Future
 ///    `tx.send()` calls fail; `submit()` translates the failure
-///    into `Error::CompletionDriverDead`. (We also mark the
-///    shared `poisoned` flag from the *outside* via a small
-///    watcher; see [`AsyncIoUring::watch_for_panic`].)
+///    into `Error::CompletionDriverDead` AND sets the shared
+///    `poisoned` flag so subsequent submits short-circuit on the
+///    fast-path atomic check. The owner task itself does not
+///    write `poisoned` — `submit()` is the witness that converts
+///    the structural failure into the flag transition.
 ///
 /// Net effect: every awaiting submitter wakes up with a defined
 /// error, and every new submit short-circuits via the poisoned
 /// flag. The "load-bearing invariant" called out in
 /// `.dev/DECISIONS-0.7.0.md` is preserved.
-async fn owner_main(
-    queue_depth: u32,
-    eventfd_raw: RawFd,
-    rx: mpsc::UnboundedReceiver<Op>,
-    _poisoned: Arc<AtomicBool>,
-) {
+async fn owner_main(queue_depth: u32, eventfd_raw: RawFd, rx: mpsc::UnboundedReceiver<Op>) {
     // Run the inner loop directly. If it panics, tokio's task
     // framework catches the unwind; the channel + pending map
     // drop on the unwind path, signalling all submitters.
@@ -295,57 +312,42 @@ async fn owner_main(
 async fn owner_loop(queue_depth: u32, eventfd_raw: RawFd, mut rx: mpsc::UnboundedReceiver<Op>) {
     use std::collections::HashMap;
 
+    // Wrap the eventfd in `OwnedFd` first thing — before any
+    // fallible construction below. If anything panics or returns
+    // early, the unwind drops `OwnedFd` and closes the eventfd
+    // exactly once. Eliminates the leak window that existed in
+    // 0.7.0 between `register_eventfd_with_ring` succeeding and
+    // ownership being established.
+    //
+    // SAFETY: `eventfd_raw` is a valid eventfd produced by
+    // `create_eventfd` (which used `OwnedFd::into_raw_fd` to release
+    // ownership) and not duplicated anywhere else. We are the sole
+    // owner from this point onward.
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(eventfd_raw) };
+
     // Reconstruct the ring on this task's stack. (We probed it
     // synchronously in `AsyncIoUring::new` to surface kernel
     // failure as a clean error.)
     let mut ring = match io_uring::IoUring::new(queue_depth) {
         Ok(r) => r,
-        Err(_) => return, // probe succeeded; this is a transient failure
+        Err(_) => return, // owned_fd drops, eventfd closes once
     };
 
     // Register the eventfd with the ring so the kernel signals it
-    // when CQ has new entries.
-    if register_eventfd_with_ring(&mut ring, eventfd_raw).is_err() {
-        return;
+    // when CQ has new entries. Use `as_raw_fd()` — registration
+    // does not transfer ownership.
+    if register_eventfd_with_ring(&mut ring, owned_fd.as_raw_fd()).is_err() {
+        return; // owned_fd drops, eventfd closes once
     }
 
-    // Wrap the eventfd in OwnedFd + AsyncFd for tokio reactor
-    // integration. We use `std::mem::ManuallyDrop` to avoid
-    // double-drop with `owner_main`'s tail wrap-and-close —
-    // ownership of the raw fd transfers to AsyncFd here, and the
-    // outer `OwnedFd` is consumed when AsyncFd drops.
-    //
-    // SAFETY: `eventfd_raw` is a valid eventfd from
-    // `create_eventfd`, owned by this task, and not duplicated
-    // anywhere else. The `into_raw_fd` in `new` released the
-    // OwnedFd to us; we re-wrap and pass to AsyncFd.
-    let owned_fd = unsafe { OwnedFd::from_raw_fd(eventfd_raw) };
+    // Hand ownership of the eventfd to AsyncFd. From here on,
+    // AsyncFd is responsible for closing the fd when it drops.
+    // On error, `with_interest` consumes and drops `owned_fd`
+    // internally — still closes once.
     let async_fd = match AsyncFd::with_interest(owned_fd, tokio::io::Interest::READABLE) {
         Ok(f) => f,
         Err(_) => return,
     };
-
-    // Forget the OwnedFd that owner_main will create — AsyncFd now
-    // owns the eventfd.
-    //
-    // Actually, simpler: have owner_main NOT wrap-and-drop the
-    // raw fd; let AsyncFd's drop handle it. That requires
-    // changing the structure above. Done: see comment in
-    // owner_main marking that we wrap-and-drop on PANIC ONLY.
-    //
-    // To enforce this, we use catch_unwind's distinction:
-    // if we reach here without panicking and AsyncFd takes
-    // ownership, the eventfd_raw is consumed by AsyncFd. If we
-    // panic, the catch_unwind wrap-and-close in owner_main is the
-    // backstop — but we've already given the fd to AsyncFd!
-    //
-    // The honest answer: there's a small double-close risk on the
-    // panic path. To eliminate it, we'd need to detect "did
-    // AsyncFd take ownership before the panic happened?" which
-    // requires more careful structure. For 0.7.0 pragmatic mode,
-    // the panic path is itself a poisoned state and the
-    // double-close is at worst a benign EBADF ignored elsewhere.
-    // Filed as a refinement to address before alpha.
 
     let mut pending: HashMap<u64, oneshot::Sender<i32>> = HashMap::new();
     let mut next_id: u64 = 1;

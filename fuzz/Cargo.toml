@@ -37,3 +37,21 @@ path = "fuzz_targets/batch_builder.rs"
 test = false
 doc = false
 bench = false
+
+# 0.9.0 R-2 — journal frame format fuzzing. Validates encoder/decoder
+# round-trip + decoder safety on arbitrary input. Requires the parent
+# crate's `fuzz` feature so the pub(crate) frame helpers are exposed
+# via the __fuzz internal-API module.
+[[bin]]
+name = "journal_frame"
+path = "fuzz_targets/journal_frame.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzz"]
+
+[features]
+# Enables the parent crate's `fuzz` feature, which in turn exposes
+# `pub(crate)` frame helpers via the `__fuzz` module so the harness
+# can reach them.
+fuzz = ["fsys/fuzz"]

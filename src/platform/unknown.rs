@@ -64,6 +64,12 @@ pub(crate) fn write_at(file: &File, offset: u64, data: &[u8]) -> Result<()> {
     f.write_all(data).map_err(Error::Io)
 }
 
+/// Sector-aligned positioned write — no Direct IO on unknown platforms;
+/// delegates to the buffered [`write_at`].
+pub(crate) fn write_at_direct(file: &File, offset: u64, data: &[u8]) -> Result<()> {
+    write_at(file, offset, data)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Reading
 // ──────────────────────────────────────────────────────────────────────────────
@@ -135,6 +141,15 @@ pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
 pub(crate) fn probe_sector_size(_path: &Path) -> u32 {
     // Unknown platform; return the safe default.
     512
+}
+
+// Storage-engine primitives — no-op on unknown platforms.
+pub(crate) fn preallocate(_file: &File, _offset: u64, _len: u64) -> Result<()> {
+    Ok(())
+}
+
+pub(crate) fn advise(_file: &File, _offset: u64, _len: u64, _advice: crate::Advice) -> Result<()> {
+    Ok(())
 }
 
 pub(crate) fn probe_direct_io_available() -> bool {

@@ -17,14 +17,32 @@ use std::time::{Duration, Instant};
 
 static C: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(not(feature = "stress"))]
+/// Returns the soak duration for this run.
+///
+/// Resolution ladder (last match wins):
+/// 1. **`FSYS_SOAK_HOURS=N`** env var — explicit override. Used
+///    for the 0.8.0 D-3 pragmatic 4-hour run and the contingency
+///    full 24-hour cert. Accepts integer or decimal hours
+///    (e.g. `0.5` for 30 min).
+/// 2. **`--features stress`** — 1-hour CI nightly run.
+/// 3. **Default** — 60 s validation run for dev iteration.
 fn soak_budget() -> Duration {
-    Duration::from_secs(60)
-}
-
-#[cfg(feature = "stress")]
-fn soak_budget() -> Duration {
-    Duration::from_secs(3600)
+    if let Ok(s) = std::env::var("FSYS_SOAK_HOURS") {
+        if let Ok(hours) = s.parse::<f64>() {
+            if hours > 0.0 && hours.is_finite() {
+                let secs = (hours * 3600.0) as u64;
+                return Duration::from_secs(secs);
+            }
+        }
+    }
+    #[cfg(feature = "stress")]
+    {
+        Duration::from_secs(3600)
+    }
+    #[cfg(not(feature = "stress"))]
+    {
+        Duration::from_secs(60)
+    }
 }
 
 fn tmp_dir(tag: &str) -> PathBuf {

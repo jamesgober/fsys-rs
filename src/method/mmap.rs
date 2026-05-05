@@ -135,13 +135,29 @@ pub(crate) fn write(path: &Path, data: &[u8]) -> Result<()> {
     };
     mmap.copy_from_slice(data);
 
-    // Step 3 — flush the mapping (msync / FlushViewOfFile). This is
-    // the durability point.
+    // Step 3 — flush the mapping (msync / FlushViewOfFile). This
+    // flushes dirty data pages to stable storage but on Linux/macOS
+    // does NOT include a metadata sync.
     if let Err(e) = mmap.flush() {
         drop(mmap);
         let _ = std::fs::remove_file(&temp);
         return Err(Error::MmapFailed {
             reason: format!("Mmap::flush (msync/FlushViewOfFile) failed: {e}"),
+        });
+    }
+
+    // Step 3b — fsync the file to sync inode metadata (file size).
+    // POSIX `msync(MS_SYNC)` covers data pages but not metadata; an
+    // atomic-rename of a file whose data is durable but whose size
+    // metadata is stale would surface as a 0-length file after a
+    // power-loss event. `fsync` after `msync` closes that window.
+    // On Windows `FlushViewOfFile` covers data; `FlushFileBuffers`
+    // covers metadata — both happen via the same call here.
+    if let Err(e) = temp_file.sync_all() {
+        drop(mmap);
+        let _ = std::fs::remove_file(&temp);
+        return Err(Error::MmapFailed {
+            reason: format!("fsync of mmap temp file failed: {e}"),
         });
     }
 

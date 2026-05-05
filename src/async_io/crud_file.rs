@@ -268,6 +268,30 @@ async fn write_async_native(
         });
     }
 
+    // Empty input — skip buffer alloc + native write entirely.
+    // The temp file is already at size 0; we still need fdatasync
+    // to ensure the inode is durable before the rename.
+    if data.is_empty() {
+        if let Err(e) = fdatasync_native(ring, file.as_raw_fd()).await {
+            drop(file);
+            let _ = std::fs::remove_file(&temp);
+            return Err(Error::AtomicReplaceFailed {
+                step: "fdatasync_native",
+                source: as_io_error(e),
+            });
+        }
+        drop(file);
+        if let Err(e) = crate::platform::atomic_rename(&temp, &resolved) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(Error::AtomicReplaceFailed {
+                step: "rename",
+                source: as_io_error(e),
+            });
+        }
+        let _ = crate::platform::sync_parent_dir(&resolved);
+        return Ok(());
+    }
+
     // Compute aligned length for Direct IO.
     let sector_size = handle.sector_size() as usize;
     let aligned_len = data.len().div_ceil(sector_size).saturating_mul(sector_size);

@@ -201,12 +201,16 @@ impl Pipeline {
     /// [`tokio::sync::oneshot`] so the caller `.await`s without
     /// blocking a tokio worker.
     ///
-    /// The crossbeam queue submission itself remains synchronous —
-    /// when the dispatcher's bounded queue is full, this method
-    /// blocks the calling task on `crossbeam_channel::send` until
-    /// space frees up. This honours the dispatcher's backpressure
-    /// contract from D-1 of `0.4.0`. Spawning a buffer thread to
-    /// keep submission async would defeat that backpressure.
+    /// **Backpressure under saturation.** When the dispatcher's
+    /// bounded queue is full, this method **does not block the
+    /// tokio worker**. Earlier 0.7.0 versions called
+    /// `crossbeam_channel::Sender::send` (a synchronous block-the-
+    /// thread call) which stalled the entire runtime worker until
+    /// space freed up. The 0.8.0 I round-3 fix uses `try_send` in
+    /// a `tokio::task::yield_now`-retry loop so the runtime can
+    /// repurpose the worker while we wait. Backpressure is
+    /// preserved (the calling task is suspended until space
+    /// appears); the runtime is no longer held hostage.
     #[cfg(feature = "async")]
     pub(crate) async fn submit_async(
         &self,
@@ -219,14 +223,27 @@ impl Pipeline {
         };
 
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let job = BatchJob {
+        let mut job = BatchJob {
             ops,
             snapshot,
             response: crate::pipeline::group::BatchResponse::Async(response_tx),
         };
 
-        if job_tx.send(job).is_err() {
-            return Err(shutdown_err());
+        // Try-send retry loop: yields to the runtime when the
+        // dispatcher's bounded queue is full, instead of blocking
+        // the worker on a synchronous `send`. Cooperatively
+        // descheduled — backpressure preserved.
+        loop {
+            match job_tx.try_send(job) {
+                Ok(()) => break,
+                Err(crossbeam_channel::TrySendError::Full(returned)) => {
+                    job = returned;
+                    tokio::task::yield_now().await;
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    return Err(shutdown_err());
+                }
+            }
         }
 
         match response_rx.await {
