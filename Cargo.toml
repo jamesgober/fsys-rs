@@ -4,7 +4,7 @@
 ######################################################
 [package]
 name    = "fsys"
-version = "0.5.1"
+version = "0.6.0"
 
 # METADATA
 readme  = "README.md"
@@ -30,6 +30,10 @@ include = [
     "LICENSE-MIT",
     "CHANGELOG.md",
 ]
+# `fuzz/` is intentionally NOT included — it's a separate cargo-fuzz
+# workspace with its own `Cargo.toml` (`cargo-fuzz = true` in
+# `[package.metadata]`). The fuzz crate is published separately if
+# at all and should not be packaged into the main library crate.
 # DESCRIPTION
 description  = "Adaptive file and directory IO for Rust — fast, hardware-aware, multi-strategy."
 
@@ -68,14 +72,41 @@ path = "src/lib.rs"
 ###########################
 [features]
 default = []
+# Async layer (locked decision D-1 in `.dev/DECISIONS-0.6.0.md`).
+# Adds `_async` siblings to every sync method via
+# `tokio::task::spawn_blocking`; async batch ops via
+# `tokio::sync::oneshot`. Pulls in tokio's `rt`, `rt-multi-thread`,
+# `sync`, `macros` features.
 async = ["dep:tokio"]
+# Stress / soak test harnesses (locked decision D-7). Tests gated
+# behind this flag run for the full 1-hour duration; without the
+# flag they compile but skip the long-running body. CI nightly
+# enables this for full-duration validation; dev iteration uses
+# short validation runs.
+stress = []
+# Fuzz harness wiring. Compile-only flag — actual fuzz target binaries
+# live in the `fuzz/` directory and use `cargo-fuzz`. This flag
+# exists so library code that supports fuzz instrumentation can be
+# conditionally enabled without it bloating release builds.
+fuzz = []
 
 
 ###########################
 # DEPENDENCIES
 ###########################
 [dependencies]
-tokio = { version = "1", features = ["fs", "rt"], optional = true }
+# Tokio runtime — gated behind the `async` feature flag.
+# Feature set rationale (locked decision D-10 in
+# `.dev/DECISIONS-0.6.0.md`):
+# - `rt` + `rt-multi-thread`: required for `spawn_blocking` and
+#   `#[tokio::test(flavor = "multi_thread")]` for batch tests.
+# - `sync`: required for `tokio::sync::oneshot` (async batch
+#   response channel per locked decision D-5).
+# - `macros`: required for `#[tokio::test]`.
+# `fs` was dropped in 0.6.0 — fsys's async layer uses
+# `spawn_blocking` against the sync core, never tokio's fs
+# primitives.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros"], optional = true }
 
 # Bounded MPMC + oneshot channels with `select!` support.
 # Used by the 0.4.0 pipeline subsystem: the group-lane work queue
@@ -100,6 +131,15 @@ crossbeam-queue = "0.3"
 # Rust storage projects (RocksDB-rs bindings, sled, etc.). Minimal
 # transitive deps.
 memmap2 = "0.9"
+
+# Glob-pattern matching for `Handle::find`. Standard syntax (`*`,
+# `**`, `?`, `[abc]`, `{foo,bar}`) — the de-facto pattern crate in
+# the Rust ecosystem (~300k weekly downloads). Selected over
+# implementing glob from scratch (which would either be incomplete
+# or several hundred LOC) per locked decision D-4 in
+# `.dev/DECISIONS-0.6.0.md`. Mature, well-maintained, no transitive
+# bloat.
+glob = "0.3"
 
 # Syscall wrappers for Unix platforms (Linux, macOS).
 # Required for O_DIRECT, pread/pwrite, fdatasync, F_FULLFSYNC, F_NOCACHE,
@@ -143,6 +183,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Pipes",
     "Win32_System_SystemInformation",
     "Win32_Security",
+    # 0.6.0: Windows ACL preservation in `Handle::write_copy` (D-8 in
+    # `.dev/DECISIONS-0.6.0.md`) uses `GetNamedSecurityInfoW` /
+    # `SetNamedSecurityInfoW` from this module.
+    "Win32_Security_Authorization",
 ] }
 
 

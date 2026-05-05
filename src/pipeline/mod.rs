@@ -179,7 +179,7 @@ impl Pipeline {
         let job = BatchJob {
             ops,
             snapshot,
-            response: response_tx,
+            response: crate::pipeline::group::BatchResponse::Sync(response_tx),
         };
 
         // Bounded send: blocks when the queue is full; returns Err iff
@@ -192,6 +192,47 @@ impl Pipeline {
             Ok(result) => result,
             // Receiver disconnected: dispatcher exited without sending
             // a response. Treat as shutdown.
+            Err(_) => Err(shutdown_err()),
+        }
+    }
+
+    /// Async equivalent of [`Pipeline::submit`]. Routes through the
+    /// same per-handle dispatcher; the response channel is a
+    /// [`tokio::sync::oneshot`] so the caller `.await`s without
+    /// blocking a tokio worker.
+    ///
+    /// The crossbeam queue submission itself remains synchronous —
+    /// when the dispatcher's bounded queue is full, this method
+    /// blocks the calling task on `crossbeam_channel::send` until
+    /// space frees up. This honours the dispatcher's backpressure
+    /// contract from D-1 of `0.4.0`. Spawning a buffer thread to
+    /// keep submission async would defeat that backpressure.
+    #[cfg(feature = "async")]
+    pub(crate) async fn submit_async(
+        &self,
+        ops: Vec<BatchOp>,
+        snapshot: HandleSnapshot,
+    ) -> std::result::Result<(), BatchError> {
+        let job_tx = match self.dispatcher_sender() {
+            Some(tx) => tx,
+            None => return Err(shutdown_err()),
+        };
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let job = BatchJob {
+            ops,
+            snapshot,
+            response: crate::pipeline::group::BatchResponse::Async(response_tx),
+        };
+
+        if job_tx.send(job).is_err() {
+            return Err(shutdown_err());
+        }
+
+        match response_rx.await {
+            Ok(result) => result,
+            // Receiver disconnected: dispatcher exited without sending
+            // a response. Same handling as the sync path.
             Err(_) => Err(shutdown_err()),
         }
     }

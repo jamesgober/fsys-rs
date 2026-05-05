@@ -38,8 +38,9 @@ use std::path::PathBuf;
 ///   `.dev/DECISIONS-0.5.0.md`).
 /// - `buffer_pool_block` defaults to `4096` (per-buffer size in bytes).
 /// - `io_uring_queue_depth` defaults to `128` (Linux io_uring SQ
-///   depth; **stubbed in 0.5.0** — see the io_uring blocker in
-///   `.dev/DECISIONS-0.5.0.md`).
+///   depth). Real `io_uring` integration shipped in `0.5.1` after
+///   the rustc 1.95 ICE workaround landed; see the io_uring blocker
+///   record in `.dev/DECISIONS-0.5.0.md`.
 pub struct Builder {
     method: Method,
     root: Option<PathBuf>,

@@ -25,9 +25,14 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 
 #[cfg(target_os = "linux")]
-use crate::platform::linux_iouring::IoUringRing;
+use crate::platform::linux_iouring::{IoUringRing, NvmeAccess};
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
+
+#[cfg(target_os = "windows")]
+use crate::platform::windows_nvme::NvmeAccess as WinNvmeAccess;
+#[cfg(target_os = "windows")]
+use std::sync::Arc as WinArc;
 
 /// Per-handle io_uring ring slot (Linux only).
 ///
@@ -44,6 +49,34 @@ use std::sync::Arc;
 enum IoUringState {
     Untried,
     Active(Arc<IoUringRing>),
+    Disabled,
+}
+
+/// Per-handle NVMe-passthrough capability slot (Linux only).
+///
+/// Same three-state pattern as [`IoUringState`]. The first Direct
+/// op probes via [`crate::platform::linux_iouring::nvme_flush_capable`]
+/// and caches the result. `Active(access)` holds an open
+/// `/dev/nvmeX` handle plus the namespace ID, ready for
+/// `nvme_flush_ioctl` calls. `Disabled` means probing failed; the
+/// Direct path uses `fdatasync` instead.
+#[cfg(target_os = "linux")]
+enum NvmeState {
+    Untried,
+    Active(Arc<NvmeAccess>),
+    Disabled,
+}
+
+/// Per-handle NVMe-passthrough capability slot (Windows only).
+///
+/// Mirror of [`NvmeState`] for the Windows IOCTL path. `Active`
+/// holds the resolved volume root (e.g. `\\\\.\\C:`); volume
+/// handles are reopened per-op (matches the Windows convention of
+/// not holding long-lived shared volume handles).
+#[cfg(target_os = "windows")]
+enum NvmeStateWin {
+    Untried,
+    Active(WinArc<WinNvmeAccess>),
     Disabled,
 }
 
@@ -147,6 +180,17 @@ pub struct Handle {
     /// rest of this Handle's lifetime.
     #[cfg(target_os = "linux")]
     iouring_slot: Mutex<IoUringState>,
+    /// Linux-only: lazy NVMe-passthrough capability slot.
+    /// `Untried` until the first Direct op probes; `Active(...)`
+    /// (with an owned `/dev/nvmeX` handle) or `Disabled` for the
+    /// rest of this Handle's lifetime.
+    #[cfg(target_os = "linux")]
+    nvme_slot: Mutex<NvmeState>,
+    /// Windows-only: lazy NVMe-passthrough capability slot.
+    /// Same three-state pattern as [`NvmeState`] but caches the
+    /// resolved volume root (handles are reopened per-op).
+    #[cfg(target_os = "windows")]
+    nvme_slot_win: Mutex<NvmeStateWin>,
 }
 
 impl Handle {
@@ -178,6 +222,194 @@ impl Handle {
             iouring_queue_depth,
             #[cfg(target_os = "linux")]
             iouring_slot: Mutex::new(IoUringState::Untried),
+            #[cfg(target_os = "linux")]
+            nvme_slot: Mutex::new(NvmeState::Untried),
+            #[cfg(target_os = "windows")]
+            nvme_slot_win: Mutex::new(NvmeStateWin::Untried),
+        }
+    }
+
+    /// Returns the per-handle Windows NVMe-passthrough access for
+    /// the volume containing `path`, probing on the first call.
+    /// Cached `None` after probe failure.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn nvme_access_win(&self, path: &Path) -> Option<WinArc<WinNvmeAccess>> {
+        let mut guard = match self.nvme_slot_win.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match &*guard {
+            NvmeStateWin::Active(a) => return Some(a.clone()),
+            NvmeStateWin::Disabled => return None,
+            NvmeStateWin::Untried => {}
+        }
+        match crate::platform::windows_nvme::nvme_flush_capable(path) {
+            Some(access) => {
+                let arc = WinArc::new(access);
+                *guard = NvmeStateWin::Active(arc.clone());
+                Some(arc)
+            }
+            None => {
+                *guard = NvmeStateWin::Disabled;
+                None
+            }
+        }
+    }
+
+    /// Returns the per-handle NVMe passthrough access, probing on
+    /// the first call given an arbitrary file `fd` whose underlying
+    /// block device we want to flush. The probe resolves the fd to
+    /// `/dev/nvmeX` and verifies privilege.
+    ///
+    /// Cached `None` after probe failure so subsequent ops don't
+    /// retry the resolution + open.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn nvme_access(&self, fd: std::os::fd::RawFd) -> Option<Arc<NvmeAccess>> {
+        let mut guard = match self.nvme_slot.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match &*guard {
+            NvmeState::Active(a) => return Some(a.clone()),
+            NvmeState::Disabled => return None,
+            NvmeState::Untried => {}
+        }
+        match crate::platform::linux_iouring::nvme_flush_capable(fd) {
+            Some(access) => {
+                let arc = Arc::new(access);
+                *guard = NvmeState::Active(arc.clone());
+                Some(arc)
+            }
+            None => {
+                *guard = NvmeState::Disabled;
+                None
+            }
+        }
+    }
+
+    /// Returns the canonical name of the durability primitive this
+    /// handle currently invokes for write durability. The exact
+    /// strings are defined as constants in [`crate::primitive`] —
+    /// match against those rather than the raw string to avoid
+    /// typos.
+    ///
+    /// The value reflects the **resolved** primitive after lazy
+    /// probes (io_uring construction, NVMe passthrough capability
+    /// detection, mmap suitability) — not the configured method.
+    /// Probes happen on the first IO op; before that, this returns
+    /// the conservative-fallback primitive for the configured
+    /// method.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use fsys::{builder, primitive};
+    ///
+    /// let fs = builder().build()?;
+    /// match fs.active_durability_primitive() {
+    ///     primitive::IO_URING_NVME_FLUSH => println!("elite path"),
+    ///     primitive::IO_URING_FDATASYNC => println!("standard io_uring"),
+    ///     primitive::FSYNC => println!("fallback fsync"),
+    ///     _ => println!("other"),
+    /// }
+    /// # Ok::<(), fsys::Error>(())
+    /// ```
+    #[must_use]
+    pub fn active_durability_primitive(&self) -> &'static str {
+        let method = self.active_method();
+        match method {
+            Method::Mmap => crate::primitive::MMAP_MSYNC,
+            Method::Sync => {
+                #[cfg(target_os = "macos")]
+                {
+                    crate::primitive::F_FULLFSYNC
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    crate::primitive::FSYNC
+                }
+            }
+            Method::Data => {
+                #[cfg(target_os = "linux")]
+                {
+                    crate::primitive::FDATASYNC
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    crate::primitive::F_FULLFSYNC
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    crate::primitive::FSYNC
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                {
+                    crate::primitive::FSYNC
+                }
+            }
+            Method::Direct => {
+                #[cfg(target_os = "linux")]
+                {
+                    self.linux_direct_primitive()
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    crate::primitive::F_NOCACHE_F_FULLFSYNC
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    self.windows_direct_primitive()
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                {
+                    crate::primitive::FSYNC
+                }
+            }
+            // Reserved / unreachable variants — return a conservative
+            // fallback rather than panicking. `Method::Auto` is
+            // resolved to a concrete method at handle construction,
+            // so it should not be observed here in practice.
+            _ => crate::primitive::FSYNC,
+        }
+    }
+
+    /// Resolves the active Direct primitive on Linux based on the
+    /// cached io_uring + NVMe slot state. Pure read of the cached
+    /// state — does NOT trigger probing (probing is driven by IO ops
+    /// in `crud/file.rs`).
+    #[cfg(target_os = "linux")]
+    fn linux_direct_primitive(&self) -> &'static str {
+        let nvme_active = matches!(
+            *self.nvme_slot.lock().unwrap_or_else(|p| p.into_inner()),
+            NvmeState::Active(_)
+        );
+        if nvme_active {
+            return crate::primitive::IO_URING_NVME_FLUSH;
+        }
+        let ring_active = matches!(
+            *self.iouring_slot.lock().unwrap_or_else(|p| p.into_inner()),
+            IoUringState::Active(_)
+        );
+        if ring_active {
+            crate::primitive::IO_URING_FDATASYNC
+        } else {
+            crate::primitive::O_DIRECT_PWRITE_FDATASYNC
+        }
+    }
+
+    /// Resolves the active Direct primitive on Windows based on the
+    /// cached NVMe slot state. Pure read of the cached state — does
+    /// NOT trigger probing.
+    #[cfg(target_os = "windows")]
+    fn windows_direct_primitive(&self) -> &'static str {
+        let nvme_active = matches!(
+            *self.nvme_slot_win.lock().unwrap_or_else(|p| p.into_inner()),
+            NvmeStateWin::Active(_)
+        );
+        if nvme_active {
+            crate::primitive::FILE_FLAG_WRITE_THROUGH_NVME_IOCTL
+        } else {
+            crate::primitive::FILE_FLAG_WRITE_THROUGH
         }
     }
 
@@ -552,6 +784,17 @@ impl Handle {
     /// exposing the pipeline field directly to that module.
     pub(crate) fn submit_batch(&self, ops: Vec<BatchOp>) -> std::result::Result<(), BatchError> {
         self.pipeline.submit(ops, self.snapshot())
+    }
+
+    /// Async equivalent of [`submit_batch`]. Routes through
+    /// [`Pipeline::submit_async`] (locked decision D-5) — same
+    /// dispatcher, oneshot response channel.
+    #[cfg(feature = "async")]
+    pub(crate) async fn submit_batch_async(
+        &self,
+        ops: Vec<BatchOp>,
+    ) -> std::result::Result<(), BatchError> {
+        self.pipeline.submit_async(ops, self.snapshot()).await
     }
 }
 

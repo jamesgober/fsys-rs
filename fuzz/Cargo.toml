@@ -1,0 +1,39 @@
+# cargo-fuzz workspace for fsys (locked decision D-7 — pragmatic
+# mode). Build with `cargo fuzz build`; run targets with `cargo fuzz
+# run <target>`. Full-duration runs (1M iterations or 1 hour) are
+# documented protocol in `.dev/DECISIONS-0.6.0.md`; dev iteration
+# uses `--max_total_time=60` for a quick sanity pass.
+
+[package]
+name = "fsys-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fsys = { path = ".." }
+
+[[bin]]
+name = "path_normalize"
+path = "fuzz_targets/path_normalize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "glob_pattern"
+path = "fuzz_targets/glob_pattern.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "batch_builder"
+path = "fuzz_targets/batch_builder.rs"
+test = false
+doc = false
+bench = false

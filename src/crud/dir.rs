@@ -185,6 +185,211 @@ impl Handle {
     pub fn is_file(&self, path: impl AsRef<Path>) -> Result<bool> {
         self.exists(path)
     }
+
+    /// Walks the directory at `path`, returning every entry.
+    ///
+    /// When `recursive` is `false`, this is equivalent to
+    /// [`Handle::list`]. When `recursive` is `true`, descendants are
+    /// included. Order is OS-dependent; do not rely on it.
+    ///
+    /// Symlinks are **not** followed in `0.6.0`. Symlink-following as
+    /// an opt-in option is filed as F-14 for `0.7.0+` (see
+    /// `.dev/DECISIONS-0.6.0.md`).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidPath`] if `path` escapes the handle root.
+    /// - [`Error::Io`] if the root directory cannot be read.
+    /// - [`Error::PartialDirectoryOp`] if a recursive walk fails part-
+    ///   way through (e.g. permission denied on a subdirectory). The
+    ///   variant carries the entries enumerated successfully before
+    ///   the failure.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use fsys::builder;
+    ///
+    /// let fs = builder().build()?;
+    /// let entries = fs.scan("/var/log", true)?;
+    /// for e in entries {
+    ///     println!("{}", e.path.display());
+    /// }
+    /// # Ok::<(), fsys::Error>(())
+    /// ```
+    pub fn scan(&self, path: impl AsRef<Path>, recursive: bool) -> Result<Vec<DirEntry>> {
+        let root = self.resolve_path(path.as_ref())?;
+        let mut out: Vec<DirEntry> = Vec::new();
+        scan_into(&root, recursive, &mut out)?;
+        Ok(out)
+    }
+
+    /// Returns paths within `path` that match `pattern`.
+    ///
+    /// `pattern` is interpreted relative to `path`. Standard glob
+    /// syntax (`*`, `**`, `?`, `[abc]`, `[!abc]`, `{foo,bar}`) per
+    /// the [`glob`](https://docs.rs/glob) crate. Patterns that
+    /// escape the base directory (e.g. `../../etc/passwd`) are
+    /// rejected with [`Error::InvalidPath`].
+    ///
+    /// Symlinks are not followed in `0.6.0`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidPath`] if `path` escapes the handle root, or
+    ///   if `pattern` escapes `path`.
+    /// - [`Error::GlobPatternInvalid`] if `pattern` is not a
+    ///   syntactically valid glob.
+    /// - [`Error::Io`] on filesystem errors.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use fsys::builder;
+    ///
+    /// let fs = builder().build()?;
+    /// // Find all `.log` files anywhere under `/var/log`:
+    /// let logs = fs.find("/var/log", "**/*.log")?;
+    /// // Find immediate `.conf` children of `/etc`:
+    /// let confs = fs.find("/etc", "*.conf")?;
+    /// # Ok::<(), fsys::Error>(())
+    /// ```
+    pub fn find(&self, path: impl AsRef<Path>, pattern: &str) -> Result<Vec<std::path::PathBuf>> {
+        let root = self.resolve_path(path.as_ref())?;
+
+        // Pattern escape check: reject any leading `..` or absolute
+        // path; we never run a pattern that resolves outside `root`.
+        if pattern.contains("..") || std::path::Path::new(pattern).is_absolute() {
+            return Err(Error::InvalidPath {
+                path: std::path::PathBuf::from(pattern),
+                reason: "glob pattern must not escape the base directory".into(),
+            });
+        }
+
+        let combined = root.join(pattern);
+        let combined_str = combined.to_str().ok_or_else(|| Error::InvalidPath {
+            path: combined.clone(),
+            reason: "non-UTF-8 path component".into(),
+        })?;
+
+        // Brace alternation `{a,b}` is part of the 0.6.0 `find`
+        // API contract (D-4) but is not supported natively by the
+        // `glob` crate. Expand braces here so each expanded
+        // pattern is a single `glob`-supported string, then union
+        // the match sets.
+        let expanded = expand_braces(combined_str);
+
+        let mut out: Vec<std::path::PathBuf> = Vec::new();
+        let mut seen: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        for sub in &expanded {
+            let paths = glob::glob(sub).map_err(|e| Error::GlobPatternInvalid {
+                reason: e.to_string(),
+            })?;
+            for entry in paths {
+                match entry {
+                    Ok(p) => {
+                        if seen.insert(p.clone()) {
+                            out.push(p);
+                        }
+                    }
+                    Err(e) => return Err(Error::Io(e.into_error())),
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Counts the number of regular files within `path`.
+    ///
+    /// Implemented in terms of [`Handle::scan`] with a counter — no
+    /// separate optimised path. Cost is O(file count). When
+    /// `recursive` is `true`, descendants are counted.
+    ///
+    /// # Errors
+    ///
+    /// - Same as [`Handle::scan`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use fsys::builder;
+    ///
+    /// let fs = builder().build()?;
+    /// let n = fs.count("/var/log", true)?;
+    /// println!("log tree has {} files", n);
+    /// # Ok::<(), fsys::Error>(())
+    /// ```
+    pub fn count(&self, path: impl AsRef<Path>, recursive: bool) -> Result<usize> {
+        let entries = self.scan(path, recursive)?;
+        Ok(entries.iter().filter(|e| e.is_file).count())
+    }
+}
+
+/// Expands brace-alternation in a glob pattern.
+///
+/// `{a,b}*.conf` → `["a*.conf", "b*.conf"]`. Nested braces are not
+/// supported in `0.6.0` (e.g. `{a,{b,c}}` would be treated as a
+/// literal at the inner brace) — filed for follow-up if a real
+/// consumer needs it. Patterns without `{...}` are returned as a
+/// single-element vec containing the original pattern.
+///
+/// Algorithm: scan left-to-right for the first top-level `{...}`
+/// group, split its contents on commas, and recursively expand the
+/// surrounding context with each alternative substituted in. The
+/// recursion's depth is bounded by the number of brace groups.
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let bytes = pattern.as_bytes();
+    let Some(open) = bytes.iter().position(|&b| b == b'{') else {
+        return vec![pattern.to_string()];
+    };
+    let Some(close_offset) = bytes[open + 1..].iter().position(|&b| b == b'}') else {
+        return vec![pattern.to_string()];
+    };
+    let close = open + 1 + close_offset;
+
+    let prefix = &pattern[..open];
+    let group = &pattern[open + 1..close];
+    let suffix = &pattern[close + 1..];
+
+    let mut out = Vec::new();
+    for alt in group.split(',') {
+        let with_alt = format!("{prefix}{alt}{suffix}");
+        out.extend(expand_braces(&with_alt));
+    }
+    out
+}
+
+/// Recursive walk helper. Best-effort: when a subdirectory cannot be
+/// read (permission denied, vanished mid-walk), the entries already
+/// collected are preserved and the failing step is surfaced via
+/// [`Error::PartialDirectoryOp`]. Entries collected before the
+/// failure are still returned to the caller via the
+/// `completed_steps` field's count.
+fn scan_into(root: &Path, recursive: bool, out: &mut Vec<DirEntry>) -> Result<()> {
+    let rd = std::fs::read_dir(root).map_err(|e| {
+        if out.is_empty() {
+            // Top-level read failure — surface as plain Io for the
+            // simplest happy/sad split.
+            Error::Io(e)
+        } else {
+            Error::PartialDirectoryOp {
+                failed_step: format!("read_dir({}): {}", root.display(), e),
+                completed_steps: out.iter().map(|x| x.path.display().to_string()).collect(),
+            }
+        }
+    })?;
+    for item in rd {
+        let entry = item.map_err(Error::Io)?;
+        let de = DirEntry::from_std(entry);
+        let is_dir = de.is_dir;
+        let path = de.path.clone();
+        out.push(de);
+        if recursive && is_dir {
+            scan_into(&path, true, out)?;
+        }
+    }
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -286,6 +491,44 @@ mod tests {
         std::fs::create_dir(root.join("subdir")).expect("create subdir");
         let entries = handle().list(&root).expect("list");
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn test_expand_braces_no_braces_returns_input() {
+        assert_eq!(super::expand_braces("*.log"), vec!["*.log".to_string()]);
+    }
+
+    #[test]
+    fn test_expand_braces_single_group_two_alternatives() {
+        let out = super::expand_braces("{a,b}*.log");
+        assert_eq!(out, vec!["a*.log".to_string(), "b*.log".to_string()]);
+    }
+
+    #[test]
+    fn test_expand_braces_single_group_three_alternatives() {
+        let out = super::expand_braces("pre-{x,y,z}");
+        assert_eq!(
+            out,
+            vec![
+                "pre-x".to_string(),
+                "pre-y".to_string(),
+                "pre-z".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_expand_braces_multiple_groups_cartesian() {
+        let out = super::expand_braces("{a,b}-{1,2}");
+        assert_eq!(
+            out,
+            vec![
+                "a-1".to_string(),
+                "a-2".to_string(),
+                "b-1".to_string(),
+                "b-2".to_string(),
+            ]
+        );
     }
 
     #[test]

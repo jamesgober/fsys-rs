@@ -335,6 +335,199 @@ fn owner_dead() -> Error {
     Error::Io(std::io::Error::other("io_uring owner thread terminated"))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// NVMe passthrough capability detection + flush
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The 0.6.0 NVMe passthrough flush path uses the legacy
+// `NVME_IOCTL_IO_CMD` ioctl rather than `IORING_OP_URING_CMD`. The
+// ioctl is synchronous (no io_uring submission), but FLUSH is a
+// single-command op whose latency is dominated by the device's
+// flush time (~50–100 µs on consumer NVMe), not syscall overhead —
+// io_uring submission would add complexity (Entry128 SQEs, ring
+// reconstruction, kernel ≥ 5.19 requirement) for zero measurable
+// gain on this specific opcode. Filed as refinement R-1 in
+// `.dev/DECISIONS-0.6.0.md`.
+
+/// Result of resolving an arbitrary fd to its underlying NVMe
+/// character device for passthrough commands.
+pub(crate) struct NvmeAccess {
+    /// Open file handle on `/dev/nvmeX` (the character device).
+    /// Owned by this struct; closed on drop.
+    pub(crate) char_dev: std::fs::File,
+    /// NVMe namespace ID. `1` for typical single-namespace consumer
+    /// drives; we extract it from `/sys/block/.../nsid` when
+    /// possible, defaulting to `1` otherwise.
+    pub(crate) nsid: u32,
+}
+
+/// Probes whether NVMe passthrough flush is available for `fd`.
+///
+/// Returns `Some(NvmeAccess)` when:
+/// 1. `FSYS_DISABLE_NVME_PASSTHROUGH` env override is **not** set
+///    (locked decision D-11 in `.dev/DECISIONS-0.6.0.md`).
+/// 2. The block device backing `fd` is an NVMe drive.
+/// 3. `/dev/nvmeX` (the character device) opens successfully with
+///    `O_RDWR` — i.e. the calling process has the privilege to send
+///    raw NVMe commands (typically `CAP_SYS_ADMIN` or membership in
+///    the `disk` group).
+///
+/// Returns `None` on any failure. The caller's [`Method::Direct`]
+/// path falls back to `fdatasync` on Linux / `WRITE_THROUGH` on
+/// Windows per locked decision D-2.
+pub(crate) fn nvme_flush_capable(fd: RawFd) -> Option<NvmeAccess> {
+    // 1. Env override (testing aid).
+    if std::env::var_os("FSYS_DISABLE_NVME_PASSTHROUGH").is_some() {
+        return None;
+    }
+
+    // 2. Resolve fd → block device → NVMe character device.
+    let nvme_dev = nvme_char_device_for(fd)?;
+    let nsid = nvme_namespace_id_for(fd).unwrap_or(1);
+
+    // 3. Open the character device. EACCES here is the privilege
+    //    boundary we care about — return None for the silent-
+    //    fallback path.
+    let char_dev = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&nvme_dev)
+        .ok()?;
+
+    Some(NvmeAccess { char_dev, nsid })
+}
+
+/// Issues an NVMe FLUSH (opcode 0x00) on `nvme_fd` for namespace
+/// `nsid` via the legacy `NVME_IOCTL_IO_CMD` ioctl.
+///
+/// This is synchronous from the caller's perspective — the kernel
+/// submits the command to the controller, waits for completion, and
+/// returns the status. On capable hardware with sufficient
+/// privileges, latency is dominated by the device's volatile-cache
+/// flush time (~50–100 µs on consumer NVMe).
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] wrapping the underlying `EACCES`, `EPERM`,
+/// or hardware status code on failure. Callers that want to
+/// distinguish "passthrough denied at runtime" from other IO errors
+/// should match on the inner `io::ErrorKind`.
+pub(crate) fn nvme_flush_ioctl(nvme_fd: RawFd, nsid: u32) -> Result<()> {
+    // `nvme_passthru_cmd` layout per `linux/nvme_ioctl.h` (kernel
+    // ≥ 4.12 stable). 64-byte struct, all fields little-endian on
+    // x86_64 / aarch64.
+    #[repr(C)]
+    #[derive(Default)]
+    struct NvmePassthruCmd {
+        opcode: u8,
+        flags: u8,
+        rsvd1: u16,
+        nsid: u32,
+        cdw2: u32,
+        cdw3: u32,
+        metadata: u64,
+        addr: u64,
+        metadata_len: u32,
+        data_len: u32,
+        cdw10: u32,
+        cdw11: u32,
+        cdw12: u32,
+        cdw13: u32,
+        cdw14: u32,
+        cdw15: u32,
+        timeout_ms: u32,
+        result: u32,
+    }
+
+    // NVME_IOCTL_IO_CMD = _IOWR('N', 0x43, struct nvme_passthru_cmd)
+    // For x86_64, _IOWR with size 64 bytes ('N' = 0x4e, type 0x43):
+    //   dir=3 (RW) << 30 | size=64 << 16 | 'N' << 8 | nr=0x43
+    //   = 0xc040_4e43.
+    const NVME_IOCTL_IO_CMD: libc::c_ulong = 0xc040_4e43;
+
+    let mut cmd = NvmePassthruCmd {
+        opcode: 0x00, // FLUSH
+        nsid,
+        ..Default::default()
+    };
+
+    // SAFETY: `nvme_fd` is owned by the caller (an open `/dev/nvmeX`
+    // file) for the duration of this synchronous call. `&mut cmd`
+    // points to a stack-allocated `NvmePassthruCmd` of exactly the
+    // size the kernel expects (matched by the ioctl request code's
+    // size field). `ioctl` returns -1 on error rather than
+    // panicking; we surface `errno` via `last_os_error`.
+    let rc = unsafe { libc::ioctl(nvme_fd, NVME_IOCTL_IO_CMD, &mut cmd) };
+    if rc < 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Resolves `fd` to its NVMe character device path
+/// (e.g. `/dev/nvme0`).
+///
+/// Walks `fstat(fd)` → `st_dev` → `/sys/dev/block/<major>:<minor>` →
+/// readlink → trim namespace suffix. Returns `None` for non-block-
+/// device fds, non-NVMe block devices, or any IO error along the
+/// way.
+fn nvme_char_device_for(fd: RawFd) -> Option<std::path::PathBuf> {
+    // SAFETY: `libc::stat` is a plain-old-data C struct whose
+    // bit pattern of all-zeros is a valid initialization (every
+    // field is an integer or pointer that accepts zero); we
+    // overwrite it via `fstat` before reading.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is a valid open file descriptor owned by the
+    // caller for the duration of this call. `&mut stat` points to a
+    // properly aligned `libc::stat` on this stack frame; fstat
+    // writes through it before returning.
+    let rc = unsafe { libc::fstat(fd, &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+    let dev = stat.st_dev;
+    let major = libc::major(dev);
+    let minor = libc::minor(dev);
+    let block_link = format!("/sys/dev/block/{major}:{minor}");
+    let resolved = std::fs::canonicalize(&block_link).ok()?;
+    // resolved looks like `/sys/devices/.../block/nvme0n1`. The
+    // character device for that namespace is `/dev/nvme0`.
+    let name = resolved.file_name()?.to_str()?;
+    if !name.starts_with("nvme") {
+        return None;
+    }
+    // `nvme0n1` -> `nvme0`. `nvme0n1p3` -> `nvme0`.
+    let controller = name.split('n').next()?;
+    if controller.is_empty() || !controller.starts_with("nvme") {
+        return None;
+    }
+    Some(std::path::PathBuf::from(format!("/dev/{controller}")))
+}
+
+/// Reads the namespace ID for a block-device fd from
+/// `/sys/block/<dev>/nsid`. Defaults to 1 when the file is missing
+/// or unreadable (consumer NVMe drives universally use NSID 1 for
+/// the primary namespace).
+fn nvme_namespace_id_for(fd: RawFd) -> Option<u32> {
+    // SAFETY: `libc::stat` is a plain-old-data C struct whose
+    // bit pattern of all-zeros is a valid initialization (every
+    // field is an integer or pointer that accepts zero); we
+    // overwrite it via `fstat` before reading.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: same as `nvme_char_device_for` — fd is valid, stat is
+    // on this stack frame.
+    let rc = unsafe { libc::fstat(fd, &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+    let dev = stat.st_dev;
+    let major = libc::major(dev);
+    let minor = libc::minor(dev);
+    let nsid_path = format!("/sys/dev/block/{major}:{minor}/nsid");
+    let s = std::fs::read_to_string(&nsid_path).ok()?;
+    s.trim().parse::<u32>().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

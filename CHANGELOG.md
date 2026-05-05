@@ -7,6 +7,153 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-04
+
+### Added
+
+- **Async layer (gated behind the `async` Cargo feature).** Every
+  sync method on [`Handle`] gets an `_async` sibling: `write_async`,
+  `read_async`, `write_at_async`, `write_copy_async`,
+  `append_async`, `delete_async`, `truncate_async`, `rename_async`,
+  `copy_async`, `read_range_async`, `exists_async`, `size_async`,
+  `meta_async`, `mkdir_async`, `mkdir_all_async`, `rmdir_async`,
+  `rmdir_all_async`, `list_async`, `scan_async`, `find_async`,
+  `count_async`, `is_dir_async`, `is_file_async`. Plus async batch:
+  `write_batch_async`, `delete_batch_async`, `copy_batch_async`. And
+  async `quick`: `fsys::async_io::quick::{write_async, read_async,
+  delete_async, write_with_async}`.
+  - Single-op CRUD wrappers route through
+    [`tokio::task::spawn_blocking`] (locked decision D-1).
+  - Async batch routes through the existing per-handle dispatcher
+    via `tokio::sync::oneshot` (locked decision D-5). The
+    dispatcher's job carries a new `BatchResponse` enum:
+    `Sync(crossbeam_channel::Sender<...>)` or
+    `Async(tokio::sync::oneshot::Sender<...>)`. The dispatcher
+    matches exhaustively on the variant.
+  - 18 `#[tokio::test]` integration tests covering the full async
+    surface; 100× pre-merge stability run on the batch path
+    confirmed the enum refactor is regression-free.
+
+- **NVMe passthrough flush on Linux and Windows** (locked decision
+  D-2).
+  - **Linux:** `NVME_IOCTL_IO_CMD` ioctl carrying NVMe FLUSH
+    (opcode 0x00). Capability detection at the first Direct op:
+    resolves the file's underlying block device, opens
+    `/dev/nvmeX` with `O_RDWR`, caches success/failure on the
+    Handle. Falls back to `fdatasync` when not capable.
+  - **Windows:** `IOCTL_STORAGE_PROTOCOL_COMMAND` with
+    `ProtocolTypeNvme` carrying NVMe FLUSH. Capability detection
+    via Identify Controller probe; falls back to
+    `FILE_FLAG_WRITE_THROUGH` when not capable.
+  - **macOS:** intentionally not supported (Apple does not expose
+    the necessary primitives in mainstream APIs). `Method::Direct`
+    on macOS continues to use `F_NOCACHE + F_FULLFSYNC`.
+  - `FSYS_DISABLE_NVME_PASSTHROUGH=1` environment variable forces
+    the fallback path. Testing aid only — production callers who
+    want to disable passthrough should explicitly pick
+    `Method::Data` or `Method::Sync`.
+
+- **`Handle::active_durability_primitive() -> &'static str`** —
+  new accessor returning the canonical name of the durability
+  primitive currently in use (e.g. `"io_uring + NVMe FLUSH"`,
+  `"FILE_FLAG_WRITE_THROUGH"`, `"F_FULLFSYNC"`). Match against the
+  public constants in the new [`fsys::primitive`] module to avoid
+  string-typo bugs.
+
+- **`fsys::primitive`** — new public module of canonical
+  durability-primitive strings. Stable across `0.x.y` releases.
+
+- **Completion CRUD methods.**
+  - `Handle::write_copy(path, &data)` — atomic-swap with
+    metadata preservation. Unix: mode unconditional, owner/group
+    silent-skip-on-EPERM, mtime/atime via `utimensat`. Windows:
+    timestamps via `SetFileTime`, ACLs via
+    `GetNamedSecurityInfoW` / `SetNamedSecurityInfoW`.
+  - `Handle::scan(path, recursive)` — directory walk, optionally
+    recursive. Symlinks not followed in 0.6.0 (F-14 for 0.7.0+).
+  - `Handle::find(path, pattern)` — glob-based search. Standard
+    `glob` crate syntax (`*`, `**`, `?`, `[abc]`, `[!abc]`) plus
+    brace alternation `{foo,bar}` via a custom expansion
+    preprocessor (the `glob` crate doesn't natively support
+    braces).
+  - `Handle::count(path, recursive)` — count regular files at or
+    under `path`.
+  - `Handle::truncate(path, new_size)` — resize a file.
+  - `Handle::rename(old, new)` — atomic rename / move.
+
+- **4 new error variants.**
+  - `Error::NvmePassthroughUnsupported` (FS-00015).
+  - `Error::NvmePassthroughDenied` (FS-00016).
+  - `Error::AsyncRuntimeRequired` (FS-00017) — returned by `_async`
+    methods when called outside a tokio runtime.
+  - `Error::GlobPatternInvalid { reason }` (FS-00018).
+
+- **Stress / soak / fuzz infrastructure (pragmatic mode per
+  locked decision D-7).**
+  - `tests/stress.rs` — 3 soak tests gated behind the new
+    `stress` Cargo feature: 60 s default budget, 1 hour with
+    `--features stress`. Validates no memory growth, no thread
+    leaks, no per-handle resource leaks under continuous mixed
+    CRUD load.
+  - `tests/edge_cases.rs` — 11 edge-case tests covering 0-byte
+    payloads, exact page/sector boundaries, Unicode + emoji
+    paths, deeply nested directories, `MAX_PATH`-safe long
+    filenames, atomic-rename racing.
+  - `fuzz/` — cargo-fuzz workspace with three targets:
+    `path_normalize`, `glob_pattern`, `batch_builder`. Per
+    pragmatic mode, dev iteration runs ~60 s / 100K iterations;
+    CI nightly and pre-release runs the documented 1 hour / 1M
+    iterations.
+
+- **`docs/` directory** at the repo root with six user-facing
+  documents: `ARCHITECTURE.md`, `METHODS.md`, `PERFORMANCE.md`,
+  `CRASH-SAFETY.md`, `PLATFORM-NOTES.md`, `MIGRATION.md`.
+
+### Changed
+
+- **New runtime dependency:** `glob = "0.3"` (always-on, required
+  by `Handle::find`). Justified inline in `Cargo.toml`: mature
+  (~300k weekly downloads), well-maintained, no transitive
+  bloat. Selected over rolling our own glob (~500 LOC).
+
+- **Tokio feature set:** dropped `"fs"`, added `"rt"`,
+  `"rt-multi-thread"`, `"sync"`, `"macros"`. The async layer uses
+  `spawn_blocking` against the sync core, never tokio's `fs`
+  primitives.
+
+- **`windows-sys` features:** added
+  `Win32_Security_Authorization` for the `write_copy` ACL
+  preservation path.
+
+- **`BatchJob.response`** changed from
+  `crossbeam_channel::Sender<Result<…>>` to a new
+  `BatchResponse` enum (Sync or Async). Internal change — public
+  batch API surface is unchanged. The dispatcher matches
+  exhaustively on the enum.
+
+### Notes
+
+- `Method::Direct` on Linux now has three execution paths:
+  1. **io_uring + NVMe passthrough** (preferred when capable).
+  2. **io_uring + fdatasync** (when the ring is available but
+     NVMe passthrough isn't).
+  3. **`O_DIRECT` + `pwrite` + `fdatasync`** (final fallback).
+  `active_durability_primitive()` reports the actual primitive in
+  use.
+
+- `Method::Direct` on Windows now has two execution paths:
+  1. **`FILE_FLAG_WRITE_THROUGH` + NVMe IOCTL** (when admin +
+     capable hardware).
+  2. **`FILE_FLAG_WRITE_THROUGH`** (fallback).
+
+- Async layer adds zero new threads. `spawn_blocking` uses tokio's
+  existing blocking pool; the batch async path shares the
+  per-handle dispatcher with sync batches.
+
+- `cargo-fuzz` is **not** required for routine `cargo build` /
+  `cargo test`. The `fuzz/` directory is its own workspace; main
+  workspace builds ignore it.
+
 ## [0.5.1] - 2026-05-04
 
 ### Added
