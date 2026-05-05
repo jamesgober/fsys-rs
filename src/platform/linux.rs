@@ -402,12 +402,12 @@ pub(crate) fn preallocate(file: &File, offset: u64, len: u64) -> Result<()> {
     // Try `fallocate` first — fastest path, doesn't write zeros.
     // FALLOC_FL_KEEP_SIZE = 0x01.
     const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
-    // SAFETY: fd is valid; offset/len are u64 → off_t conversions
-    // bounded below i64::MAX by the caller's responsibility (file
-    // sizes don't exceed exabyte ranges in any realistic
-    // workload).
     let off = offset as libc::off_t;
     let len_off = len as libc::off_t;
+    // SAFETY: fd is a valid file descriptor owned by `file`;
+    // off/len are u64 → off_t conversions bounded below i64::MAX
+    // by the caller's responsibility (file sizes don't exceed
+    // exabyte ranges in any realistic workload).
     let ret = unsafe { libc::fallocate(fd, FALLOC_FL_KEEP_SIZE, off, len_off) };
     if ret == 0 {
         return Ok(());

@@ -34,6 +34,7 @@ use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::sync::Mutex;
 
 #[cfg(target_os = "linux")]
