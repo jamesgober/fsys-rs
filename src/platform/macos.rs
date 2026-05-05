@@ -359,12 +359,21 @@ pub(crate) fn preallocate(file: &File, offset: u64, len: u64) -> Result<()> {
     if len == 0 {
         return Ok(());
     }
-    // F_PREALLOCATE struct fstore_t:
-    //   u32 fst_flags;     // F_ALLOCATECONTIG (0x2) | F_ALLOCATEALL (0x4)
-    //   i32 fst_posmode;   // F_PEOFPOSMODE (3) for relative-to-EOF, F_VOLPOSMODE (4) for absolute
-    //   off_t fst_offset;
-    //   off_t fst_length;
-    //   off_t fst_bytesalloc; // out
+    // macOS preallocation goes through `fcntl(F_PREALLOCATE)` with
+    // an `fstore_t` describing the request. The `fst_posmode` field
+    // selects how `fst_offset` is interpreted:
+    //   - `F_PEOFPOSMODE` (3): allocate `fst_length` bytes past the
+    //     current logical EOF. `fst_offset` is unused.
+    //   - `F_VOLPOSMODE`  (4): allocate at a specific volume-physical
+    //     offset (advanced use; typically rejected with EINVAL on
+    //     ordinary files).
+    //
+    // For our semantic — reserve disk extents for an append-only
+    // journal — `F_PEOFPOSMODE` is the correct mode. The caller's
+    // `offset` parameter is interpreted as "additional bytes past
+    // current EOF", which on a fresh / append-only file matches
+    // the Linux `fallocate(offset, len)` behaviour for the usual
+    // calling shape (`preallocate(0, total_journal_size)`).
     #[repr(C)]
     struct Fstore {
         fst_flags: u32,
@@ -376,17 +385,23 @@ pub(crate) fn preallocate(file: &File, offset: u64, len: u64) -> Result<()> {
     const F_PREALLOCATE: libc::c_int = 42;
     const F_ALLOCATECONTIG: u32 = 0x0000_0002;
     const F_ALLOCATEALL: u32 = 0x0000_0004;
-    const F_VOLPOSMODE: i32 = 4;
+    const F_PEOFPOSMODE: i32 = 3;
 
     let fd = file.as_raw_fd();
+    // Reserve `offset + len` bytes past current EOF — this covers
+    // both the typical `preallocate(0, total)` case and the
+    // less-common `preallocate(off, len)` case where the caller
+    // wants extents reserved for a region they'll write later.
+    let total_to_reserve = offset.saturating_add(len) as libc::off_t;
     let mut store = Fstore {
         fst_flags: F_ALLOCATECONTIG | F_ALLOCATEALL,
-        fst_posmode: F_VOLPOSMODE,
-        fst_offset: offset as libc::off_t,
-        fst_length: len as libc::off_t,
+        fst_posmode: F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: total_to_reserve,
         fst_bytesalloc: 0,
     };
-    // SAFETY: fd is valid; F_PREALLOCATE expects an fstore_t pointer.
+    // SAFETY: fd is valid; F_PREALLOCATE expects an `fstore_t *`
+    // and reads/writes only that struct.
     let ret = unsafe { libc::fcntl(fd, F_PREALLOCATE, &mut store) };
     if ret == 0 {
         return Ok(());
