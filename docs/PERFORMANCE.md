@@ -20,8 +20,10 @@ this are regressions blocking merge.
 | `Method::Direct` 1 KiB write — Linux NVMe + NVMe passthrough | **< 50 µs p50** |
 | `Method::Direct` 1 KiB write — Linux NVMe (io_uring + fdatasync) | < 100 µs p50 |
 | `Method::Direct` 1 KiB write — Windows NVMe + IOCTL | < 200 µs p50 |
-| Async overhead vs sync (`spawn_blocking`) | < 50 µs added |
+| Async overhead vs sync (`spawn_blocking` substrate) | < 50 µs added |
+| Async overhead vs sync (native io_uring substrate, Linux + Direct, 0.7.0+) | within 5% of sync |
 | Async batch overhead (oneshot vs crossbeam) | < 5 µs added |
+| Native vs `spawn_blocking` substrate ratio (Linux + Direct, 4 KiB) | &geq; 1.1&times;; measured 1.46&times; on WSL2 + ext4 (D-8) |
 | `write_copy` 1 KiB | within 10% of `write` |
 | `scan` recursive — 10K files | < 50 ms |
 | `find` `**/*.txt` — 10K files | < 100 ms |

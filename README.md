@@ -57,10 +57,10 @@ The crate is usable and tested, but the API is not stable yet. Expect breaking c
 - **Root-scoped handles** &mdash; bind a `Handle` to a base directory and reject paths that escape it.
 - **Full file and directory CRUD** &mdash; write, read, append, positioned writes, range reads, truncate, rename, copy, metadata, sync, directory creation/removal, listing, recursive scan, glob find, and recursive count.
 - **Batch operations** &mdash; grouped writes, deletes, and copies through `write_batch`, `delete_batch`, `copy_batch`, and the chainable `Batch` builder.
-- **Async layer** &mdash; gated behind the `async` Cargo feature. Every sync method gets an `_async` sibling backed by `tokio::task::spawn_blocking`; async batch ops route through the per-handle dispatcher via `tokio::sync::oneshot`.
+- **Async layer with two substrates** &mdash; gated behind the `async` Cargo feature. Every sync method gets an `_async` sibling. On Linux + `Method::Direct`, async ops submit directly to the per-handle io_uring ring (the **native substrate**, new in `0.7.0`). Everywhere else, async ops route through `tokio::task::spawn_blocking`. Which substrate a handle uses is observable via `Handle::async_substrate() -> AsyncSubstrate`.
 - **Configurable group lane** &mdash; tune batch window, batch size, queue depth, io_uring queue depth, and aligned-buffer-pool size per handle.
 - **Quick one-shot API** &mdash; convenience helpers backed by a lazily initialized default handle for simple cases.
-- **Structured error reporting** &mdash; 18 explicit error variants with stable `FS-XXXXX` codes for unsupported methods, alignment failures, atomic-replace failures, NVMe passthrough denial, async-runtime requirements, glob-pattern errors, and batch failure position.
+- **Structured error reporting** &mdash; 21 explicit error variants with stable `FS-XXXXX` codes for unsupported methods, alignment failures, atomic-replace failures, NVMe passthrough denial, async-runtime requirements, glob-pattern errors, batch failure position, handle poisoning, io_uring submit failure, and completion-driver liveness.
 
 
 &nbsp;
@@ -113,26 +113,46 @@ Use `fsys` when you need one or more of the following:
 
 ## Status & roadmap
 
-Current state: **the public API is feature-complete for everything that will
-ship at `1.0`** &mdash; with the single exception of `Method::Journal`, which is
-deliberately reserved for `0.7.x`. The current release line is `0.6.x`.
+Current state: **the public API is feature-complete for `1.0` and frozen at
+the upcoming `0.8.0` alpha tag.** From `0.8.0` onward, only genuine bugs may
+change a name or signature. The current release line is `0.7.x`, which is
+the last breaking-change phase before alpha.
 
-`0.6.0` finished the public surface: the async layer, NVMe passthrough flush
-on Linux and Windows, completion CRUD methods (`write_copy`, `scan`, `find`,
-`count`), `Handle::active_durability_primitive()` plus the `fsys::primitive`
-constants module, and a publication-quality documentation pass across the
-crate. The `0.5.x` line consolidated real hardware probing, the real
-`Method::Mmap` implementation, the io_uring path on Linux, and the per-method
-crash-test harness. Everything from earlier phases (handle/builder, full
-file/dir CRUD, batch + group lane) is unchanged.
+`0.7.0` shipped the optimization phase: the **native io_uring async
+substrate** on Linux (`Method::Direct` + `async` feature) which submits
+directly to the per-handle ring instead of hopping `spawn_blocking`,
+the [`AsyncSubstrate`] enum + `Handle::async_substrate()` accessor, the
+`FSYS_DISABLE_NATIVE_ASYNC=1` environment override, PLP detection
+refinement (per-vendor enterprise-NVMe lookup table), 3 new error variants
+(`HandlePoisoned`, `IoUringSubmitFailed`, `CompletionDriverDead`), and the
+public-API audit pass that tightened 5 names (`read_range` &rarr; `read_at`,
+`scan(_, recursive)` split into `scan` + `scan_all`, same for `count`,
+`buffer_pool_size` &rarr; `buffer_pool_count`,
+`buffer_pool_block` &rarr; `buffer_pool_block_size`).
+
+`0.6.0` finished the rest of the public surface: the async layer, NVMe
+passthrough flush on Linux and Windows, completion CRUD methods
+(`write_copy`, `scan`, `find`, `count`), `Handle::active_durability_primitive()`
+plus the `fsys::primitive` constants module, and a publication-quality
+documentation pass across the crate. The `0.5.x` line consolidated real
+hardware probing, the real `Method::Mmap` implementation, the io_uring
+path on Linux, and the per-method crash-test harness. Everything from
+earlier phases (handle/builder, full file/dir CRUD, batch + group lane)
+is unchanged.
 
 What remains before `1.0`:
 
-- `Method::Journal` (intent-log durability) &mdash; `0.7.x` work.
-- A native io_uring async substrate (using io_uring as a true `Future`-driven
-  primitive instead of `spawn_blocking`) &mdash; `0.7.x`.
-- Deep audit, performance certification on real NVMe, full alpha &rarr; beta
-  &rarr; RC progression.
+- API freeze at the `0.8.0` alpha tag.
+- Tier-3 24-hour soak certification on representative hardware classes.
+- Bare-metal Linux native-substrate measurement (formalising the 2&times;+
+  expectation behind the 1.46&times; figure measured in WSL2 + ext4).
+- Crash-safety certification with forced-unmount sim.
+- Full alpha &rarr; beta &rarr; RC progression.
+
+`Method::Journal` (intent-log durability) is **deferred indefinitely**.
+The variant is kept in the public API as a forward-compatibility
+placeholder, but no version commits to implementing it; it needs its own
+multi-phase design pass that the alpha freeze takes priority over.
 
 The roadmap below shows where each phase landed.
 
@@ -141,9 +161,9 @@ The roadmap below shows where each phase landed.
 - `0.3.x` &mdash; [**DONE**]: Handle, CRUD, metadata, and cross-platform IO core.
 - `0.4.x` &mdash; [**DONE**]: Group-lane batching and dispatcher pipeline.
 - `0.5.x` &mdash; [**DONE**]: Real hardware probe, `Method::Mmap`, `Method::Direct` with io_uring on Linux, per-method crash tests.
-- `0.6.x` &mdash; [**CURRENT**]: Async layer, NVMe passthrough, completion CRUD, publication-quality docs.
-- `0.7.x` &mdash; [**NEXT**]: `Method::Journal`, native async io_uring, observability, deep audit.
-- `0.8.x` &mdash; [**BETA**]: Public testing and compatibility validation.
+- `0.6.x` &mdash; [**DONE**]: Async layer, NVMe passthrough, completion CRUD, publication-quality docs.
+- `0.7.x` &mdash; [**CURRENT**]: Native io_uring async substrate, PLP refinement, API audit + cleanup, regression suite, optimization phase.
+- `0.8.x` &mdash; [**NEXT (alpha + freeze)**]: API freeze. Tier-3 soak certification, bare-metal native-substrate measurement, crash-safety certification.
 - `0.9.x` &mdash; [**RC**]: Release candidate.
 - `1.0.0` &mdash; Stable API release.
 
@@ -156,14 +176,14 @@ The roadmap is aspirational, not a schedule. Versions ship when they're right, n
 
 ```toml
 [dependencies]
-fsys = "0.6.0"
+fsys = "0.7.0"
 ```
 
 To opt into the async layer:
 
 ```toml
 [dependencies]
-fsys = { version = "0.6.0", features = ["async"] }
+fsys = { version = "0.7.0", features = ["async"] }
 ```
 
 > ⚠️ The crate is published and usable, but it should still be treated as pre-stable software. Use it in production only if you are comfortable tracking breaking changes before `1.0.0`.
@@ -194,7 +214,7 @@ fsys = { version = "0.6.0", features = ["async"] }
 - Performance targets and tuning: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)
 - Crash-safety contract per method: [`docs/CRASH-SAFETY.md`](docs/CRASH-SAFETY.md)
 - Per-platform behavior + capability requirements: [`docs/PLATFORM-NOTES.md`](docs/PLATFORM-NOTES.md)
-- Migration policy: see the *Migration from 0.x to 1.0* section in [`docs/API.md`](docs/API.md) (added in `0.7.0`; replaces the standalone `MIGRATION.md` from `0.6.0`)
+- API stability + breaking-change policy: see *Stability + breaking-change policy* and *API changes in 0.7.0* in [`docs/API.md`](docs/API.md). Per-version migration deltas live in [`CHANGELOG.md`](CHANGELOG.md).
 
 
 
