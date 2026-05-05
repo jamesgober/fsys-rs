@@ -72,7 +72,18 @@ prohibited.
   method, root, mode, sector size, pipeline, buffer pool slot,
   io_uring slot (Linux), NVMe-passthrough slot (Linux + Windows).
 - **`crate::Method`** — durability strategy enum (`Sync`, `Data`,
-  `Mmap`, `Direct`, `Journal` (reserved 0.7.0), `Auto`).
+  `Mmap`, `Direct`, `Journal` (reserved variant — see note in
+  [`METHODS.md`](METHODS.md)), `Auto`).
+- **`crate::journal`** — open-once append-only log substrate
+  (shipped in 0.9.0). Independent of `Method`; opened via
+  `Handle::journal` / `Handle::journal_with` regardless of the
+  parent handle's method. Three throughput tiers
+  (cross-platform sync, lock-free POSIX/Windows append, native
+  io_uring async on Linux) plus an opt-in Direct-IO mode that
+  routes appends through a sector-aligned in-memory log buffer.
+  Production-grade frame format (magic + length + CRC-32C) and
+  five-state tail-truncation taxonomy enable correct
+  recovery-after-crash semantics.
 - **`crate::Builder`** — three-tier API (one-shot `quick::*`,
   default `new()`/`with(method)`, builder for advanced config).
 - **`crate::pipeline`** — per-handle dispatcher serving the

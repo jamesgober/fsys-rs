@@ -1,0 +1,208 @@
+name: Bench (matrix)
+
+# Manual-trigger benchmark workflow. Runs the canonical
+# `matrix_with_peers` bench on every supported platform's GitHub
+# Actions runner, posts results to the run summary (visible in the
+# Actions UI), and uploads them as artifacts for permanent record.
+#
+# Why manual-trigger only:
+# - Bench takes 5–10 minutes per OS; running on every push burns CI.
+# - GitHub runners are virtualised (azure-backed for ubuntu/windows,
+#   bare M-series for macOS) — numbers aren't directly comparable
+#   between runs but ARE useful as a "default machine" baseline.
+# - You want to fire this when you actually want a fresh number,
+#   typically after a perf-affecting change.
+#
+# Trigger:  Actions tab → "Bench (matrix)" → "Run workflow" → main.
+# Or via gh CLI: `gh workflow run bench.yml --ref main`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_windows:
+        description: 'Include Windows runner (slow; off by default)'
+        type: boolean
+        default: false
+      include_macos:
+        description: 'Include macOS runner'
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  bench-linux:
+    name: Bench (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Bench-specific cache key so we don't share with the
+          # release-mode test cache.
+          shared-key: bench-matrix
+
+      - name: Print runner spec
+        run: |
+          echo "## Runner spec" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- **OS:** $(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- **Kernel:** $(uname -srm)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- **CPU:** $(grep -m1 'model name' /proc/cpuinfo | sed 's/.*: //')" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- **Cores:** $(nproc)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- **Memory:** $(free -h | awk '/^Mem:/ {print $2}')" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- **Filesystem (\$TMPDIR):** $(stat -f -c '%T' "${TMPDIR:-/tmp}")" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- **io_uring available:** $(test -e /sys/kernel/io_uring && echo 'yes' || ls /proc/sys/kernel/io_uring_disabled 2>/dev/null >/dev/null && echo 'check sysctl' || echo 'unknown')" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Build bench (release)
+        run: cargo build --bench matrix_with_peers --features async --release
+
+      - name: Run bench → markdown
+        id: bench
+        run: |
+          mkdir -p bench-results
+          OUT="bench-results/matrix-ubuntu-latest.md"
+          # `cargo bench --bench` runs the binary; --features async needed for
+          # the `[[bench]] required-features = ["async"]` declaration.
+          cargo bench --bench matrix_with_peers --features async \
+            2>&1 \
+            | grep -v -e '^   Compiling' -e '^    Finished' -e '^     Running' \
+            | tee "$OUT"
+
+          # Post results to the workflow run summary so they show up
+          # immediately in the GitHub UI without downloading artifacts.
+          {
+            echo ""
+            echo "## Results — ubuntu-latest"
+            echo ""
+            cat "$OUT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-matrix-ubuntu-latest
+          path: bench-results/matrix-ubuntu-latest.md
+          retention-days: 90
+
+  bench-macos:
+    name: Bench (macos-latest)
+    if: ${{ inputs.include_macos }}
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-matrix-mac
+
+      - name: Print runner spec
+        run: |
+          echo "## Runner spec" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- **OS:** $(sw_vers -productName) $(sw_vers -productVersion)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- **Kernel:** $(uname -srm)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- **CPU:** $(sysctl -n machdep.cpu.brand_string)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- **Cores:** $(sysctl -n hw.ncpu)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- **Memory:** $(($(sysctl -n hw.memsize) / 1024 / 1024)) MiB" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Build bench (release)
+        run: cargo build --bench matrix_with_peers --features async --release
+
+      - name: Run bench → markdown
+        run: |
+          mkdir -p bench-results
+          OUT="bench-results/matrix-macos-latest.md"
+          cargo bench --bench matrix_with_peers --features async \
+            2>&1 \
+            | grep -v -e '^   Compiling' -e '^    Finished' -e '^     Running' \
+            | tee "$OUT"
+
+          {
+            echo ""
+            echo "## Results — macos-latest"
+            echo ""
+            cat "$OUT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-matrix-macos-latest
+          path: bench-results/matrix-macos-latest.md
+          retention-days: 90
+
+  bench-windows:
+    name: Bench (windows-latest)
+    if: ${{ inputs.include_windows }}
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-matrix-win
+
+      - name: Print runner spec
+        shell: pwsh
+        run: |
+          $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
+          $cores = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+          $mem = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+          $os = (Get-CimInstance Win32_OperatingSystem).Caption
+          @"
+          ## Runner spec
+
+          - **OS:** $os
+          - **CPU:** $cpu
+          - **Cores:** $cores
+          - **Memory:** $mem GiB
+
+          "@ | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      - name: Build bench (release)
+        run: cargo build --bench matrix_with_peers --features async --release
+
+      - name: Run bench → markdown
+        shell: bash
+        run: |
+          mkdir -p bench-results
+          OUT="bench-results/matrix-windows-latest.md"
+          cargo bench --bench matrix_with_peers --features async \
+            2>&1 \
+            | grep -v -e '^   Compiling' -e '^    Finished' -e '^     Running' \
+            | tee "$OUT"
+
+          {
+            echo ""
+            echo "## Results — windows-latest"
+            echo ""
+            cat "$OUT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-matrix-windows-latest
+          path: bench-results/matrix-windows-latest.md
+          retention-days: 90

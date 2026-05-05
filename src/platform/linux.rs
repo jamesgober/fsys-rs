@@ -133,6 +133,14 @@ pub(crate) fn write_all(file: &File, data: &[u8]) -> Result<()> {
 pub(crate) fn write_all_direct(file: &File, data: &[u8], sector_size: u32) -> Result<()> {
     use super::{round_up, AlignedBuf};
 
+    // Empty input — no bytes to write, no buffer to allocate. The
+    // caller's `open()` already created the file at size 0; this
+    // function is a no-op. (`AlignedBuf::new(0, ...)` would error;
+    // we short-circuit before reaching it.)
+    if data.is_empty() {
+        return Ok(());
+    }
+
     let ss = sector_size as usize;
     // O_DIRECT requires length to be a multiple of the sector size.
     // Pad with zeros if necessary.
@@ -142,12 +150,38 @@ pub(crate) fn write_all_direct(file: &File, data: &[u8], sector_size: u32) -> Re
     // Remainder is already zero from alloc_zeroed.
 
     let fd = file.as_raw_fd();
-    let ptr = buf.as_slice().as_ptr().cast::<libc::c_void>();
-    // SAFETY: fd is valid. buf is aligned to sector_size and has aligned_len
-    // bytes available. We write from offset 0 (this function is for new files).
-    let n = unsafe { libc::pwrite(fd, ptr, aligned_len, 0) };
-    if n < 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
+    let base = buf.as_slice().as_ptr();
+
+    // Loop on partial writes. `pwrite(2)` may return less than
+    // requested on EINTR or transient short-write conditions on
+    // certain filesystems. Without a loop, a Direct write of a
+    // large payload could silently truncate.
+    let mut written = 0usize;
+    while written < aligned_len {
+        // SAFETY: fd is valid; buf is sector-aligned and has
+        // aligned_len bytes available; the offset (written) and
+        // length (aligned_len - written) stay within bounds.
+        let n = unsafe {
+            libc::pwrite(
+                fd,
+                base.add(written).cast::<libc::c_void>(),
+                aligned_len - written,
+                written as libc::off_t,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(Error::Io(err));
+        }
+        if n == 0 {
+            return Err(Error::Io(std::io::Error::other(
+                "pwrite returned 0 in write_all_direct (no progress)",
+            )));
+        }
+        written += n as usize;
     }
     Ok(())
 }
@@ -181,6 +215,20 @@ pub(crate) fn write_at(file: &File, offset: u64, data: &[u8]) -> Result<()> {
         written += n as usize;
     }
     Ok(())
+}
+
+/// Sector-aligned positioned write for `O_DIRECT` files.
+///
+/// **Pre-conditions** (caller-enforced):
+/// - `data.as_ptr()` is aligned to the underlying device's sector size.
+/// - `data.len()` is a multiple of the sector size.
+/// - `offset` is a multiple of the sector size.
+///
+/// Used by the direct-IO journal log buffer. Same `pwrite` syscall as
+/// [`write_at`]; the alignment invariants come from the caller, not from
+/// any padding here.
+pub(crate) fn write_at_direct(file: &File, offset: u64, data: &[u8]) -> Result<()> {
+    write_at(file, offset, data)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -331,6 +379,76 @@ pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
 // ──────────────────────────────────────────────────────────────────────────────
 // Probes
 // ──────────────────────────────────────────────────────────────────────────────
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Storage-engine primitives — preallocate + advise
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Pre-allocates `len` bytes of disk space starting at `offset` via
+/// `fallocate(2)` with `FALLOC_FL_KEEP_SIZE`. Reserves filesystem
+/// extents without changing the logical file size — the journal
+/// can write into the reserved region knowing the kernel won't
+/// need to allocate blocks mid-write.
+///
+/// Falls back to `posix_fallocate(3)` if `fallocate` returns
+/// `EOPNOTSUPP` or `ENOSYS`. `posix_fallocate` is portable but
+/// writes zeros into the reserved region (slower, page-cache-
+/// polluting); `fallocate` is the modern Linux way.
+pub(crate) fn preallocate(file: &File, offset: u64, len: u64) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let fd = file.as_raw_fd();
+    // Try `fallocate` first — fastest path, doesn't write zeros.
+    // FALLOC_FL_KEEP_SIZE = 0x01.
+    const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+    // SAFETY: fd is valid; offset/len are u64 → off_t conversions
+    // bounded below i64::MAX by the caller's responsibility (file
+    // sizes don't exceed exabyte ranges in any realistic
+    // workload).
+    let off = offset as libc::off_t;
+    let len_off = len as libc::off_t;
+    let ret = unsafe { libc::fallocate(fd, FALLOC_FL_KEEP_SIZE, off, len_off) };
+    if ret == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    let raw = err.raw_os_error().unwrap_or(0);
+    // EOPNOTSUPP (95) on filesystems without fallocate (e.g. FUSE
+    // without the right hooks); ENOSYS (38) on very old kernels.
+    if raw != 95 && raw != 38 {
+        return Err(Error::Io(err));
+    }
+    // Fallback: posix_fallocate (writes zeros).
+    // SAFETY: fd is valid; off/len are bounded as above.
+    let ret = unsafe { libc::posix_fallocate(fd, off, len_off) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::from_raw_os_error(ret)))
+    }
+}
+
+/// Hints the kernel about access pattern for a region of `file`
+/// via `posix_fadvise(2)`.
+pub(crate) fn advise(file: &File, offset: u64, len: u64, advice: crate::Advice) -> Result<()> {
+    let fd = file.as_raw_fd();
+    let raw_advice: i32 = match advice {
+        crate::Advice::Normal => libc::POSIX_FADV_NORMAL,
+        crate::Advice::Sequential => libc::POSIX_FADV_SEQUENTIAL,
+        crate::Advice::Random => libc::POSIX_FADV_RANDOM,
+        crate::Advice::WillNeed => libc::POSIX_FADV_WILLNEED,
+        crate::Advice::DontNeed => libc::POSIX_FADV_DONTNEED,
+    };
+    // SAFETY: fd is valid; offset/len are u64 → off_t.
+    let ret =
+        unsafe { libc::posix_fadvise(fd, offset as libc::off_t, len as libc::off_t, raw_advice) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::from_raw_os_error(ret)))
+    }
+}
 
 pub(crate) fn probe_sector_size(path: &Path) -> u32 {
     let path_cstr = match path_to_cstr(path) {

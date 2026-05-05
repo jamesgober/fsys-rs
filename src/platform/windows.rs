@@ -13,8 +13,12 @@
 //!   need for a separate `FlushFileBuffers` call on the Direct IO path.
 //! - **Alignment:** `GetDiskFreeSpaceW` returns `BytesPerSector` at handle
 //!   creation; the same sector size is used to size aligned scratch buffers.
-//! - **Positioned writes (`write_at`):** uses `SetFilePointerEx` + `WriteFile`.
-//!   IOCP / overlapped IO is deferred to `0.5.0`.
+//! - **Positioned writes (`write_at`):** uses `WriteFile` with an
+//!   `OVERLAPPED` struct carrying the offset (Windows' equivalent of
+//!   POSIX `pwrite`). Concurrent-safe at the same fd because the
+//!   per-fd cursor is not consulted for the write position.
+//!   (0.8.0 R-1 tier-2 fix; earlier versions used SetFilePointerEx +
+//!   WriteFile which raced on the cursor under multi-thread append.)
 //! - **Copy:** `std::fs::copy` (wraps `CopyFileExW` internally in std).
 //!   `FSCTL_DUPLICATE_EXTENTS_TO_FILE` (ReFS reflink) is deferred to `0.5.0`.
 
@@ -30,11 +34,11 @@ use windows_sys::Win32::Foundation::{
     BOOL, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, GetDiskFreeSpaceW, MoveFileExW, ReadFile, SetFilePointerEx,
-    WriteFile, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_FLAG_NO_BUFFERING,
-    FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
+    CreateFileW, FlushFileBuffers, GetDiskFreeSpaceW, MoveFileExW, ReadFile, WriteFile, CREATE_NEW,
+    FILE_ATTRIBUTE_NORMAL, FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
 };
+use windows_sys::Win32::System::IO::OVERLAPPED;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // File opening
@@ -207,6 +211,12 @@ pub(crate) fn write_all(file: &File, data: &[u8]) -> Result<()> {
 pub(crate) fn write_all_direct(file: &File, data: &[u8], sector_size: u32) -> Result<()> {
     use super::{round_up, AlignedBuf};
 
+    // Empty input — no-op. See linux.rs::write_all_direct for the
+    // rationale (AlignedBuf::new rejects size=0).
+    if data.is_empty() {
+        return Ok(());
+    }
+
     let ss = sector_size as usize;
     let aligned_len = round_up(data.len(), ss);
     let mut buf = AlignedBuf::new(aligned_len, ss)?;
@@ -217,21 +227,80 @@ pub(crate) fn write_all_direct(file: &File, data: &[u8], sector_size: u32) -> Re
 }
 
 pub(crate) fn write_at(file: &File, offset: u64, data: &[u8]) -> Result<()> {
+    // Concurrent-safe positioned write — Windows' equivalent of
+    // POSIX `pwrite`. We pass the offset via an `OVERLAPPED`
+    // struct rather than `SetFilePointerEx`-then-`WriteFile`,
+    // because the latter mutates the per-fd cursor and is NOT
+    // thread-safe across concurrent callers on the same fd.
+    //
+    // (0.8.0 R-1 tier-2 fix. Earlier versions used
+    // SetFilePointerEx + WriteFile, which the journal substrate's
+    // multi-thread concurrent-append benchmark surfaced as
+    // anti-scaling: aggregate throughput went DOWN as thread
+    // count went up because threads raced on the cursor.)
+    //
+    // For synchronous file handles (those NOT opened with
+    // FILE_FLAG_OVERLAPPED — fsys's default), MSDN documents
+    // that passing OVERLAPPED with the offset fields set causes
+    // WriteFile to write at that exact offset synchronously.
+    // The fd cursor *does* advance after the call, but two
+    // threads each passing distinct offsets via OVERLAPPED do
+    // not race on the cursor for the *write* itself.
     let handle = file.as_raw_handle() as HANDLE;
 
-    // Seek to the requested offset.
-    let dist_lo = (offset & 0xFFFF_FFFF) as i32;
-    let dist_hi = (offset >> 32) as i32;
-    // SAFETY: handle is valid; FILE_BEGIN is a valid move method.
-    let ok: BOOL =
-        unsafe { SetFilePointerEx(handle, dist_lo as i64, std::ptr::null_mut(), FILE_BEGIN) };
-    // SetFilePointerEx returns 0 on failure (not INVALID_SET_FILE_POINTER).
-    if ok == FALSE {
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-    let _ = dist_hi; // Used implicitly via the i64 cast above.
+    let mut written_total: u32 = 0;
+    while (written_total as usize) < data.len() {
+        let remaining = data.len() - written_total as usize;
+        // WriteFile takes a u32 length; cap at u32::MAX.
+        let chunk_len: u32 = remaining.min(u32::MAX as usize) as u32;
+        let chunk_offset = offset + written_total as u64;
 
-    write_all(file, data)
+        // Build the OVERLAPPED struct. Only the offset fields
+        // need to be set; hEvent stays zero (we're synchronous).
+        // Zeroing via std::mem::zeroed is sound — OVERLAPPED is
+        // a plain old struct with no invalid bit patterns.
+        // SAFETY: OVERLAPPED is repr(C), all-zero bit pattern
+        // is a valid initial value per Windows API contract.
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        // `Anonymous` is a union {Anonymous: { Offset, OffsetHigh }, Pointer }.
+        // Writing to a union variant is safe (only reading is
+        // unsafe because the active variant might not match).
+        overlapped.Anonymous.Anonymous.Offset = (chunk_offset & 0xFFFF_FFFF) as u32;
+        overlapped.Anonymous.Anonymous.OffsetHigh = (chunk_offset >> 32) as u32;
+
+        let mut written: u32 = 0;
+        let buf_ptr = data[written_total as usize..].as_ptr();
+        // SAFETY: handle is valid; buf_ptr points to chunk_len
+        // valid bytes; written is a valid out-pointer; overlapped
+        // is a valid OVERLAPPED struct with offset fields set.
+        let ok: BOOL =
+            unsafe { WriteFile(handle, buf_ptr, chunk_len, &mut written, &mut overlapped) };
+        if ok == FALSE {
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
+        if written == 0 {
+            return Err(Error::Io(std::io::Error::other(
+                "WriteFile returned 0 bytes written in write_at",
+            )));
+        }
+        written_total += written;
+    }
+    Ok(())
+}
+
+/// Sector-aligned positioned write for `FILE_FLAG_NO_BUFFERING` files.
+///
+/// **Pre-conditions** (caller-enforced):
+/// - `data.as_ptr()` is sector-aligned.
+/// - `data.len()` is a multiple of the sector size.
+/// - `offset` is a multiple of the sector size.
+///
+/// Same `WriteFile` + `OVERLAPPED` path as [`write_at`]; the
+/// alignment invariants come from the caller (the journal direct-mode
+/// log buffer is allocated from `AlignedBuf` and flushed only at
+/// sector boundaries).
+pub(crate) fn write_at_direct(file: &File, offset: u64, data: &[u8]) -> Result<()> {
+    write_at(file, offset, data)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -359,6 +428,88 @@ pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
 // ──────────────────────────────────────────────────────────────────────────────
 // Probes
 // ──────────────────────────────────────────────────────────────────────────────
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Storage-engine primitives — preallocate + advise
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Windows preallocate via `SetFileInformationByHandle` with
+/// `FileAllocationInfo` — the proper analog to Linux's
+/// `fallocate(FALLOC_FL_KEEP_SIZE)`. Reserves NTFS extents
+/// without changing the file's logical size (EOF). The journal's
+/// reader doesn't see zero-filled tail bytes; the writer's
+/// subsequent `WriteFile` calls land on pre-reserved extents
+/// without per-write allocation jitter.
+///
+/// Note: `SetFileInformationByHandle(FileAllocationInfo)` requests
+/// allocation; the actual disk blocks may still be lazily zeroed
+/// by NTFS on first write. True physical preallocation (zero-
+/// initialised blocks at preallocate time) requires
+/// `SetFileValidData` which needs the `SE_MANAGE_VOLUME_NAME`
+/// privilege. The current implementation is the best-available
+/// non-privileged path.
+pub(crate) fn preallocate(file: &File, offset: u64, len: u64) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileAllocationInfo, GetFileSizeEx, SetFileInformationByHandle, FILE_ALLOCATION_INFO,
+    };
+    let handle = file.as_raw_handle() as HANDLE;
+
+    // Compute target allocation size.
+    let end = offset.saturating_add(len);
+    let target = i64::try_from(end).map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "preallocate target offset exceeds i64::MAX",
+        ))
+    })?;
+
+    // Don't shrink — only grow allocation.
+    let mut current: i64 = 0;
+    // SAFETY: handle is valid; GetFileSizeEx writes the size to the out-pointer.
+    let ok: BOOL = unsafe { GetFileSizeEx(handle, &mut current) };
+    if ok == FALSE {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    if target <= current {
+        return Ok(());
+    }
+
+    let info = FILE_ALLOCATION_INFO {
+        AllocationSize: target,
+    };
+    // SAFETY: handle is valid; FileAllocationInfo expects a
+    // FILE_ALLOCATION_INFO struct of size_of::<FILE_ALLOCATION_INFO>().
+    let ok: BOOL = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileAllocationInfo,
+            &info as *const _ as *const _,
+            std::mem::size_of::<FILE_ALLOCATION_INFO>() as u32,
+        )
+    };
+    if ok == FALSE {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Windows advise — best-effort no-op for runtime hints. Windows
+/// lacks a per-range cache advisory API equivalent to
+/// `posix_fadvise`. Sequential / Random hints CAN be applied at
+/// file-open time via `FILE_FLAG_SEQUENTIAL_SCAN` /
+/// `FILE_FLAG_RANDOM_ACCESS`, but only at open and only at the
+/// whole-file granularity.
+///
+/// We accept the call and return `Ok(())` so cross-platform
+/// callers don't need to `cfg`-gate. Future Windows-specific
+/// improvements can wire in `PrefetchVirtualMemory` for
+/// `WillNeed`.
+pub(crate) fn advise(_file: &File, _offset: u64, _len: u64, _advice: crate::Advice) -> Result<()> {
+    Ok(())
+}
 
 pub(crate) fn probe_sector_size(path: &Path) -> u32 {
     // GetDiskFreeSpaceW returns the bytes-per-sector of the volume hosting

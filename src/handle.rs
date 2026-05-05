@@ -196,7 +196,14 @@ pub struct Handle {
     /// lifetime. The Mutex is held only briefly during lazy init —
     /// once the pool is constructed, leasing is lock-free on the
     /// fast path.
-    pool_slot: Mutex<Option<AlignedBufferPool>>,
+    /// Lock-free slot — `OnceLock::get()` is a single atomic load
+    /// after first init, so the buffer-pool fast path on every
+    /// Direct write costs zero mutex acquires. The slot is set
+    /// exactly once (lazy init); after that, all reads are
+    /// uncontended atomic loads. (0.8.0 I round-3 perf fix —
+    /// previously `Mutex<Option<AlignedBufferPool>>` cost a mutex
+    /// acquire per Direct op even after init.)
+    pool_slot: std::sync::OnceLock<AlignedBufferPool>,
     /// Linux-only: requested `io_uring` SQ depth (from
     /// [`crate::Builder::io_uring_queue_depth`]). Captured at
     /// construction; consumed by [`Handle::io_uring_ring`] on the
@@ -249,7 +256,7 @@ impl Handle {
             sector_size,
             pipeline,
             pool_config,
-            pool_slot: Mutex::new(None),
+            pool_slot: std::sync::OnceLock::new(),
             #[cfg(target_os = "linux")]
             iouring_queue_depth,
             #[cfg(target_os = "linux")]
@@ -604,20 +611,32 @@ impl Handle {
     /// probed sector size.
     #[allow(dead_code)] // wired into Direct path in 0.5.x patch alongside io_uring lift
     pub(crate) fn buffer_pool(&self) -> Result<AlignedBufferPool> {
-        let mut guard = match self.pool_slot.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        if let Some(pool) = guard.as_ref() {
+        // Fast path: post-init read is a single atomic load + Arc clone.
+        if let Some(pool) = self.pool_slot.get() {
             return Ok(pool.clone());
         }
+        // Slow path: first-init. Construct, then race-set into the
+        // OnceLock. If we lose the race (another thread populated
+        // the slot first), our local `pool` is dropped and we
+        // return the slot's value. Either way, the slot is
+        // populated exactly once for this handle's lifetime.
         let pool = AlignedBufferPool::new(
             self.pool_config.capacity,
             self.pool_config.block_size,
             self.pool_config.block_align,
         )?;
-        *guard = Some(pool.clone());
-        Ok(pool)
+        // `set` returns Err with our `pool` if the slot was already
+        // populated by a racing thread. Either way, after `set`
+        // returns the slot is definitely populated — by us or by
+        // the winner. We always read from the slot so callers from
+        // different threads see a coherent pool (lease/return
+        // pairing requires the same allocation).
+        let _ = self.pool_slot.set(pool);
+        self.pool_slot.get().cloned().ok_or_else(|| {
+            Error::Io(std::io::Error::other(
+                "buffer pool slot was unset after set — impossible",
+            ))
+        })
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -682,6 +701,112 @@ impl Handle {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
+    // Journal API (0.8.0)
+    //
+    // High-throughput append-only durability primitive. Independent of
+    // [`Method`] — works with every Handle regardless of how the parent
+    // Handle was constructed. See [`crate::journal`] for the design
+    // rationale and the `JournalHandle` API.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Opens an append-only journal at `path`.
+    ///
+    /// The journal is the high-throughput durability primitive
+    /// that databases / queues / ledgers should use for WAL-style
+    /// workloads. Unlike [`Handle::write`] (atomic-replace, 5–7
+    /// syscalls per call, fsync per call), the journal opens
+    /// once, supports concurrent appends without per-call fsync,
+    /// and exposes group-commit durability via
+    /// [`crate::JournalHandle::sync_through`].
+    ///
+    /// If `path` already exists, the journal resumes at the
+    /// existing file size (next LSN = existing length). If not,
+    /// the file is created.
+    ///
+    /// `path` is resolved against the handle's
+    /// [`crate::Builder::root`] scope if one is configured, with
+    /// the same canonical-prefix security check as
+    /// [`Handle::write`].
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use fsys::builder;
+    ///
+    /// # fn main() -> fsys::Result<()> {
+    /// let fs = builder().build()?;
+    /// let log = Arc::new(fs.journal("/var/log/app.wal")?);
+    ///
+    /// // Many appends, no fsync.
+    /// let _lsn1 = log.append(b"event 1")?;
+    /// let _lsn2 = log.append(b"event 2")?;
+    /// let lsn3 = log.append(b"event 3")?;
+    ///
+    /// // One group-commit fsync covers all three.
+    /// log.sync_through(lsn3)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidPath`] if `path` escapes the handle root.
+    /// - [`Error::Io`] on the underlying open failure.
+    pub fn journal(&self, path: impl AsRef<std::path::Path>) -> Result<crate::JournalHandle> {
+        let resolved = self.resolve_path(path.as_ref())?;
+        crate::journal::JournalHandle::open(&resolved)
+    }
+
+    /// Opens an append-only journal at `path` honoring the
+    /// supplied [`crate::JournalOptions`].
+    ///
+    /// Use this entry point when you need Direct-IO mode
+    /// (`JournalOptions::direct(true)`) or a non-default log
+    /// buffer size. For the standard buffered-mode path, use
+    /// [`Self::journal`].
+    ///
+    /// Path resolution is identical to [`Self::journal`] — the
+    /// path is canonicalised against the handle root if one is
+    /// configured, with the same security check.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use fsys::{builder, JournalOptions};
+    ///
+    /// # fn main() -> fsys::Result<()> {
+    /// let fs = builder().build()?;
+    /// let log = Arc::new(fs.journal_with(
+    ///     "/var/lib/mydb/wal",
+    ///     JournalOptions::new().direct(true).log_buffer_kib(256),
+    /// )?);
+    ///
+    /// // Same API as a standard journal — direct mode is
+    /// // transparent to the caller.
+    /// let _lsn = log.append(b"event 1")?;
+    /// log.sync_through(log.next_lsn())?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidPath`] if `path` escapes the handle root.
+    /// - [`Error::Io`] on the underlying open failure or — in
+    ///   direct mode — on a non-recoverable resume tail state
+    ///   (`BadMagic`, `LengthOverflow`).
+    pub fn journal_with(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        options: crate::JournalOptions,
+    ) -> Result<crate::JournalHandle> {
+        let resolved = self.resolve_path(path.as_ref())?;
+        crate::journal::options::open_with_options(&resolved, options)
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
     // Crate-internal helpers
     // ──────────────────────────────────────────────────────────────────────────
 
@@ -701,12 +826,32 @@ impl Handle {
 
     /// Resolves a caller-supplied path against this handle's root.
     ///
-    /// If the handle has a root:
-    /// - Absolute paths are checked to ensure they are rooted *inside* the
-    ///   handle root (rejects path-escape attacks).
-    /// - Relative paths are joined to the root.
+    /// **Security contract.** The handle's `root` was canonicalised
+    /// at [`Builder::build`] time (all symlinks resolved). This
+    /// function performs lexical normalisation of the caller's path,
+    /// then **re-canonicalises the longest existing prefix** of the
+    /// resolved path and verifies it still lies inside the canonical
+    /// root. That second check catches the case where a symlink
+    /// inside the root points outside it: the lexical `starts_with`
+    /// check would pass, but the canonical-prefix check rejects.
+    ///
+    /// For paths whose target does not yet exist (e.g. `write` to a
+    /// new file), only the existing prefix is canonicalised; the
+    /// not-yet-existing tail components are joined back lexically.
+    /// This is sound because `open(O_CREAT|O_EXCL)` and
+    /// `atomic_rename` operate within the just-canonicalised parent.
     ///
     /// If the handle has no root, the path is returned as-is.
+    ///
+    /// **Known gap (TOCTOU).** A truly hostile local actor could
+    /// race a symlink swap between this resolution and the
+    /// subsequent `open`. The 1.0 mitigation is a platform-specific
+    /// `openat2(RESOLVE_BENEATH)` (Linux 5.6+) /
+    /// `O_NOFOLLOW`-walked openat (POSIX) /
+    /// `FILE_FLAG_OPEN_REPARSE_POINT` (Windows) primitive that
+    /// closes the race entirely. Filed for 0.9.0+; for 0.8.0 alpha
+    /// the lexical + canonical-prefix check is the documented
+    /// guarantee.
     pub(crate) fn resolve_path(&self, path: &Path) -> Result<PathBuf> {
         let Some(root) = &self.root else {
             return Ok(path.to_owned());
@@ -718,10 +863,8 @@ impl Handle {
             root.join(path)
         };
 
-        // Canonicalise components without touching the filesystem so that
-        // a path like `root/a/../../../etc/passwd` is caught before any
-        // syscall. We do a simple lexical normalisation: process each
-        // component and reject `..` that would escape the root.
+        // Pass 1 — lexical normalisation. Catches `..` traversal
+        // that exceeds the root depth before any syscall fires.
         let mut resolved = PathBuf::new();
         for component in candidate.components() {
             use std::path::Component;
@@ -749,15 +892,117 @@ impl Handle {
             }
         }
 
-        // Final check: the resolved path must start with the root.
+        // Pass 2 — lexical `starts_with(root)` check on the
+        // normalised path. Cheap; rejects obvious escapes before
+        // we touch the filesystem.
         if !resolved.starts_with(root) {
             return Err(Error::InvalidPath {
                 path: path.to_owned(),
-                reason: "path escapes the handle root".into(),
+                reason: "path escapes the handle root (lexical)".into(),
             });
         }
 
-        Ok(resolved)
+        // 0.8.0 I round-3 fast path. The expensive Pass 3
+        // (`canonicalize` syscall on every op) is a 50–200 µs cost
+        // on Windows. The vast majority of operations fall into a
+        // shape where canonicalize is *unnecessary*:
+        //
+        //   - The resolved path's parent equals the canonical
+        //     root (i.e. the user wrote `fs.write("file.txt")`,
+        //     not `fs.write("subdir/file.txt")`).
+        //   - The leaf component either doesn't exist yet (write-
+        //     new case) or is not a symlink (regular file/dir).
+        //
+        // For that shape, the security guarantee is preserved by:
+        //   1. The canonical-root invariant (Builder::build canonicalised it).
+        //   2. The lexical pass-1 normalisation rejecting `..`-escape.
+        //   3. A cheap `symlink_metadata` (`lstat`) on the leaf to
+        //      reject symlinked-leaf-pointing-outside.
+        //
+        // Cost of the fast path: 1 `lstat` syscall (~1–5 µs) vs.
+        // 1 `canonicalize` syscall (~50–200 µs on Windows). 10×+
+        // speedup for the common case.
+        //
+        // The slow path (Pass 3 below) handles the remaining cases
+        // — nested writes (`subdir/file.txt`), reads of paths with
+        // symlinks anywhere in the chain, etc.
+        if let Some(parent) = resolved.parent() {
+            if parent == root.as_path() {
+                match std::fs::symlink_metadata(&resolved) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Write-new case — leaf doesn't exist; the parent
+                        // is the canonical root; we're safe.
+                        return Ok(resolved);
+                    }
+                    Ok(meta) if !meta.file_type().is_symlink() => {
+                        // Existing leaf, not a symlink. Safe.
+                        return Ok(resolved);
+                    }
+                    _ => {
+                        // Either the leaf IS a symlink (potentially
+                        // pointing outside root) or another error —
+                        // fall through to the canonicalize-based
+                        // slow path below for proper validation.
+                    }
+                }
+            }
+        }
+
+        // Pass 3 — canonicalise the longest existing prefix and
+        // verify it still lies inside the canonical root. This is
+        // the load-bearing security check: it catches symlinks
+        // inside the root that point outside.
+        let mut existing_prefix = resolved.clone();
+        let mut tail_components: Vec<std::ffi::OsString> = Vec::new();
+        loop {
+            match std::fs::canonicalize(&existing_prefix) {
+                Ok(canon) => {
+                    if !canon.starts_with(root) {
+                        return Err(Error::InvalidPath {
+                            path: path.to_owned(),
+                            reason:
+                                "path escapes the handle root via symlink (canonical-prefix check)"
+                                    .into(),
+                        });
+                    }
+                    // Re-attach any not-yet-existing tail components.
+                    let mut out = canon;
+                    for tail in tail_components.iter().rev() {
+                        out.push(tail);
+                    }
+                    return Ok(out);
+                }
+                Err(_) => {
+                    // The path doesn't exist at this depth; pop one
+                    // component and retry. If we've popped past the
+                    // root, the path is unreachable.
+                    let popped = match existing_prefix.file_name() {
+                        Some(n) => n.to_os_string(),
+                        None => {
+                            return Err(Error::InvalidPath {
+                                path: path.to_owned(),
+                                reason: "path has no canonical existing ancestor".into(),
+                            });
+                        }
+                    };
+                    tail_components.push(popped);
+                    if !existing_prefix.pop() {
+                        return Err(Error::InvalidPath {
+                            path: path.to_owned(),
+                            reason: "path has no canonical existing ancestor".into(),
+                        });
+                    }
+                    // Defensive: if we've popped past the canonical
+                    // root, the path can't be inside.
+                    if !existing_prefix.starts_with(root) && existing_prefix != *root {
+                        return Err(Error::InvalidPath {
+                            path: path.to_owned(),
+                            reason: "no canonical ancestor lies within the handle root".into(),
+                        });
+                    }
+                }
+            }
+        }
     }
 
     /// Generates a unique temp-file path adjacent to `path`.
@@ -768,12 +1013,29 @@ impl Handle {
     pub(crate) fn gen_temp_path(path: &Path) -> PathBuf {
         let n = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let stem = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let name = format!(".fsys-tmp-{}.{}", n, stem);
-        parent.join(name)
+
+        // Build the temp name as an `OsString` directly, without
+        // routing through `String`/`format!`. This stays in
+        // `OsStr`-land for non-UTF-8 filenames (Linux can have
+        // those) and avoids the `to_string_lossy` -> `into_owned`
+        // -> `format!` -> `parent.join` chain that allocated 3
+        // strings + 1 PathBuf per call. Now: 1 OsString + 1
+        // PathBuf (from `parent.join`).
+        //
+        // The format `.fsys-tmp-<n>.<original_filename>` is
+        // preserved exactly so crash-recovery scripts that match
+        // on the prefix continue to work.
+        use std::ffi::OsString;
+        let mut temp_name = OsString::with_capacity(32);
+        temp_name.push(".fsys-tmp-");
+        // `n.to_string()` allocates a small String — itoa would
+        // avoid it but adding a dep for one site isn't justified.
+        temp_name.push(n.to_string());
+        temp_name.push(".");
+        if let Some(stem) = path.file_name() {
+            temp_name.push(stem);
+        }
+        parent.join(temp_name)
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -1062,7 +1324,12 @@ mod tests {
 
     #[test]
     fn test_resolve_path_with_root_joins() {
-        let root = std::env::temp_dir();
+        // 0.8.0: `resolve_path`'s canonical-prefix check requires the
+        // stored root to be canonical (which `Builder::build` enforces
+        // for all public entry points). `Handle::new_raw` is the
+        // pub(crate) backdoor used by tests; pass a canonical root
+        // directly.
+        let root = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp");
         let h = Handle::new_raw(
             Method::Sync,
             Method::Sync,

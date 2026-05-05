@@ -17,8 +17,10 @@ Pick the cheapest method that satisfies your durability requirement.
 | `Data` | `fdatasync(2)` | falls back to `Sync` | falls back to `Sync` | ~500 µs–5 ms | data-only durability, no metadata |
 | `Mmap` | `mmap` + `msync(MS_SYNC)` | `mmap` + `msync` | `MapViewOfFile` + `FlushViewOfFile` | size-dependent | read-heavy random access |
 | `Direct` | `O_DIRECT` + io_uring (+ NVMe FLUSH on capable HW) | `F_NOCACHE` + `F_FULLFSYNC` | `FILE_FLAG_WRITE_THROUGH` (+ NVMe IOCTL on capable HW) | < 100 µs target | append-heavy or cache-bypass writes |
-| `Journal` | (reserved 0.7.0) | (reserved 0.7.0) | (reserved 0.7.0) | (n/a) | append-only WAL |
+| `Journal` | reserved variant — no committed implementation | reserved variant | reserved variant | n/a | reserved enum slot only; see note below |
 | `Auto` | hardware-aware | hardware-aware | hardware-aware | varies | "pick something sensible" |
+
+> **Note on `Method::Journal`.** This enum variant is a forward-compatibility placeholder reserved at 0.7.0 and intentionally not implemented. Append-only / write-ahead-log workloads should use the dedicated [journal substrate](API.md#journal-substrate) shipped in 0.9.0 — opened via [`Handle::journal`] / [`Handle::journal_with`], surfaced through [`JournalHandle`], and entirely independent of the `Method` enum. The journal substrate is a structurally different primitive (open-once log file with explicit LSN reservation and group-commit fsync) rather than a per-write durability strategy, which is why it lives outside the `Method` taxonomy.
 
 ## How to pick
 

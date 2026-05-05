@@ -424,13 +424,38 @@ impl Handle {
 /// group, split its contents on commas, and recursively expand the
 /// surrounding context with each alternative substituted in. The
 /// recursion's depth is bounded by the number of brace groups.
+///
+/// Hard-bounded to [`MAX_EXPANSION`] total expansions to prevent
+/// exponential-blowup attacks: a pattern like `{a,b}` chained 20
+/// times produces ≈ 1M expansions, each its own string allocation.
+/// Beyond the bound, this function returns the original pattern
+/// unchanged — `glob` will then either match it literally (if it's
+/// a valid glob) or surface a `GlobPatternInvalid` error. (0.8.0
+/// J-checkpoint security fix.)
+const MAX_BRACE_EXPANSIONS: usize = 1024;
+
 fn expand_braces(pattern: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(1);
+    expand_braces_into(pattern, &mut out);
+    out
+}
+
+fn expand_braces_into(pattern: &str, out: &mut Vec<String>) {
+    if out.len() >= MAX_BRACE_EXPANSIONS {
+        // Bound exceeded — bail out. The caller will see a
+        // truncated expansion set; that's the documented behaviour
+        // when a brace pattern is too pathological to fully expand.
+        return;
+    }
+
     let bytes = pattern.as_bytes();
     let Some(open) = bytes.iter().position(|&b| b == b'{') else {
-        return vec![pattern.to_string()];
+        out.push(pattern.to_string());
+        return;
     };
     let Some(close_offset) = bytes[open + 1..].iter().position(|&b| b == b'}') else {
-        return vec![pattern.to_string()];
+        out.push(pattern.to_string());
+        return;
     };
     let close = open + 1 + close_offset;
 
@@ -438,12 +463,13 @@ fn expand_braces(pattern: &str) -> Vec<String> {
     let group = &pattern[open + 1..close];
     let suffix = &pattern[close + 1..];
 
-    let mut out = Vec::new();
     for alt in group.split(',') {
+        if out.len() >= MAX_BRACE_EXPANSIONS {
+            return;
+        }
         let with_alt = format!("{prefix}{alt}{suffix}");
-        out.extend(expand_braces(&with_alt));
+        expand_braces_into(&with_alt, out);
     }
-    out
 }
 
 /// Recursive walk helper. Best-effort: when a subdirectory cannot be

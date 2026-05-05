@@ -56,10 +56,37 @@
 //! # }
 //! ```
 //!
-//! ## What's in 0.6.0
+//! ## What's in 0.9.0 (release candidate for 1.0)
 //!
-//! 0.6.0 finishes the public API. Every method that will ship at 1.0
-//! is present.
+//! 0.9.0 is the **release candidate for 1.0**. Real-world testing
+//! begins from this tag. The public API documented in
+//! [`docs/API.md`](https://github.com/jamesgober/fsys-rs/blob/main/docs/API.md)
+//! is the 1.0 target shape.
+//!
+//! - **Journal substrate** — open-once append-only log for WAL-style
+//!   workloads. [`JournalHandle::append`](crate::JournalHandle::append)
+//!   is the high-throughput durable-write primitive that databases /
+//!   queues / ledgers should use; [`Handle::write`] is the
+//!   atomic-replace primitive for individual files. Three throughput
+//!   tiers ship: cross-platform sync, lock-free concurrent append,
+//!   and native io_uring async on Linux.
+//! - **Direct-IO journal opt-in** —
+//!   [`JournalOptions::direct(true)`](crate::JournalOptions::direct)
+//!   routes appends through a sector-aligned in-memory log buffer
+//!   (the InnoDB / WiredTiger pattern), bypassing the kernel page
+//!   cache for zero-copy DMA on NVMe.
+//! - **Production-grade frame format** — every record wrapped in
+//!   a 12-byte frame with CRC-32C (Castagnoli, RFC 3720 KAT-verified).
+//!   Tail-truncation detection via [`JournalTailState`].
+//! - **Crash-safety integration tests** — process-kill harness
+//!   validates durability claims under real crashes.
+//! - **Optional `tracing` feature** for production observability.
+//!
+//! ## What shipped in 0.6.0–0.7.0
+//!
+//! 0.6.0 finished the public API and 0.7.0 (the optimization
+//! phase) tuned it. Every method that will ship at 1.0 is
+//! present from 0.7.0 onward.
 //!
 //! - **Async layer** (gated behind the `async` Cargo feature). Every
 //!   sync method gets an `_async` sibling backed by
@@ -132,7 +159,7 @@
 //! `fs.write_async()` outside a tokio runtime returns
 //! [`Error::AsyncRuntimeRequired`] rather than panicking.
 
-#![doc(html_root_url = "https://docs.rs/fsys/0.6.0")]
+#![doc(html_root_url = "https://docs.rs/fsys/0.9.0")]
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unused_must_use)]
@@ -151,6 +178,7 @@
 #![warn(rust_2018_idioms)]
 #![warn(clippy::all)]
 
+pub mod advice;
 pub mod batch;
 pub(crate) mod buffer;
 pub mod builder;
@@ -158,6 +186,7 @@ pub mod crud;
 pub mod error;
 pub mod handle;
 pub mod hardware;
+pub mod journal;
 pub mod meta;
 pub mod method;
 pub mod os;
@@ -171,10 +200,76 @@ pub mod substrate;
 #[cfg(feature = "async")]
 pub mod async_io;
 
+/// Internal fuzz-test surface. Wraps `pub(crate)` helpers under
+/// `cfg(feature = "fuzz")` so the cargo-fuzz workspace can reach
+/// them without making them part of the public 1.0 API surface.
+/// Subject to change without semver guarantees; do not use from
+/// non-fuzz code.
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub mod __fuzz {
+    use crate::journal::format as fmt;
+
+    /// Public mirror of `crate::journal::format::FrameDecode` for
+    /// fuzz harness consumption.
+    #[derive(Debug)]
+    pub enum FrameDecode {
+        Ok {
+            consumed: usize,
+            payload_start: usize,
+            payload_end: usize,
+        },
+        Truncated,
+        BadMagic,
+        LengthOverflow,
+        ChecksumMismatch,
+    }
+
+    impl From<fmt::FrameDecode> for FrameDecode {
+        fn from(d: fmt::FrameDecode) -> Self {
+            match d {
+                fmt::FrameDecode::Ok {
+                    consumed,
+                    payload_start,
+                    payload_end,
+                } => FrameDecode::Ok {
+                    consumed,
+                    payload_start,
+                    payload_end,
+                },
+                fmt::FrameDecode::Truncated => FrameDecode::Truncated,
+                fmt::FrameDecode::BadMagic => FrameDecode::BadMagic,
+                fmt::FrameDecode::LengthOverflow => FrameDecode::LengthOverflow,
+                fmt::FrameDecode::ChecksumMismatch => FrameDecode::ChecksumMismatch,
+            }
+        }
+    }
+
+    /// Encode a payload as a journal frame; returns the encoded
+    /// `Vec<u8>`.
+    pub fn encode_frame_owned(payload: &[u8]) -> crate::Result<Vec<u8>> {
+        fmt::encode_frame_owned(payload)
+    }
+
+    /// Decode a journal frame from `bytes`.
+    pub fn decode_frame(bytes: &[u8]) -> FrameDecode {
+        fmt::decode_frame(bytes).into()
+    }
+
+    /// Compute the CRC-32C checksum of `bytes`.
+    pub fn crc32c(bytes: &[u8]) -> u32 {
+        fmt::crc32c(bytes)
+    }
+}
+
+pub use crate::advice::Advice;
 pub use crate::batch::Batch;
 pub use crate::builder::Builder;
 pub use crate::error::{BatchError, Error, Result};
 pub use crate::handle::Handle;
+pub use crate::journal::{
+    JournalHandle, JournalOptions, JournalReader, JournalRecord, JournalTailState, Lsn,
+};
 pub use crate::meta::{DirEntry, FileMeta, Permissions};
 pub use crate::method::Method;
 pub use crate::path::Mode;

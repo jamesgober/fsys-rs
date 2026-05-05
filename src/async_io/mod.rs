@@ -41,6 +41,7 @@
 pub mod batch;
 pub mod crud_dir;
 pub mod crud_file;
+pub mod journal;
 pub mod quick;
 
 #[cfg(target_os = "linux")]

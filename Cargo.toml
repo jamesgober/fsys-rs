@@ -4,7 +4,7 @@
 ######################################################
 [package]
 name    = "fsys"
-version = "0.7.0"
+version = "0.9.0"
 
 # METADATA
 readme  = "README.md"
@@ -24,6 +24,7 @@ include = [
     "src/**/*",
     "tests/**/*",
     "benches/**/*",
+    "examples/**/*",
     "Cargo.toml",
     "README.md",
     "LICENSE-APACHE",
@@ -89,6 +90,13 @@ stress = []
 # exists so library code that supports fuzz instrumentation can be
 # conditionally enabled without it bloating release builds.
 fuzz = []
+# Opt-in `tracing` instrumentation. Adds spans + events on the
+# write / read / journal hot paths. Off by default — the `tracing`
+# macros compile to no-ops when the dep is absent, so there's
+# zero overhead for non-tracing builds. Enable this in production
+# observability environments where `tracing` subscribers
+# (tokio-console, OpenTelemetry, etc.) are already wired.
+tracing = ["dep:tracing"]
 
 
 ###########################
@@ -107,6 +115,15 @@ fuzz = []
 # `spawn_blocking` against the sync core, never tokio's fs
 # primitives.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "time"], optional = true }
+
+# Optional structured-event instrumentation. Gated behind the
+# `tracing` feature flag; when off, the dep isn't pulled in.
+# `tracing`'s macros (`trace_span!`, `debug!`, etc.) compile to
+# no-ops in the absence of the dep — fsys's own code uses them
+# unconditionally inside `#[cfg(feature = "tracing")]` blocks so
+# the no-op-on-absent-feature property is enforced by the type
+# system, not just convention.
+tracing = { version = "0.1", default-features = false, optional = true }
 
 # Bounded MPMC + oneshot channels with `select!` support.
 # Used by the 0.4.0 pipeline subsystem: the group-lane work queue
@@ -261,6 +278,38 @@ required-features = ["async"]
 [[bench]]
 name    = "tail_validation"
 harness = false
+
+# 0.8.0 F — canonical performance matrix vs std::fs / tokio peers.
+# Custom main (no Criterion); produces a markdown table on stdout
+# ready for `docs/BENCH.md`.
+[[bench]]
+name              = "matrix_with_peers"
+harness           = false
+required-features = ["async"]
+
+# 0.8.0 R-1 — Journal substrate throughput vs atomic-replace.
+# Measures the speedup the WAL/append + group-commit primitive
+# delivers over the per-write atomic-replace primitive.
+[[bench]]
+name    = "journal_vs_atomic_replace"
+harness = false
+
+
+###########################
+# EXAMPLES
+###########################
+# Examples 01–10, 13–16 build with the default feature set; only the
+# async ones (11, 12) require the `async` feature. Cargo auto-discovers
+# every `examples/*.rs` so we list only the entries that need
+# `required-features`.
+
+[[example]]
+name              = "11_async_basics"
+required-features = ["async"]
+
+[[example]]
+name              = "12_async_batch"
+required-features = ["async"]
 
 
 ###########################

@@ -240,9 +240,31 @@ impl Builder {
         let resolved_method = self.method.resolve();
         let mode = self.mode.resolve();
 
+        // 0.8.0 J: canonicalise the root *once* at build time, so the
+        // stored root is an absolute path with all symlinks resolved.
+        // Without this, `Builder::root("data/../jail")` or a root
+        // containing a symlink trivially defeats the
+        // `resolved.starts_with(root)` check in `Handle::resolve_path`.
+        // The caller is responsible for ensuring the root directory
+        // exists before calling `build()` — `Builder::root` does not
+        // mkdir.
+        let canonical_root = match self.root {
+            None => None,
+            Some(r) => match std::fs::canonicalize(&r) {
+                Ok(canon) => Some(canon),
+                Err(e) => {
+                    return Err(Error::InvalidPath {
+                        path: r,
+                        reason: format!(
+                            "Builder::root canonicalisation failed (path must exist and be a directory): {e}"
+                        ),
+                    })
+                }
+            },
+        };
+
         // Probe sector size for the target directory (or cwd as fallback).
-        let probe_path = self
-            .root
+        let probe_path = canonical_root
             .as_deref()
             .unwrap_or_else(|| std::path::Path::new("."));
         let sector_size = crate::platform::probe_sector_size(probe_path);
@@ -271,7 +293,7 @@ impl Builder {
         Ok(Handle::new_raw(
             self.method,
             resolved_method,
-            self.root,
+            canonical_root,
             mode,
             sector_size,
             pipeline,
@@ -324,12 +346,25 @@ mod tests {
 
     #[test]
     fn test_builder_sets_root() {
+        // 0.8.0 J: `Builder::build` canonicalises the root; the
+        // stored value is the canonical form (with Windows
+        // `\\?\` extended-length prefix where applicable). The
+        // test compares against the *canonicalised* expected form.
         let root = std::env::temp_dir();
-        let h = Builder::new()
-            .root(root.clone())
-            .build()
-            .expect("build with root");
-        assert_eq!(h.root(), Some(root.as_path()));
+        let canonical_root = std::fs::canonicalize(&root).expect("canonicalize temp");
+        let h = Builder::new().root(root).build().expect("build with root");
+        assert_eq!(h.root(), Some(canonical_root.as_path()));
+    }
+
+    #[test]
+    fn test_builder_rejects_nonexistent_root() {
+        // 0.8.0 J: a root that doesn't exist must be rejected at
+        // `build()` rather than allowed through with a "lexical-only"
+        // jail that can be defeated by symlinks.
+        let bogus = std::env::temp_dir().join("fsys_intentionally_missing_root_xyz_abc");
+        let _ = std::fs::remove_dir_all(&bogus);
+        let result = Builder::new().root(&bogus).build();
+        assert!(matches!(result, Err(Error::InvalidPath { .. })));
     }
 
     #[test]

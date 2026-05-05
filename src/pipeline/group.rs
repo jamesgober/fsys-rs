@@ -170,10 +170,53 @@ pub(super) fn run_dispatcher(
         };
 
         // Step 2 — accumulate within the time/count window.
-        let deadline = Instant::now() + Duration::from_millis(config.batch_window_ms);
-        let mut accumulated: Vec<BatchJob> = Vec::with_capacity(8);
+        //
+        // 0.8.0 I round-2: scoop any already-queued jobs via
+        // `try_recv` first. Two cases benefit:
+        //
+        //   (a) Multiple submitters racing — their jobs are already
+        //       queued by the time we wake up; we batch them
+        //       without waiting for the window.
+        //   (b) Single-submitter "big batch" — the first job alone
+        //       already has many ops; if no other jobs are queued,
+        //       skip the window entirely and flush.
+        //
+        // This eliminates the ~window/2 fixed latency penalty that
+        // the bench surfaced (batch-of-8 was 0.42–0.65× of solo×8
+        // on Windows because of the 1 ms accumulation wait).
         let mut total_ops: usize = first.ops.len();
+        let mut accumulated: Vec<BatchJob> = Vec::with_capacity(8);
         accumulated.push(first);
+        // Drain any jobs already in the queue (non-blocking).
+        while total_ops < config.batch_size_max {
+            match job_rx.try_recv() {
+                Ok(job) => {
+                    total_ops += job.ops.len();
+                    accumulated.push(job);
+                }
+                Err(_) => break,
+            }
+        }
+        // Fast-flush rule: if we already have enough work or the
+        // queue is empty (no concurrent submitters trickling jobs
+        // in), don't wait for more.
+        let already_full = total_ops >= config.batch_size_max;
+        let already_busy = accumulated.len() >= 2;
+        if already_full || (config.batch_window_ms == 0) {
+            // No window — go straight to execute.
+            process_jobs(accumulated);
+            continue 'outer;
+        }
+        // Only enter the time-window if our first scoop found more
+        // jobs (indicating concurrent submitters worth waiting
+        // for). Otherwise flush eagerly — the bench's
+        // single-batch-and-wait pattern hits this branch.
+        if !already_busy {
+            process_jobs(accumulated);
+            continue 'outer;
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(config.batch_window_ms);
 
         while total_ops < config.batch_size_max {
             let now = Instant::now();

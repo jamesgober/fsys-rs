@@ -198,7 +198,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "fsys"
-version = "0.7.0"
+version = "0.9.0"
 dependencies = [
  "criterion",
  "crossbeam-channel",
@@ -208,6 +208,7 @@ dependencies = [
  "libc",
  "memmap2",
  "tokio",
+ "tracing",
  "windows-sys 0.59.0",
 ]
 
@@ -579,6 +580,22 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "tracing"
+version = "0.1.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
+dependencies = [
+ "pin-project-lite",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-core"
+version = "0.1.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 
 [[package]]
 name = "unicode-ident"

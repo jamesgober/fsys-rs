@@ -36,17 +36,12 @@ applications, durable caches, append-heavy services, background workers, and
 other programs where write semantics matter as much as raw throughput. It is
 not trying to replace `std::fs` for ordinary application code.
 
-
----
-
-> ⚠️ **Status:** Early development.  
-The crate is usable and tested, but the API is not stable yet. Expect breaking changes before `1.0.0`.
-
 &nbsp;
 
 
 ## FEATURES
 
+- **Journal substrate** &mdash; open-once append-only log file with atomic LSN reservation, group-commit fsync, and a CRC-32C-protected self-identifying frame format. Intended for write-ahead-log workloads (database WAL, persistent queues, ledgers) where the atomic-replace primitive's per-call fsync cost is the bottleneck. Three throughput tiers are present: a cross-platform synchronous core, a lock-free concurrent append path, and a native io_uring asynchronous substrate on Linux. An opt-in Direct-IO mode (`JournalOptions::direct(true)`) routes appends through a sector-aligned in-memory log buffer &mdash; the architecture used by InnoDB's redo log and the WiredTiger journal &mdash; which trades the lock-free hot path for predictable tail latency and zero-copy device writes via `O_DIRECT` / `F_NOCACHE` / `FILE_FLAG_NO_BUFFERING`.
 - **Five real durability methods** &mdash; `Sync`, `Data`, `Mmap`, `Direct`, and hardware-aware `Auto`. Every method is platform-honest: the actual primitive in use is observable via `Handle::active_method()` and `Handle::active_durability_primitive()`.
 - **Cross-platform IO semantics** &mdash; one API surface across Linux, macOS, and Windows, with platform-specific fallbacks documented rather than hidden.
 - **NVMe passthrough flush** &mdash; on Linux (`NVME_IOCTL_IO_CMD`) and Windows (`IOCTL_STORAGE_PROTOCOL_COMMAND`) when the hardware supports it and the process has the privilege. Transparent fallback to `fdatasync` / `WRITE_THROUGH` otherwise.
@@ -65,110 +60,6 @@ The crate is usable and tested, but the API is not stable yet. Expect breaking c
 
 &nbsp;
 
----
-
-&nbsp;
-
-&nbsp;
-
-
-## What fsys provides today
-
-- A `Handle` + `Builder` model for configuring IO once and reusing it across operations.
-- Five durability methods: `Sync`, `Data`, `Mmap`, `Direct` (with NVMe passthrough on capable hardware), and `Auto`.
-- Cross-platform file CRUD: atomic replace-style writes, `write_copy` (atomic-swap with metadata preservation), reads, appends, deletes, copies, range reads, truncate, rename, metadata, and sync operations.
-- Cross-platform directory CRUD: create, remove, recursive variants, existence checks, listing, recursive scan, glob find, and recursive count.
-- A root-scoped path model so a handle can enforce that all resolved paths stay under a chosen base directory.
-- A convenience `quick` module for one-shot operations when you do not want to manage a handle directly.
-- A batch API for grouped writes, deletes, and copies via `Handle::write_batch`, `Handle::delete_batch`, `Handle::copy_batch`, and the `Batch` builder.
-- A per-handle group lane with bounded queueing and configurable batch thresholds for workloads that benefit from grouped dispatch.
-- An optional async layer (feature `async`) covering every sync method.
-- The `fsys::primitive` module of canonical durability-primitive strings for runtime observation of the active code path.
-
-## Design principles
-
-- **Explicit semantics first.** The API should make durability and routing choices visible.
-- **Portable without pretending platforms are identical.** Linux, macOS, and Windows have different primitives; `fsys` exposes one model while documenting where fallbacks occur.
-- **Low ceremony for the common path.** A single `Handle` should cover most workloads; the `quick` module exists for one-off use.
-- **Predictable failure behavior.** Atomic write/replace and batch operations report where failure happened instead of silently smoothing over it.
-- **Room to grow.** Reserved methods and pipeline internals make it possible to expand into more advanced IO paths without replacing the public model.
-
-## When to use fsys
-
-Use `fsys` when you need one or more of the following:
-
-- Explicit control over full sync, data-only sync, direct IO, or automatic method selection.
-- Cross-platform file IO behavior that is stricter and more deliberate than `std::fs` defaults.
-- Atomic replace-style writes for file updates.
-- A handle-scoped root for keeping file activity inside a known subtree.
-- Grouped write/delete/copy submission for higher-throughput batch-style work.
-
-## Non-goals
-
-- High-level filesystem tooling such as watchers, lock orchestration, virtual filesystems, or rich path-manipulation utilities.
-- Replacing `std::fs` for everyday scripting or application scaffolding.
-- Hiding platform-specific tradeoffs behind vague “fast mode” abstractions.
-- Full async-runtime integration in the core crate.
-
-
-## Status & roadmap
-
-Current state: **the public API is feature-complete for `1.0` and frozen at
-the upcoming `0.8.0` alpha tag.** From `0.8.0` onward, only genuine bugs may
-change a name or signature. The current release line is `0.7.x`, which is
-the last breaking-change phase before alpha.
-
-`0.7.0` shipped the optimization phase: the **native io_uring async
-substrate** on Linux (`Method::Direct` + `async` feature) which submits
-directly to the per-handle ring instead of hopping `spawn_blocking`,
-the [`AsyncSubstrate`] enum + `Handle::async_substrate()` accessor, the
-`FSYS_DISABLE_NATIVE_ASYNC=1` environment override, PLP detection
-refinement (per-vendor enterprise-NVMe lookup table), 3 new error variants
-(`HandlePoisoned`, `IoUringSubmitFailed`, `CompletionDriverDead`), and the
-public-API audit pass that tightened 5 names (`read_range` &rarr; `read_at`,
-`scan(_, recursive)` split into `scan` + `scan_all`, same for `count`,
-`buffer_pool_size` &rarr; `buffer_pool_count`,
-`buffer_pool_block` &rarr; `buffer_pool_block_size`).
-
-`0.6.0` finished the rest of the public surface: the async layer, NVMe
-passthrough flush on Linux and Windows, completion CRUD methods
-(`write_copy`, `scan`, `find`, `count`), `Handle::active_durability_primitive()`
-plus the `fsys::primitive` constants module, and a publication-quality
-documentation pass across the crate. The `0.5.x` line consolidated real
-hardware probing, the real `Method::Mmap` implementation, the io_uring
-path on Linux, and the per-method crash-test harness. Everything from
-earlier phases (handle/builder, full file/dir CRUD, batch + group lane)
-is unchanged.
-
-What remains before `1.0`:
-
-- API freeze at the `0.8.0` alpha tag.
-- Tier-3 24-hour soak certification on representative hardware classes.
-- Bare-metal Linux native-substrate measurement (formalising the 2&times;+
-  expectation behind the 1.46&times; figure measured in WSL2 + ext4).
-- Crash-safety certification with forced-unmount sim.
-- Full alpha &rarr; beta &rarr; RC progression.
-
-`Method::Journal` (intent-log durability) is **deferred indefinitely**.
-The variant is kept in the public API as a forward-compatibility
-placeholder, but no version commits to implementing it; it needs its own
-multi-phase design pass that the alpha freeze takes priority over.
-
-The roadmap below shows where each phase landed.
-
-- `0.1.x` &mdash; [**DONE**]: Initial setup.
-- `0.2.x` &mdash; [**DONE**]: Scaffolding and foundation modules.
-- `0.3.x` &mdash; [**DONE**]: Handle, CRUD, metadata, and cross-platform IO core.
-- `0.4.x` &mdash; [**DONE**]: Group-lane batching and dispatcher pipeline.
-- `0.5.x` &mdash; [**DONE**]: Real hardware probe, `Method::Mmap`, `Method::Direct` with io_uring on Linux, per-method crash tests.
-- `0.6.x` &mdash; [**DONE**]: Async layer, NVMe passthrough, completion CRUD, publication-quality docs.
-- `0.7.x` &mdash; [**CURRENT**]: Native io_uring async substrate, PLP refinement, API audit + cleanup, regression suite, optimization phase.
-- `0.8.x` &mdash; [**NEXT (alpha + freeze)**]: API freeze. Tier-3 soak certification, bare-metal native-substrate measurement, crash-safety certification.
-- `0.9.x` &mdash; [**RC**]: Release candidate.
-- `1.0.0` &mdash; Stable API release.
-
-The roadmap is aspirational, not a schedule. Versions ship when they're right, not when the calendar agrees.
-
 <hr><br>
 
 
@@ -176,17 +67,15 @@ The roadmap is aspirational, not a schedule. Versions ship when they're right, n
 
 ```toml
 [dependencies]
-fsys = "0.7.0"
+fsys = "0.9.0"
 ```
 
 To opt into the async layer:
 
 ```toml
 [dependencies]
-fsys = { version = "0.7.0", features = ["async"] }
+fsys = { version = "0.9.0", features = ["async"] }
 ```
-
-> ⚠️ The crate is published and usable, but it should still be treated as pre-stable software. Use it in production only if you are comfortable tracking breaking changes before `1.0.0`.
 
 <br>
 
@@ -206,15 +95,51 @@ fsys = { version = "0.7.0", features = ["async"] }
 
 <br>
 
+### Benchmark results
+
+Numbers below were captured on `windows-ntfs-nvme` (Windows 11 Pro, x86_64, local NVMe SSD; `std::env::temp_dir()` resolves to NTFS) with 100 timed iterations after 10 warmup. Run-to-run noise is roughly &plusmn;5 % on this host class. The full methodology, additional payload sizes, and Linux numbers live in [`docs/BENCH.md`](docs/BENCH.md); reproduce locally with `cargo bench`.
+
+**Journal substrate vs atomic-replace** &mdash; the headline 0.9.0 result. Atomic-replace pays 5&ndash;7 syscalls per durable write; the journal opens once, appends without per-call fsync, and amortises durability across a `sync_through` call.
+
+| Payload | Atomic-replace | Journal (sync at end) | Speedup |
+|---------|---------------:|----------------------:|--------:|
+| 64 B | 634 ops/s | 462.9 K ops/s | **730&times;** |
+| 4 KiB | 891 ops/s | 189.3 K ops/s | **212&times;** |
+
+The "sync at end" cadence is the canonical WAL pattern: append many records, fsync once at a transaction boundary. At an intermediate cadence (sync every 100 appends), the journal still delivers 109&ndash;255&times; the atomic-replace throughput. See [`docs/BENCH.md`](docs/BENCH.md#journal-substrate-090-r-1--vs-atomic-replace) for the full table including the per-append sync cadence.
+
+**Atomic-replace `write` vs `std::fs::write`** &mdash; tail latency is what fsys pays for; medians on small writes go to `std::fs::write` because it does not provide durability guarantees.
+
+| Payload | `fsys::Auto` median / p99 | `std::fs::write` median / p99 |
+|---------|--------------------------:|------------------------------:|
+| 4 KiB | 1.08 ms / 4.69 ms | 218.7 &micro;s / 7.18 ms |
+| 64 KiB | 1.23 ms / 5.50 ms | 4.48 ms / 5.47 ms |
+| 1 MiB | 1.80 ms / 5.00 ms | 2.84 ms / 16.45 ms |
+
+`std::fs::write` is ~5&times; faster than `fsys::Auto` at the 4 KiB median because it skips the `fsync` + atomic-rename cycle. At p99 the gap inverts: `fsys::Auto` is 3.3&times; faster than `std::fs::write` at 1 MiB because the durability cost is paid deterministically rather than deferred to OS scheduling. The fair comparison for durable writes is `fsys::Sync` versus `std::fs` plus a manual temp-file + `sync_all` + `rename` dance &mdash; the latter is what most application code gets wrong.
+
+**Read parity** &mdash; the read path is essentially `std::fs::read` plus handle bookkeeping.
+
+| Payload | `fsys::Auto` median / p99 | `std::fs::read` median / p99 | `tokio::fs::read` median / p99 |
+|---------|--------------------------:|-----------------------------:|-------------------------------:|
+| 4 KiB | 25.0 / 89.4 &micro;s | 23.7 / 77.1 &micro;s | 35.8 / 152.8 &micro;s |
+| 64 KiB | 25.0 / 58.9 &micro;s | 24.1 / 64.0 &micro;s | 105.9 / 337.5 &micro;s |
+| 1 MiB | 182.5 / 482.3 &micro;s | 189.0 / 327.4 &micro;s | 250.7 / 585.8 &micro;s |
+
+`tokio::fs::read` (simulated via `spawn_blocking`, which is what tokio's own `fs` module does internally) is 1.5&ndash;4.4&times; slower because of the thread-pool hop. On Linux + `Method::Direct` + the `async` feature, `fsys`'s native io_uring substrate bypasses that hop entirely &mdash; see [`docs/BENCH.md`](docs/BENCH.md) for the WSL2 measurement.
+
+<br>
+
 ### Documentation
 
 - API reference: <https://docs.rs/fsys>
 - Architecture overview: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- **Runnable examples (16)**: [`docs/EXAMPLES.md`](docs/EXAMPLES.md) &mdash; catalogues every example in [`examples/`](examples/) with a "when to use this pattern" guide.
 - Method matrix and `Auto` decision ladder: [`docs/METHODS.md`](docs/METHODS.md)
 - Performance targets and tuning: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)
 - Crash-safety contract per method: [`docs/CRASH-SAFETY.md`](docs/CRASH-SAFETY.md)
 - Per-platform behavior + capability requirements: [`docs/PLATFORM-NOTES.md`](docs/PLATFORM-NOTES.md)
-- API stability + breaking-change policy: see *Stability + breaking-change policy* and *API changes in 0.7.0* in [`docs/API.md`](docs/API.md). Per-version migration deltas live in [`CHANGELOG.md`](CHANGELOG.md).
+- API stability + breaking-change policy: see *Stability + breaking-change policy* and *API changes in 0.9.0* in [`docs/API.md`](docs/API.md). Per-version migration deltas live in [`CHANGELOG.md`](CHANGELOG.md).
 
 
 
@@ -223,7 +148,7 @@ fsys = { version = "0.7.0", features = ["async"] }
 <br><br>
 <h2 align="center">CONTRIBUTORS</h2>
 
-Coming Soon
+Coming Soon...
 
 
 <!-- LICENSE
