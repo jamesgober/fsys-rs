@@ -44,16 +44,20 @@ The crate is usable and tested, but the API is not stable yet. Expect breaking c
 
 ## FEATURES
 
-- **Explicit durability methods** &mdash; choose `Sync`, `Data`, `Direct`, or `Auto` instead of relying on implicit OS behavior.
-- **Cross-platform IO semantics** &mdash; one API surface across Windows, Linux, and macOS, with platform-specific fallbacks documented rather than hidden.
-- **Atomic replace-style writes** &mdash; file writes go through a temp-file and rename flow designed to avoid partial overwrite states.
+- **Five real durability methods** &mdash; `Sync`, `Data`, `Mmap`, `Direct`, and hardware-aware `Auto`. Every method is platform-honest: the actual primitive in use is observable via `Handle::active_method()` and `Handle::active_durability_primitive()`.
+- **Cross-platform IO semantics** &mdash; one API surface across Linux, macOS, and Windows, with platform-specific fallbacks documented rather than hidden.
+- **NVMe passthrough flush** &mdash; on Linux (`NVME_IOCTL_IO_CMD`) and Windows (`IOCTL_STORAGE_PROTOCOL_COMMAND`) when the hardware supports it and the process has the privilege. Transparent fallback to `fdatasync` / `WRITE_THROUGH` otherwise.
+- **Linux io_uring path** &mdash; `Method::Direct` on Linux routes through `io_uring` when available (kernel ≥ 5.1, no SECCOMP/AppArmor block), falling back to `O_DIRECT` + `pwrite` + `fdatasync` cleanly.
+- **Atomic replace-style writes** &mdash; every public write API (`write`, `write_copy`, `write_batch`, `Batch::commit`) uses a temp-file + atomic rename pattern. The target file is either entirely the old payload or entirely the new payload &mdash; never torn.
+- **Crash-safety verified** &mdash; per-method crash tests with three kill points (pre-syscall, mid-syscall, post-syscall) and the 100&times; pre-merge stability protocol.
+- **`write_copy` with metadata preservation** &mdash; atomic-swap that preserves the target's existing mode (Unix), owner/group (Unix, when permitted), ACLs (Windows), and timestamps (all platforms).
 - **Root-scoped handles** &mdash; bind a `Handle` to a base directory and reject paths that escape it.
-- **File and directory CRUD** &mdash; write, read, append, positioned writes, range reads, copy, metadata, sync, directory creation/removal, listing, and existence checks.
+- **Full file and directory CRUD** &mdash; write, read, append, positioned writes, range reads, truncate, rename, copy, metadata, sync, directory creation/removal, listing, recursive scan, glob find, and recursive count.
 - **Batch operations** &mdash; grouped writes, deletes, and copies through `write_batch`, `delete_batch`, `copy_batch`, and the chainable `Batch` builder.
-- **Configurable group lane** &mdash; tune batch window, batch size, and queue depth per handle for throughput-oriented workloads.
-- **Direct IO support with fallback** &mdash; attempts non-buffered/direct paths where supported, but degrades cleanly when a filesystem rejects them.
+- **Async layer** &mdash; gated behind the `async` Cargo feature. Every sync method gets an `_async` sibling backed by `tokio::task::spawn_blocking`; async batch ops route through the per-handle dispatcher via `tokio::sync::oneshot`.
+- **Configurable group lane** &mdash; tune batch window, batch size, queue depth, io_uring queue depth, and aligned-buffer-pool size per handle.
 - **Quick one-shot API** &mdash; convenience helpers backed by a lazily initialized default handle for simple cases.
-- **Structured error reporting** &mdash; explicit error variants for unsupported methods, alignment failures, atomic replace failures, and batch failure position.
+- **Structured error reporting** &mdash; 18 explicit error variants with stable `FS-XXXXX` codes for unsupported methods, alignment failures, atomic-replace failures, NVMe passthrough denial, async-runtime requirements, glob-pattern errors, and batch failure position.
 
 
 &nbsp;
@@ -68,13 +72,15 @@ The crate is usable and tested, but the API is not stable yet. Expect breaking c
 ## What fsys provides today
 
 - A `Handle` + `Builder` model for configuring IO once and reusing it across operations.
-- Explicit durability methods: `Sync`, `Data`, `Direct`, and `Auto`.
-- Cross-platform file CRUD: atomic replace-style writes, reads, appends, deletes, copies, range reads, metadata, and sync operations.
-- Cross-platform directory CRUD: create, remove, recursive variants, existence checks, and listing.
+- Five durability methods: `Sync`, `Data`, `Mmap`, `Direct` (with NVMe passthrough on capable hardware), and `Auto`.
+- Cross-platform file CRUD: atomic replace-style writes, `write_copy` (atomic-swap with metadata preservation), reads, appends, deletes, copies, range reads, truncate, rename, metadata, and sync operations.
+- Cross-platform directory CRUD: create, remove, recursive variants, existence checks, listing, recursive scan, glob find, and recursive count.
 - A root-scoped path model so a handle can enforce that all resolved paths stay under a chosen base directory.
 - A convenience `quick` module for one-shot operations when you do not want to manage a handle directly.
 - A batch API for grouped writes, deletes, and copies via `Handle::write_batch`, `Handle::delete_batch`, `Handle::copy_batch`, and the `Batch` builder.
 - A per-handle group lane with bounded queueing and configurable batch thresholds for workloads that benefit from grouped dispatch.
+- An optional async layer (feature `async`) covering every sync method.
+- The `fsys::primitive` module of canonical durability-primitive strings for runtime observation of the active code path.
 
 ## Design principles
 
@@ -104,31 +110,39 @@ Use `fsys` when you need one or more of the following:
 
 ## Status & roadmap
 
-Current state: **the core model is in place and the project is moving into its
-next implementation phase**. The current release line is `0.5.x`.
+Current state: **the public API is feature-complete for everything that will
+ship at `1.0`** &mdash; with the single exception of `Method::Journal`, which is
+deliberately reserved for `0.7.x`. The current release line is `0.6.x`.
 
-Today, the crate already includes the handle/builder construction model,
-cross-platform file and directory CRUD, explicit durability methods,
-root-scoped path enforcement, quick helpers, and the batch/group-lane API.
-That is enough to make the crate useful for early adopters evaluating the API
-shape and operational model.
+`0.6.0` finished the public surface: the async layer, NVMe passthrough flush
+on Linux and Windows, completion CRUD methods (`write_copy`, `scan`, `find`,
+`count`), `Handle::active_durability_primitive()` plus the `fsys::primitive`
+constants module, and a publication-quality documentation pass across the
+crate. The `0.5.x` line consolidated real hardware probing, the real
+`Method::Mmap` implementation, the io_uring path on Linux, and the per-method
+crash-test harness. Everything from earlier phases (handle/builder, full
+file/dir CRUD, batch + group lane) is unchanged.
 
-At the same time, some items are intentionally not available yet. In
-particular, `Method::Mmap` and `Method::Journal` remain reserved variants, and
-some platform-specific fast paths are still planned rather than implemented.
-The roadmap below should be read as an engineering direction, not as a promise
-that every label is complete simply because the version number has advanced.
+What remains before `1.0`:
 
-- `0.1.x` — [**DONE**]: Initial setup.
-- `0.2.x` — [**DONE**]: Scaffolding and foundation modules.
-- `0.3.x` — [**DONE**]: Handle, CRUD, metadata, and cross-platform IO core.
-- `0.4.x` — [**DONE**]: Group-lane batching and dispatcher pipeline.
-- `0.5.x` — [**CURRENT**]: Consolidation of the new pipeline/core model and the next round of advanced IO paths.
-- `0.6.x` — [**NEXT**]: Broader capability expansion, additional convenience APIs, and deeper platform optimization.
-- `0.7.x` — [**ALPHA**]: `Method::Journal`, observability, deep audit.
-- `0.8.x` — [**BETA**]: Public testing and compatibility validation.
-- `0.9.x` — [**RC**]: Release candidate.
-- `1.0.0` — Stable API release.
+- `Method::Journal` (intent-log durability) &mdash; `0.7.x` work.
+- A native io_uring async substrate (using io_uring as a true `Future`-driven
+  primitive instead of `spawn_blocking`) &mdash; `0.7.x`.
+- Deep audit, performance certification on real NVMe, full alpha &rarr; beta
+  &rarr; RC progression.
+
+The roadmap below shows where each phase landed.
+
+- `0.1.x` &mdash; [**DONE**]: Initial setup.
+- `0.2.x` &mdash; [**DONE**]: Scaffolding and foundation modules.
+- `0.3.x` &mdash; [**DONE**]: Handle, CRUD, metadata, and cross-platform IO core.
+- `0.4.x` &mdash; [**DONE**]: Group-lane batching and dispatcher pipeline.
+- `0.5.x` &mdash; [**DONE**]: Real hardware probe, `Method::Mmap`, `Method::Direct` with io_uring on Linux, per-method crash tests.
+- `0.6.x` &mdash; [**CURRENT**]: Async layer, NVMe passthrough, completion CRUD, publication-quality docs.
+- `0.7.x` &mdash; [**NEXT**]: `Method::Journal`, native async io_uring, observability, deep audit.
+- `0.8.x` &mdash; [**BETA**]: Public testing and compatibility validation.
+- `0.9.x` &mdash; [**RC**]: Release candidate.
+- `1.0.0` &mdash; Stable API release.
 
 The roadmap is aspirational, not a schedule. Versions ship when they're right, not when the calendar agrees.
 
@@ -139,16 +153,45 @@ The roadmap is aspirational, not a schedule. Versions ship when they're right, n
 
 ```toml
 [dependencies]
-fsys = "0.5.0"
+fsys = "0.6.0"
+```
+
+To opt into the async layer:
+
+```toml
+[dependencies]
+fsys = { version = "0.6.0", features = ["async"] }
 ```
 
 > ⚠️ The crate is published and usable, but it should still be treated as pre-stable software. Use it in production only if you are comfortable tracking breaking changes before `1.0.0`.
 
 <br>
 
+### Cargo features
+
+| Feature | Default | Pulls in | Purpose |
+|---|---|---|---|
+| `async` | off | `tokio` (`rt`, `rt-multi-thread`, `sync`, `macros`) | `_async` siblings for every sync method; async batch via `tokio::sync::oneshot`. |
+| `stress` | off | (none) | Switches the soak tests in `tests/stress.rs` from a 60-second validation run to the full 1-hour soak duration. CI nightly enables this; dev iteration leaves it off. |
+| `fuzz` | off | (none) | Compile-only flag for fuzz instrumentation. The actual fuzz targets live in `fuzz/` (separate `cargo-fuzz` workspace). |
+
+<br>
+
 ### Minimum supported Rust version
 
 `1.75`. The MSRV may be raised in any minor version before `1.0.0`. After `1.0.0`, MSRV bumps require a minor version bump.
+
+<br>
+
+### Documentation
+
+- API reference: <https://docs.rs/fsys>
+- Architecture overview: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- Method matrix and `Auto` decision ladder: [`docs/METHODS.md`](docs/METHODS.md)
+- Performance targets and tuning: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)
+- Crash-safety contract per method: [`docs/CRASH-SAFETY.md`](docs/CRASH-SAFETY.md)
+- Per-platform behavior + capability requirements: [`docs/PLATFORM-NOTES.md`](docs/PLATFORM-NOTES.md)
+- Migration policy: [`docs/MIGRATION.md`](docs/MIGRATION.md)
 
 
 

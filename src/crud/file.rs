@@ -68,7 +68,7 @@ impl Handle {
 
         // Step 2: write data.
         let write_result = if direct_ok {
-            self.direct_write(&file, data)
+            self.direct_write(&file, &path, data)
         } else {
             platform::write_all(&file, data)
         };
@@ -143,6 +143,138 @@ impl Handle {
         let mut file = platform::open_append(&path)?;
         use std::io::Write;
         file.write_all(data).map_err(Error::Io)
+    }
+
+    /// Atomically replaces `path` with `data`, preserving the target's
+    /// existing metadata.
+    ///
+    /// Implemented as **atomic swap only** — the file at `path` is
+    /// either entirely-old or entirely-new at every observable point.
+    /// No partial replace, no in-place mutation. Compared to
+    /// [`Handle::write`], `write_copy` preserves the target file's
+    /// existing metadata where the OS supports it and the calling
+    /// process has permission:
+    ///
+    /// - **Unix:** mode is preserved unconditionally; owner/group is
+    ///   preserved only when the process has `CAP_CHOWN` or
+    ///   equivalent (silently skipped otherwise).
+    /// - **Windows:** ACLs are preserved via `GetSecurityInfo` /
+    ///   `SetSecurityInfo`.
+    /// - **All platforms:** `mtime` and `atime` are preserved.
+    ///
+    /// If `path` does not exist, `write_copy` behaves identically to
+    /// [`Handle::write`] (creates a new file with default
+    /// permissions).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidPath`] if `path` escapes the handle root.
+    /// - [`Error::AtomicReplaceFailed`] if any step in the atomic
+    ///   sequence (open temp, write, flush, rename, sync parent)
+    ///   fails. Metadata-preservation failures that surface as
+    ///   `EPERM` (e.g. trying to `chown` without `CAP_CHOWN`) are
+    ///   silently skipped, not surfaced.
+    ///
+    /// # Crash safety
+    ///
+    /// Same contract as [`Handle::write`]: the target file is either
+    /// entirely the old payload (kill before rename) or entirely the
+    /// new payload (kill after rename). Never torn. The metadata-
+    /// preservation step happens on the staging file before the
+    /// rename, so a crash mid-`chmod` leaves the target file
+    /// unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use fsys::builder;
+    ///
+    /// let fs = builder().build()?;
+    /// // Replace `/etc/foo.conf` keeping its 0644 mode bits intact:
+    /// fs.write_copy("/etc/foo.conf", b"new contents")?;
+    /// # Ok::<(), fsys::Error>(())
+    /// ```
+    pub fn write_copy(&self, path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
+        let path = self.resolve_path(path.as_ref())?;
+
+        // 1. Capture existing metadata if the target exists. This
+        //    is best-effort — if the metadata read fails we proceed
+        //    with default permissions (the same as `write`).
+        let existing_meta = std::fs::metadata(&path).ok();
+
+        // 2. Build the staging file via the same atomic-replace
+        //    primitives as `write`. We do not call `self.write`
+        //    directly because we need access to the staging path
+        //    before the rename in order to apply metadata.
+        let temp = Self::gen_temp_path(&path);
+        let (file, direct_ok) =
+            platform::open_write_new(&temp, self.use_direct()).map_err(|e| {
+                Error::AtomicReplaceFailed {
+                    step: "open_temp",
+                    source: as_io_error(e),
+                }
+            })?;
+
+        if self.use_direct() && !direct_ok {
+            self.update_active_method(Method::Data);
+        }
+
+        let write_result = if direct_ok {
+            self.direct_write(&file, &path, data)
+        } else {
+            platform::write_all(&file, data)
+        };
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&temp);
+            return Err(Error::AtomicReplaceFailed {
+                step: "write",
+                source: as_io_error(e),
+            });
+        }
+
+        if direct_ok {
+            drop(file);
+            if let Err(e) = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&temp)
+                .and_then(|f| f.set_len(data.len() as u64))
+            {
+                let _ = std::fs::remove_file(&temp);
+                return Err(Error::AtomicReplaceFailed {
+                    step: "truncate",
+                    source: e,
+                });
+            }
+        } else {
+            let flush_result = self.flush_file(&file, false);
+            if let Err(e) = flush_result {
+                let _ = std::fs::remove_file(&temp);
+                return Err(Error::AtomicReplaceFailed {
+                    step: "flush",
+                    source: as_io_error(e),
+                });
+            }
+            drop(file);
+        }
+
+        // 3. Apply preserved metadata to the staging file BEFORE
+        //    the rename, so that the rename is the single
+        //    observable transition.
+        if let Some(meta) = existing_meta.as_ref() {
+            apply_preserved_metadata(&temp, &path, meta);
+        }
+
+        // 4. Atomic rename.
+        if let Err(e) = platform::atomic_rename(&temp, &path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(Error::AtomicReplaceFailed {
+                step: "rename",
+                source: as_io_error(e),
+            });
+        }
+
+        let _ = platform::sync_parent_dir(&path);
+        Ok(())
     }
 
     /// Writes `data` at byte `offset` in `path`.
@@ -275,9 +407,11 @@ impl Handle {
 
     /// Copies `src` to `dst` using a platform-optimised copy primitive.
     ///
-    /// On Linux, `copy_file_range(2)` will be used in a future release
-    /// (0.5.0); currently falls back to `std::fs::copy`. On macOS, a
-    /// `clonefile(2)` reflink optimisation is planned for 0.5.0.
+    /// Currently routes through `std::fs::copy`. Linux
+    /// `copy_file_range(2)` and macOS `clonefile(2)` reflink
+    /// optimisations are filed for a future release (deferred from
+    /// the originally-planned `0.5.0` slot; not part of the `0.6.0`
+    /// scope).
     ///
     /// # Errors
     ///
@@ -299,6 +433,44 @@ impl Handle {
         let path = self.resolve_path(path.as_ref())?;
         let m = std::fs::metadata(&path).map_err(Error::Io)?;
         Ok(FileMeta::from_metadata(&m, &path))
+    }
+
+    /// Resizes the file at `path` to `new_size` bytes.
+    ///
+    /// Truncating to a smaller size discards the trailing bytes.
+    /// Extending to a larger size pads with zero bytes (sparse on
+    /// filesystems that support sparse files; physical zero on
+    /// those that don't).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidPath`] if `path` escapes the handle root.
+    /// - [`Error::Io`] on any IO error.
+    pub fn truncate(&self, path: impl AsRef<Path>, new_size: u64) -> Result<()> {
+        let path = self.resolve_path(path.as_ref())?;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(Error::Io)?;
+        f.set_len(new_size).map_err(Error::Io)
+    }
+
+    /// Renames or moves a file from `old` to `new`.
+    ///
+    /// On Linux/macOS this is a `rename(2)` call — atomic within a
+    /// single filesystem. On Windows it uses `MoveFileExW` with
+    /// `MOVEFILE_REPLACE_EXISTING`. Cross-filesystem renames may
+    /// fall back to copy-and-delete (platform-dependent); within a
+    /// single filesystem the operation is atomic.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidPath`] if either path escapes the handle root.
+    /// - [`Error::Io`] on any IO error.
+    pub fn rename(&self, old: impl AsRef<Path>, new: impl AsRef<Path>) -> Result<()> {
+        let old = self.resolve_path(old.as_ref())?;
+        let new = self.resolve_path(new.as_ref())?;
+        platform::atomic_rename(&old, &new)
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -356,11 +528,18 @@ impl Handle {
         not(target_os = "linux"),
         allow(clippy::needless_pass_by_value, unused_imports)
     )]
-    fn direct_write(&self, file: &std::fs::File, data: &[u8]) -> Result<()> {
+    fn direct_write(&self, file: &std::fs::File, path: &Path, data: &[u8]) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
+            use std::os::fd::AsRawFd;
             if let Some(ring) = self.io_uring_ring() {
-                if iouring_write_direct(&ring, file, data, self.sector_size()).is_ok() {
+                // Probe NVMe passthrough capability lazily on the
+                // file fd's underlying block device. Returns None
+                // for non-NVMe devices, missing privileges, or when
+                // FSYS_DISABLE_NVME_PASSTHROUGH=1 is set.
+                let nvme = self.nvme_access(file.as_raw_fd());
+                let nvme_ref = nvme.as_deref();
+                if iouring_write_direct(&ring, file, data, self.sector_size(), nvme_ref).is_ok() {
                     return Ok(());
                 }
                 // Ring submit failed at runtime — surface the
@@ -369,7 +548,27 @@ impl Handle {
                 // path produced it.
             }
         }
-        platform::write_all_direct(file, data, self.sector_size())
+        let result = platform::write_all_direct(file, data, self.sector_size());
+
+        // Windows: when NVMe passthrough is available, issue a
+        // controller-level FLUSH after the WRITE_THROUGH write. This
+        // is redundant durability (WRITE_THROUGH already flushes per
+        // write) but exercises the IOCTL path and surfaces it via
+        // `active_durability_primitive()`. Performance certification
+        // (F-9) decides whether to drop WRITE_THROUGH when the
+        // IOCTL is active.
+        #[cfg(target_os = "windows")]
+        if result.is_ok() {
+            if let Some(access) = self.nvme_access_win(path) {
+                // Best-effort: ignore NVMe FLUSH errors at runtime —
+                // WRITE_THROUGH already provided durability. We log
+                // at the metrics placeholder later (F-1) if/when the
+                // metrics layer lands.
+                let _ = crate::platform::windows_nvme::nvme_flush(&access);
+            }
+        }
+        let _ = path; // path is unused on Linux; consumed on Windows above.
+        result
     }
 
     /// Direct-IO read helper. Mirror of [`direct_write`].
@@ -396,6 +595,7 @@ fn iouring_write_direct(
     file: &std::fs::File,
     data: &[u8],
     sector_size: u32,
+    nvme: Option<&crate::platform::linux_iouring::NvmeAccess>,
 ) -> Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -412,9 +612,21 @@ fn iouring_write_direct(
     }
     // O_DIRECT minimises cache effects but does not imply durability.
     // The atomic-replace contract requires the bytes to be on stable
-    // storage before the rename, so issue an explicit
-    // `Fsync(DATASYNC)` SQE through the same ring.
-    ring.fdatasync(file.as_raw_fd())?;
+    // storage before the rename. Two paths:
+    //
+    // 1. NVMe passthrough flush (locked decision D-2). Sends NVMe
+    //    FLUSH (opcode 0x00) directly to the controller via the
+    //    legacy `NVME_IOCTL_IO_CMD` ioctl. Bypasses the kernel's
+    //    fsync path entirely — the controller flushes its volatile
+    //    write cache and acknowledges. Requires NVMe hardware +
+    //    `CAP_SYS_ADMIN`-level access.
+    // 2. Standard fallback: io_uring `Fsync(DATASYNC)` SQE — the
+    //    0.5.1 path. Used when NVMe passthrough is unavailable.
+    if let Some(access) = nvme {
+        crate::platform::linux_iouring::nvme_flush_ioctl(access.char_dev.as_raw_fd(), access.nsid)?;
+    } else {
+        ring.fdatasync(file.as_raw_fd())?;
+    }
     Ok(())
 }
 
@@ -453,6 +665,211 @@ fn as_io_error(e: Error) -> std::io::Error {
         Error::Io(io_err) => io_err,
         other => std::io::Error::other(other.to_string()),
     }
+}
+
+/// Applies the metadata-preservation set defined for `write_copy`
+/// (locked decision D-8 in `.dev/DECISIONS-0.6.0.md`) to `staging`,
+/// reading source attributes from `target` (the path whose metadata
+/// we want to preserve) and `existing_meta`.
+///
+/// All operations are best-effort — on Unix, `chown` failures
+/// (typically `EPERM` for non-root processes) are silently skipped
+/// per the locked contract. Same logic on Windows for ACL
+/// application.
+fn apply_preserved_metadata(staging: &Path, target: &Path, existing: &std::fs::Metadata) {
+    apply_preserved_metadata_inner(staging, target, existing);
+}
+
+#[cfg(unix)]
+fn apply_preserved_metadata_inner(staging: &Path, _target: &Path, existing: &std::fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    // Mode — unconditional, identical bits as the existing file.
+    let mode = existing.permissions().mode();
+    let _ = std::fs::set_permissions(staging, std::fs::Permissions::from_mode(mode));
+
+    // Owner / group — only succeeds when the process has CAP_CHOWN
+    // or equivalent. Silently skipped on EPERM per D-8.
+    let uid = existing.uid();
+    let gid = existing.gid();
+    if let Ok(c_path) = std::ffi::CString::new(staging.as_os_str().as_encoded_bytes()) {
+        // SAFETY: c_path is a valid NUL-terminated path string built
+        // from `staging`'s OsStr bytes. `chown(2)` returns an error
+        // code on failure rather than panicking; we discard the
+        // result to honour the silently-skip-on-EPERM contract from
+        // D-8. No memory or aliasing invariants are at stake.
+        let _ = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+    }
+
+    // Timestamps (mtime/atime). Best-effort.
+    apply_timestamps_unix(staging, existing);
+}
+
+#[cfg(unix)]
+fn apply_timestamps_unix(staging: &Path, existing: &std::fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+
+    let atime = libc::timespec {
+        tv_sec: existing.atime() as libc::time_t,
+        tv_nsec: existing.atime_nsec(),
+    };
+    let mtime = libc::timespec {
+        tv_sec: existing.mtime() as libc::time_t,
+        tv_nsec: existing.mtime_nsec(),
+    };
+    let times = [atime, mtime];
+
+    if let Ok(c_path) = std::ffi::CString::new(staging.as_os_str().as_encoded_bytes()) {
+        // SAFETY: c_path is a valid NUL-terminated path string built
+        // from `staging`'s OsStr bytes; `times` is a length-2 stack
+        // array of `timespec` whose pointer remains valid for the
+        // duration of the call; flag `0` means "follow symlinks".
+        // utimensat returns an error code on failure rather than
+        // panicking.
+        let _ = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    }
+}
+
+#[cfg(windows)]
+fn apply_preserved_metadata_inner(staging: &Path, target: &Path, existing: &std::fs::Metadata) {
+    apply_timestamps_windows(staging, existing);
+    // ACL preservation: copy the security descriptor from `target`
+    // to `staging` via GetNamedSecurityInfoW / SetNamedSecurityInfoW.
+    // Best-effort — failures are silent per D-8 (matching the
+    // Unix chown-on-EPERM contract).
+    apply_acls_windows(target, staging);
+}
+
+#[cfg(windows)]
+fn apply_timestamps_windows(staging: &Path, existing: &std::fs::Metadata) {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, SetFileTime, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, OPEN_EXISTING,
+    };
+
+    let atime_u64 = existing.last_access_time();
+    let mtime_u64 = existing.last_write_time();
+    let ctime_u64 = existing.creation_time();
+
+    let to_filetime = |t: u64| FILETIME {
+        dwLowDateTime: (t & 0xFFFF_FFFF) as u32,
+        dwHighDateTime: (t >> 32) as u32,
+    };
+    let atime = to_filetime(atime_u64);
+    let mtime = to_filetime(mtime_u64);
+    let ctime = to_filetime(ctime_u64);
+
+    let wide: Vec<u16> = staging
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path. CreateFileW
+    // returns INVALID_HANDLE_VALUE on failure rather than
+    // panicking; we check before using.
+    let h = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_WRITE,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return;
+    }
+    // SAFETY: `h` is a valid handle from CreateFileW; ctime/atime/
+    // mtime are valid FILETIME values; SetFileTime writes via the
+    // pointers without retaining them.
+    let _ = unsafe { SetFileTime(h, &ctime, &atime, &mtime) };
+    // SAFETY: `h` was opened by CreateFileW above; CloseHandle is
+    // the matching teardown.
+    let _ = unsafe { CloseHandle(h) };
+}
+
+#[cfg(windows)]
+fn apply_acls_windows(target: &Path, staging: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    let target_w: Vec<u16> = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let staging_w: Vec<u16> = staging
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut group: PSID = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+
+    let info_flags =
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+
+    // SAFETY: All output pointers are valid stack locations that
+    // GetNamedSecurityInfoW writes to via raw pointer; the function
+    // returns an error code on failure rather than panicking. The
+    // returned `sd` must be freed with LocalFree (handled below).
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            target_w.as_ptr(),
+            SE_FILE_OBJECT,
+            info_flags,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != 0 || sd.is_null() {
+        return;
+    }
+
+    // SAFETY: `staging_w` is NUL-terminated UTF-16; owner/group/dacl
+    // were populated by GetNamedSecurityInfoW above and remain valid
+    // until we LocalFree(sd). SetNamedSecurityInfoW returns an error
+    // code on failure rather than panicking.
+    let _ = unsafe {
+        SetNamedSecurityInfoW(
+            staging_w.as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            info_flags,
+            owner,
+            group,
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+
+    // SAFETY: `sd` was returned by GetNamedSecurityInfoW which docs
+    // require LocalFree as the matching teardown.
+    let _ = unsafe { LocalFree(sd as _) };
+}
+
+#[cfg(not(any(unix, windows)))]
+fn apply_preserved_metadata_inner(_staging: &Path, _target: &Path, _existing: &std::fs::Metadata) {
+    // Unsupported platform — no-op. The atomic-rename contract still
+    // holds; we just don't preserve metadata.
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

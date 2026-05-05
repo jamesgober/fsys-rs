@@ -1,92 +1,138 @@
 //! # fsys
 //!
-//! Adaptive file and directory IO for Rust — fast, hardware-aware, multi-strategy.
+//! Adaptive file and directory IO for Rust — fast, hardware-aware,
+//! multi-strategy.
 //!
-//! `fsys` is a low-level filesystem abstraction designed for storage engines,
-//! databases, and any application that needs predictable, high-performance
-//! file IO with explicit control over durability strategy.
+//! `fsys` is a low-level filesystem abstraction designed for storage
+//! engines, databases, and any application that needs predictable,
+//! high-performance file IO with explicit control over durability
+//! strategy.
 //!
-//! ## What ships in `0.4.0`
+//! ## Three tiers of API
 //!
-//! Adds the dual-pipeline model on top of the `0.3.0` foundation:
+//! ### Tier 1 — one-shot helpers
 //!
-//! - [`Handle::write_batch`], [`Handle::delete_batch`],
-//!   [`Handle::copy_batch`], and [`Handle::batch`]: the group-lane
-//!   batch API. Routes through a per-handle dispatcher thread that is
-//!   spawned lazily on first use and shut down cleanly on `Handle`
-//!   drop. Hybrid time-or-count window (default 1 ms / 128 ops),
-//!   bounded queue (default 1024) with blocking submission.
-//! - [`Batch`]: a chainable builder for very large or dynamic batches.
-//! - [`BatchError`]: per-batch failure reporting with `failed_at` /
-//!   `completed` / `source`.
-//! - [`Error::ShutdownInProgress`] (FS-00009) and reserved
-//!   [`Error::QueueFull`] (FS-00010, never emitted in 0.4.0).
-//!
-//! Solo-lane ops (`write`, `read`, `append`, etc.) are byte-for-byte
-//! identical to `0.3.0` — the pipeline is invisible on that path.
-//!
-//! ## What shipped in `0.3.0`
-//!
-//! - [`Error`] enum and [`Result`] type alias.
-//! - [`Handle`]: the primary IO entry point — holds method, root, sector size.
-//! - [`Builder`]: fluent builder for constructing a `Handle`.
-//! - [`Method`]: durability strategy enum — `Sync`, `Data`, `Direct`, `Auto`.
-//! - [`FileMeta`], [`DirEntry`], [`Permissions`]: filesystem metadata types.
-//! - [`crud`]: file and directory CRUD as `impl Handle`.
-//! - [`quick`]: convenience free functions backed by a default `Handle`.
-//! - [`os`] module: OS detection.
-//! - [`hardware`] module: hardware probe stubs.
-//! - [`path`] module: per-OS path defaults and `Mode`.
-//!
-//! ## Quick start
+//! The simplest path. Uses a lazily-initialised default [`Handle`]
+//! configured with [`Method::Auto`].
 //!
 //! ```no_run
 //! # fn example() -> fsys::Result<()> {
-//! // One-shot write/read (uses a lazily-initialised default Handle):
-//! fsys::quick::write("/tmp/hello.txt", b"hello")?;
-//! let data = fsys::quick::read("/tmp/hello.txt")?;
-//!
-//! // Explicit Handle with a specific method:
-//! let h = fsys::builder().method(fsys::Method::Data).build()?;
-//! h.write("/tmp/world.txt", b"world")?;
+//! fsys::quick::write("/tmp/greeting.txt", b"hello")?;
+//! let data = fsys::quick::read("/tmp/greeting.txt")?;
+//! assert_eq!(data, b"hello");
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! ### Batch operations (0.4.0)
+//! ### Tier 2 — handle-based
 //!
-//! Multiple ops share a single dispatcher round-trip and one durability
-//! pass per modified file. The dispatcher thread is spawned lazily on
-//! the first batch op and shut down cleanly on `Handle` drop.
+//! The primary API for everything beyond one-shot use. Construct a
+//! [`Handle`] with [`new()`] (default `Method::Auto`) or
+//! [`with(method)`](with).
 //!
 //! ```no_run
-//! # fn example() {
-//! let h = fsys::new().expect("handle");
-//!
-//! // Slice-based batch — best when ops are already collected.
-//! h.write_batch(&[
-//!     ("/tmp/a.bin", b"alpha".as_slice()),
-//!     ("/tmp/b.bin", b"beta".as_slice()),
-//! ])
-//! .expect("batch");
-//!
-//! // Builder-based batch — best for large or dynamic batches.
-//! let mut batch = h.batch();
-//! let _ = batch.write("/tmp/c.bin", b"gamma");
-//! let _ = batch.delete("/tmp/stale.tmp");
-//! batch.commit().expect("commit");
+//! # fn example() -> fsys::Result<()> {
+//! let fs = fsys::new()?;                          // Method::Auto
+//! let fs = fsys::with(fsys::Method::Data)?;       // explicit method
+//! fs.write("/tmp/world.txt", b"world")?;
+//! let read = fs.read("/tmp/world.txt")?;
+//! # Ok(())
 //! # }
 //! ```
 //!
-//! ## Goals
+//! ### Tier 3 — full builder
 //!
-//! - **Hardware-aware.** Detect drive type (NVMe, SSD, HDD) and capabilities
-//!   at startup. Pick sensible defaults.
-//! - **Multi-strategy durability.** Support `fsync`, `fdatasync`, Direct IO.
-//! - **Cross-platform.** Linux, macOS, Windows. Best path on each.
-//! - **Zero magic.** Every strategy is explicit. No hidden buffering.
+//! For advanced configuration: custom root, dev/prod mode,
+//! per-handle batch knobs, io_uring queue depth, buffer pool size.
+//!
+//! ```no_run
+//! # fn example() -> fsys::Result<()> {
+//! let fs = fsys::builder()
+//!     .method(fsys::Method::Direct)
+//!     .root("/var/lib/myapp")
+//!     .mode(fsys::Mode::Prod)
+//!     .build()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## What's in 0.6.0
+//!
+//! 0.6.0 finishes the public API. Every method that will ship at 1.0
+//! is present.
+//!
+//! - **Async layer** (gated behind the `async` Cargo feature). Every
+//!   sync method gets an `_async` sibling backed by
+//!   `tokio::task::spawn_blocking`; async batch ops route through the
+//!   per-handle dispatcher via `tokio::sync::oneshot`.
+//! - **NVMe passthrough flush** on Linux (`NVME_IOCTL_IO_CMD`) and
+//!   Windows (`IOCTL_STORAGE_PROTOCOL_COMMAND`). Capability detection
+//!   at first Direct op; transparent fallback to `fdatasync` /
+//!   `WRITE_THROUGH` on incapable hardware. macOS uses
+//!   `F_NOCACHE + F_FULLFSYNC` (Apple does not expose NVMe
+//!   passthrough).
+//! - **Completion CRUD:** [`Handle::write_copy`] (atomic-swap with
+//!   metadata preservation), [`Handle::scan`], [`Handle::find`]
+//!   (glob), [`Handle::count`], [`Handle::truncate`],
+//!   [`Handle::rename`].
+//! - **`Handle::active_durability_primitive()`** + [`mod@primitive`]
+//!   constants — the canonical name of the durability primitive
+//!   currently in effect.
+//!
+//! ## What shipped earlier
+//!
+//! - **0.5.x:** real hardware probe, `Method::Mmap`, `Method::Direct`
+//!   with io_uring on Linux, per-method crash tests, per-handle
+//!   aligned buffer pool. 0.5.1 unstubbed the real io_uring path.
+//! - **0.4.0:** dual-pipeline model. Solo lane (single writes via
+//!   the calling thread) + group lane (batch ops via a per-handle
+//!   dispatcher).
+//! - **0.3.0:** [`Handle`], [`Builder`], full file/dir CRUD,
+//!   cross-platform Direct IO with observable fallback.
+//! - **0.2.0:** [`Error`] / [`Result`], hardware probe stubs, OS
+//!   detection, path resolution.
+//!
+//! ## Choosing a method
+//!
+//! | If you... | Pick |
+//! |---|---|
+//! | Don't know what you need | [`Method::Auto`] |
+//! | Need universal correctness floor | [`Method::Sync`] |
+//! | Want Linux's `fdatasync` speedup | [`Method::Data`] |
+//! | Have read-heavy random-access workloads | [`Method::Mmap`] |
+//! | Need < 100 µs single-write latency on NVMe | [`Method::Direct`] |
+//!
+//! See [`docs/METHODS.md`](https://github.com/jamesgober/fsys-rs/blob/main/docs/METHODS.md)
+//! for the full per-platform matrix and the `Auto` decision ladder.
+//!
+//! ## Crash safety
+//!
+//! Every write API (`write`, `write_copy`, `write_batch`,
+//! `Batch::commit`) uses an atomic temp-file + rename pattern. The
+//! target file is either entirely the old payload (kill before
+//! rename) or entirely the new payload (kill after rename). Never
+//! torn. See [`docs/CRASH-SAFETY.md`](https://github.com/jamesgober/fsys-rs/blob/main/docs/CRASH-SAFETY.md)
+//! for the full per-method contract.
+//!
+//! ## Async (feature `async`)
+//!
+//! ```no_run
+//! # async fn example() -> fsys::Result<()> {
+//! # #[cfg(feature = "async")] {
+//! let fs = std::sync::Arc::new(fsys::builder().build()?);
+//! fs.clone().write_async("/tmp/async.dat", b"payload".to_vec()).await?;
+//! let data = fs.clone().read_async("/tmp/async.dat").await?;
+//! # }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Calling sync `fs.write()` from inside a tokio runtime is supported
+//! (it just blocks the calling thread). Calling async
+//! `fs.write_async()` outside a tokio runtime returns
+//! [`Error::AsyncRuntimeRequired`] rather than panicking.
 
-#![doc(html_root_url = "https://docs.rs/fsys/0.4.0")]
+#![doc(html_root_url = "https://docs.rs/fsys/0.6.0")]
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unused_must_use)]
@@ -118,7 +164,11 @@ pub mod os;
 pub mod path;
 pub(crate) mod pipeline;
 pub(crate) mod platform;
+pub mod primitive;
 pub mod quick;
+
+#[cfg(feature = "async")]
+pub mod async_io;
 
 pub use crate::batch::Batch;
 pub use crate::builder::Builder;

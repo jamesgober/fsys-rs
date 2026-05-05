@@ -43,6 +43,13 @@ mod windows;
 #[cfg(target_os = "windows")]
 use windows as imp;
 
+// Windows NVMe passthrough flush via `IOCTL_STORAGE_PROTOCOL_COMMAND`
+// (locked decision D-2 in `.dev/DECISIONS-0.6.0.md`). Capability
+// detection at first Direct op; falls back to
+// `FILE_FLAG_WRITE_THROUGH` when the IOCTL is unavailable.
+#[cfg(target_os = "windows")]
+pub(crate) mod windows_nvme;
+
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod unknown;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

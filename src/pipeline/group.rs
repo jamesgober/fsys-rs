@@ -94,6 +94,39 @@ pub(crate) struct HandleSnapshot {
     pub use_direct: bool,
 }
 
+/// Response channel for a batch — sync or async. Locked decision
+/// D-5 in `.dev/DECISIONS-0.6.0.md`.
+///
+/// The dispatcher matches exhaustively on this enum (no catch-all
+/// arm). The two variants are routed to the same processing path;
+/// the only difference is which channel the result lands on.
+pub(crate) enum BatchResponse {
+    /// Sync caller — uses [`crossbeam_channel::bounded(1)`].
+    Sync(Sender<std::result::Result<(), BatchError>>),
+    /// Async caller — uses [`tokio::sync::oneshot`]. Only present
+    /// when the `async` Cargo feature is enabled.
+    #[cfg(feature = "async")]
+    Async(tokio::sync::oneshot::Sender<std::result::Result<(), BatchError>>),
+}
+
+impl BatchResponse {
+    /// Sends the batch result on the held channel. Discards the
+    /// send error (the receiver dropped) — matches the existing
+    /// 0.4.0 behaviour where handle-drop-mid-flight is a documented
+    /// degenerate case rather than a hard error.
+    pub(crate) fn send(self, result: std::result::Result<(), BatchError>) {
+        match self {
+            BatchResponse::Sync(tx) => {
+                let _ = tx.send(result);
+            }
+            #[cfg(feature = "async")]
+            BatchResponse::Async(tx) => {
+                let _ = tx.send(result);
+            }
+        }
+    }
+}
+
 /// One submitted batch.
 ///
 /// Sent from a producer thread to the dispatcher via
@@ -103,8 +136,8 @@ pub(crate) struct BatchJob {
     pub ops: Vec<BatchOp>,
     /// Snapshot of the Handle's IO config at submit time.
     pub snapshot: HandleSnapshot,
-    /// Oneshot channel to send the per-batch result back to the caller.
-    pub response: Sender<std::result::Result<(), BatchError>>,
+    /// Response channel. Sync or async per [`BatchResponse`].
+    pub response: BatchResponse,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -254,8 +287,10 @@ where
                 source: Box::new(e),
             }),
         };
-        // Best-effort send: if the caller dropped its receiver, ignore.
-        let _ = response.send(result);
+        // BatchResponse handles sync vs. async dispatch internally.
+        // Best-effort: receiver may have dropped (handle-drop-mid-
+        // flight is a documented degenerate case, not an error).
+        response.send(result);
     }
 }
 
@@ -595,7 +630,7 @@ mod tests {
         let job = BatchJob {
             ops,
             snapshot: snapshot(),
-            response: tx,
+            response: BatchResponse::Sync(tx),
         };
         (job, rx)
     }

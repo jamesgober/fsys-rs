@@ -85,8 +85,9 @@ pub enum Error {
     ///
     /// **Code:** `FS-00005`. Caller action: select an available method
     /// ([`crate::Method::Sync`], [`crate::Method::Data`],
-    /// [`crate::Method::Direct`], or [`crate::Method::Auto`]).
-    /// `Method::Mmap` is planned for `0.5.0`; `Method::Journal` for `0.7.0`.
+    /// [`crate::Method::Mmap`], [`crate::Method::Direct`], or
+    /// [`crate::Method::Auto`]). `Method::Journal` is the only
+    /// remaining reserved variant in `0.6.x`; planned for `0.7.0`.
     UnsupportedMethod {
         /// The name of the method that was requested.
         method: &'static str,
@@ -213,6 +214,69 @@ pub enum Error {
         /// platform, IOCTL failure, etc.
         detail: String,
     },
+
+    /// NVMe passthrough flush is not supported on the current platform.
+    ///
+    /// **Code:** `FS-00015`. Caller action: select an alternative
+    /// method or accept the platform's standard durability primitive.
+    /// macOS does not expose NVMe passthrough; this variant is the
+    /// honest fail-fast for callers explicitly requesting
+    /// `Method::Direct` with passthrough on macOS. On Linux and
+    /// Windows, missing kernel support (Linux < 5.19) or unsupported
+    /// hardware also surfaces here.
+    NvmePassthroughUnsupported {
+        /// Human-readable explanation: which platform, which kernel,
+        /// which hardware constraint.
+        detail: String,
+    },
+
+    /// NVMe passthrough is supported on this platform but the calling
+    /// process lacks the privilege to issue raw NVMe commands.
+    ///
+    /// **Code:** `FS-00016`. Caller action: this is recoverable. The
+    /// `Method::Direct` backend silently falls back to the standard
+    /// durability primitive (`fdatasync` on Linux,
+    /// `FILE_FLAG_WRITE_THROUGH` on Windows) when capability detection
+    /// returns this error during the first Direct op. Callers
+    /// observing this variant directly are typically diagnostic tools
+    /// (`probe_nvme_passthrough() -> Result<bool>`, deferred to
+    /// `0.7.0+` per follow-up F-9) that want to know **why** the
+    /// fallback happened.
+    NvmePassthroughDenied {
+        /// Human-readable explanation: which capability check failed,
+        /// which permission was missing, which OS error code surfaced.
+        detail: String,
+    },
+
+    /// An async method was called outside an active tokio runtime.
+    ///
+    /// **Code:** `FS-00017`. Caller action: ensure the call site is
+    /// inside a `#[tokio::main]` function, a `#[tokio::test]`, or
+    /// otherwise within a tokio runtime context. fsys's async layer
+    /// uses `tokio::task::spawn_blocking` internally and requires a
+    /// runtime to drive the spawned task. This error is returned
+    /// instead of panicking on `Handle::current()` failure, so callers
+    /// observe a graceful, propagable error rather than a process
+    /// crash.
+    ///
+    /// Only emitted when the `async` Cargo feature is enabled.
+    AsyncRuntimeRequired,
+
+    /// A glob pattern supplied to [`crate::Handle::find`] could not be
+    /// parsed.
+    ///
+    /// **Code:** `FS-00018`. Caller action: correct the pattern. The
+    /// accepted syntax is the `glob` crate's standard:
+    /// `*` (any chars except `/`), `**` (any chars including `/`),
+    /// `?` (one char), `[abc]` / `[!abc]` (character class),
+    /// `{foo,bar}` (alternation). Patterns that escape the base
+    /// directory (e.g. `../../etc/passwd`) are rejected with
+    /// [`Error::InvalidPath`] instead — this variant covers only
+    /// pattern-syntax errors.
+    GlobPatternInvalid {
+        /// Human-readable explanation of the syntax error.
+        reason: String,
+    },
 }
 
 impl Error {
@@ -247,6 +311,10 @@ impl Error {
             Error::MmapFailed { .. } => "FS-00012",
             Error::BufferPoolExhausted => "FS-00013",
             Error::PlpDetectionUnavailable { .. } => "FS-00014",
+            Error::NvmePassthroughUnsupported { .. } => "FS-00015",
+            Error::NvmePassthroughDenied { .. } => "FS-00016",
+            Error::AsyncRuntimeRequired => "FS-00017",
+            Error::GlobPatternInvalid { .. } => "FS-00018",
         }
     }
 }
@@ -335,6 +403,27 @@ impl fmt::Display for Error {
             Error::PlpDetectionUnavailable { detail } => {
                 write!(f, "[{}] PLP detection unavailable: {}", self.code(), detail)
             }
+            Error::NvmePassthroughUnsupported { detail } => {
+                write!(
+                    f,
+                    "[{}] NVMe passthrough unsupported: {}",
+                    self.code(),
+                    detail
+                )
+            }
+            Error::NvmePassthroughDenied { detail } => {
+                write!(f, "[{}] NVMe passthrough denied: {}", self.code(), detail)
+            }
+            Error::AsyncRuntimeRequired => {
+                write!(
+                    f,
+                    "[{}] async method called outside an active tokio runtime",
+                    self.code()
+                )
+            }
+            Error::GlobPatternInvalid { reason } => {
+                write!(f, "[{}] invalid glob pattern: {}", self.code(), reason)
+            }
         }
     }
 }
@@ -355,7 +444,11 @@ impl std::error::Error for Error {
             | Error::QueueFull
             | Error::MmapFailed { .. }
             | Error::BufferPoolExhausted
-            | Error::PlpDetectionUnavailable { .. } => None,
+            | Error::PlpDetectionUnavailable { .. }
+            | Error::NvmePassthroughUnsupported { .. }
+            | Error::NvmePassthroughDenied { .. }
+            | Error::AsyncRuntimeRequired
+            | Error::GlobPatternInvalid { .. } => None,
         }
     }
 }
@@ -824,6 +917,106 @@ mod tests {
     fn test_error_source_plp_detection_unavailable_returns_none() {
         let err = Error::PlpDetectionUnavailable {
             detail: "test".into(),
+        };
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    // ── 0.6.0 additions ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_error_code_nvme_passthrough_unsupported_returns_fs00015() {
+        let err = Error::NvmePassthroughUnsupported {
+            detail: "macOS does not expose IOCTL_STORAGE_PROTOCOL_COMMAND".into(),
+        };
+        assert_eq!(err.code(), "FS-00015");
+    }
+
+    #[test]
+    fn test_error_display_nvme_passthrough_unsupported_includes_detail() {
+        let err = Error::NvmePassthroughUnsupported {
+            detail: "kernel < 5.19".into(),
+        };
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00015]"));
+        assert!(s.contains("kernel < 5.19"));
+    }
+
+    #[test]
+    fn test_error_source_nvme_passthrough_unsupported_returns_none() {
+        let err = Error::NvmePassthroughUnsupported {
+            detail: "test".into(),
+        };
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_error_code_nvme_passthrough_denied_returns_fs00016() {
+        let err = Error::NvmePassthroughDenied {
+            detail: "EACCES on /dev/nvme0".into(),
+        };
+        assert_eq!(err.code(), "FS-00016");
+    }
+
+    #[test]
+    fn test_error_display_nvme_passthrough_denied_includes_detail() {
+        let err = Error::NvmePassthroughDenied {
+            detail: "ERROR_ACCESS_DENIED on STORAGE_PROTOCOL_COMMAND".into(),
+        };
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00016]"));
+        assert!(s.contains("STORAGE_PROTOCOL_COMMAND"));
+    }
+
+    #[test]
+    fn test_error_source_nvme_passthrough_denied_returns_none() {
+        let err = Error::NvmePassthroughDenied {
+            detail: "test".into(),
+        };
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_error_code_async_runtime_required_returns_fs00017() {
+        let err = Error::AsyncRuntimeRequired;
+        assert_eq!(err.code(), "FS-00017");
+    }
+
+    #[test]
+    fn test_error_display_async_runtime_required_mentions_tokio() {
+        let err = Error::AsyncRuntimeRequired;
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00017]"));
+        assert!(s.to_ascii_lowercase().contains("tokio"));
+    }
+
+    #[test]
+    fn test_error_source_async_runtime_required_returns_none() {
+        let err = Error::AsyncRuntimeRequired;
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_error_code_glob_pattern_invalid_returns_fs00018() {
+        let err = Error::GlobPatternInvalid {
+            reason: "unmatched bracket".into(),
+        };
+        assert_eq!(err.code(), "FS-00018");
+    }
+
+    #[test]
+    fn test_error_display_glob_pattern_invalid_includes_reason() {
+        let err = Error::GlobPatternInvalid {
+            reason: "stray '['".into(),
+        };
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00018]"));
+        assert!(s.contains("stray"));
+    }
+
+    #[test]
+    fn test_error_source_glob_pattern_invalid_returns_none() {
+        let err = Error::GlobPatternInvalid {
+            reason: "test".into(),
         };
         assert!(std::error::Error::source(&err).is_none());
     }
