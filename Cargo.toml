@@ -4,7 +4,7 @@
 ######################################################
 [package]
 name    = "fsys"
-version = "0.6.0"
+version = "0.7.0"
 
 # METADATA
 readme  = "README.md"
@@ -106,7 +106,7 @@ fuzz = []
 # `fs` was dropped in 0.6.0 — fsys's async layer uses
 # `spawn_blocking` against the sync core, never tokio's fs
 # primitives.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros"], optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "time"], optional = true }
 
 # Bounded MPMC + oneshot channels with `select!` support.
 # Used by the 0.4.0 pipeline subsystem: the group-lane work queue
@@ -247,6 +247,19 @@ harness = false
 
 [[bench]]
 name    = "direct_iouring"
+harness = false
+
+# 0.7.0 G — performance regression infrastructure.
+# Native vs spawn_blocking comparison validates the load-bearing
+# 2× advantage from D-8. Tail validation harness validates the
+# p99.9 within 10× p50 target from D-5.
+[[bench]]
+name              = "async_native_vs_blocking"
+harness           = false
+required-features = ["async"]
+
+[[bench]]
+name    = "tail_validation"
 harness = false
 
 

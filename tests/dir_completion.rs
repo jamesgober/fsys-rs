@@ -37,7 +37,7 @@ fn scan_non_recursive_returns_only_immediate_children() {
     std::fs::write(root.join("subdir/c.txt"), b"x").unwrap();
 
     let fs = builder().build().expect("handle");
-    let entries = fs.scan(&root, false).expect("scan");
+    let entries = fs.scan(&root).expect("scan");
     assert_eq!(entries.len(), 3, "non-recursive should see 3 entries");
 }
 
@@ -53,7 +53,7 @@ fn scan_recursive_descends_into_subdirectories() {
     std::fs::write(root.join("sub/deeper/c.txt"), b"x").unwrap();
 
     let fs = builder().build().expect("handle");
-    let entries = fs.scan(&root, true).expect("scan");
+    let entries = fs.scan_all(&root).expect("scan_all");
     // 3 files + 2 directories = 5 entries.
     assert_eq!(entries.len(), 5, "recursive should see 5 entries");
 }
@@ -64,7 +64,7 @@ fn scan_empty_directory_returns_empty_vec() {
     let _g = Cleanup(root.clone());
 
     let fs = builder().build().expect("handle");
-    let entries = fs.scan(&root, true).expect("scan");
+    let entries = fs.scan_all(&root).expect("scan_all");
     assert!(entries.is_empty());
 }
 
@@ -75,7 +75,7 @@ fn scan_missing_path_returns_io_error() {
     let _ = std::fs::remove_dir_all(&root);
 
     let fs = builder().build().expect("handle");
-    let err = fs.scan(&root, false).expect_err("missing path");
+    let err = fs.scan(&root).expect_err("missing path");
     matches!(err, fsys::Error::Io(_));
 }
 
@@ -161,7 +161,7 @@ fn count_non_recursive_skips_subdirectories() {
     std::fs::write(root.join("sub/inner.txt"), b"x").unwrap();
 
     let fs = builder().build().expect("handle");
-    assert_eq!(fs.count(&root, false).expect("count"), 2);
+    assert_eq!(fs.count(&root).expect("count"), 2);
 }
 
 #[test]
@@ -177,7 +177,7 @@ fn count_recursive_includes_descendants() {
     std::fs::write(root.join("s2/d.txt"), b"x").unwrap();
 
     let fs = builder().build().expect("handle");
-    assert_eq!(fs.count(&root, true).expect("count"), 4);
+    assert_eq!(fs.count_all(&root).expect("count_all"), 4);
 }
 
 #[test]
@@ -185,5 +185,5 @@ fn count_empty_directory_returns_zero() {
     let root = tmp_dir("count_empty");
     let _g = Cleanup(root.clone());
     let fs = builder().build().expect("handle");
-    assert_eq!(fs.count(&root, true).expect("count"), 0);
+    assert_eq!(fs.count_all(&root).expect("count_all"), 0);
 }

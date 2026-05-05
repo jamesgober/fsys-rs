@@ -7,6 +7,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-04
+
+> **Optimization phase — last breaking-change phase before alpha.**
+> The API surface is **frozen at the 0.8.0 alpha tag**: from
+> that point forward, only genuine bugs may change a name or
+> signature. The renames and docstring strengthenings below are
+> the cleanup pass that earns the freeze.
+
+### Added
+
+- **Native io_uring async substrate (Linux only).** When
+  [`Method::Direct`] is in use on Linux and
+  `FSYS_DISABLE_NATIVE_ASYNC` is not set, async ops submit
+  directly to the per-handle io_uring ring and `.await` a
+  `oneshot` driven by a per-handle completion driver task —
+  no [`tokio::task::spawn_blocking`] thread-pool hop. The
+  driver task is structured around a tokio
+  [`AsyncFd`](https://docs.rs/tokio/latest/tokio/io/unix/struct.AsyncFd.html)
+  + `eventfd(2)` for completion polling. Measured 1.46×
+  throughput improvement vs. `spawn_blocking` at 4 KiB writes
+  in WSL2 + ext4 (locked decision D-1, observability via
+  [`AsyncSubstrate`]).
+- **[`AsyncSubstrate`] enum + [`Handle::async_substrate()`]**
+  — runtime observability for which async substrate a handle
+  uses: `NativeIoUring` on Linux + Direct + ring-active, or
+  `SpawnBlocking` everywhere else. Always available (even in
+  non-async builds) so consumers can match without
+  `cfg`-gating.
+- **`FSYS_DISABLE_NATIVE_ASYNC=1` environment override** —
+  forces `SpawnBlocking` even on Linux + Direct. Read on each
+  `async_substrate()` call (no process-start re-export
+  needed). Useful for A/B perf comparisons, diagnosing
+  suspected native-substrate issues, and CI runners where
+  io_uring is unavailable.
+- **PLP (power-loss-protection) detection refinement.** The
+  hardware probe now consults a per-vendor lookup table of
+  enterprise-grade NVMe families (Intel D3-S series, Samsung
+  PM-series, Micron 7xxx/9xxx, Kioxia CD/CM, etc.) and
+  reports PLP presence via `HardwareInfo::plp`. Lookup is
+  conservative — false-negatives are safe (we just avoid the
+  PLP-only fast path), false-positives would be unsafe (we'd
+  trust a drive that can't honour the contract), so the
+  table is curated rather than heuristic.
+- **Three new [`Error`] variants:** `HandlePoisoned`
+  (FS-00019), `IoUringSubmitFailed` (FS-00020),
+  `CompletionDriverDead` (FS-00021).
+- **Regression suite + perf-budget infrastructure.** New
+  `benches/baselines.json` schema with per-machine-class
+  baselines, hybrid regression strictness (critical 5%,
+  standard 10%, loose 25%), and a relative tail target
+  (p99.9 within 10× p50 — portable across hardware). New
+  bench harnesses: `benches/async_native_vs_blocking.rs`
+  (D-8 measurement), `benches/tail_validation.rs` (D-5
+  sample-and-percentile harness).
+- **Hostile-filesystem and power-loss-sim test scaffolding.**
+  Env-gated tests for tmpfs / FAT32 / exFAT / NFS / SMB
+  behaviour, plus a forced-unmount sim placeholder for the
+  full crash-safety certification path.
+
+### Changed (breaking)
+
+- **`Handle::read_range(path, offset, len)` → `Handle::read_at`.**
+  The new name aligns with standard `pread`-style naming and
+  removes the implication of an inclusive-exclusive range
+  type.
+- **`Handle::scan(path, recursive: bool)` → `Handle::scan(path)`
+  + `Handle::scan_all(path)`.** Same split for `count` →
+  `count` + `count_all`. Bare-bool parameters at the call
+  site are a Rust API smell; the audit pass split them into
+  distinct methods. `find` keeps a single method because glob
+  patterns express recursion natively (`*` non-recursive,
+  `**` recursive).
+- **`Builder::buffer_pool_size(usize)` → `Builder::buffer_pool_count`**
+  — "size" implied a byte total; this is a count of buffers.
+- **`Builder::buffer_pool_block(usize)` → `Builder::buffer_pool_block_size`**
+  — "block" alone was ambiguous; this is the per-buffer size
+  in bytes.
+- The async siblings of all renamed methods follow the same
+  renames: `read_at_async`, `scan_async` /
+  `scan_all_async`, `count_async` / `count_all_async`.
+
+### Changed (non-breaking)
+
+- **Strengthened docstrings** (no signature changes):
+  - [`Method::Sync`] — leads with the disambiguation that
+    `Sync` refers to the `fsync(2)` family of durability
+    primitives, **not** "synchronous IO" as opposed to
+    async.
+  - [`Method::Journal`] — reframed from "reserved for
+    0.7.0" to "reserved indefinitely as a forward-compat
+    placeholder; no committed target version."
+  - [`Handle::write_copy`] — leads with "this is NOT a
+    file-to-file copy (no source argument); it copies the
+    target's existing metadata onto the new payload."
+  - [`Handle::find`] — explicit "Recursion semantics"
+    section explaining that `*` is non-recursive, `**` is
+    recursive, and contrasting with the `scan` /
+    `scan_all` flat-vs-recursive split.
+
+### Documentation
+
+- Comprehensive **`docs/API.md`** rewrite covering the full
+  public surface, the three-tier entry points, and the
+  alpha-freeze policy.
+- New `.dev/DECISIONS-0.7.0.md` with 13 locked decisions
+  (11 from the original prompt + 2 reversals discovered
+  during execution: R-2 PLP refinement, R-3 1.46× WSL
+  measurement).
+- New `.dev/API-AUDIT-0.7.0.md` documenting the internal +
+  external-subagent + reconciliation passes that produced
+  the renames and docstring strengthenings above.
+- **Removed** `docs/MIGRATION.md` (per locked decision D-6:
+  migration content is part of `CHANGELOG.md` and the
+  rename table in `docs/API.md`, not a separate file).
+
+### Out of scope
+
+- **`Method::Journal`** stays reserved. The intent-log
+  durability mode was originally scoped for 0.7.0 but
+  deferred to avoid blocking alpha freeze on a feature that
+  needs its own multi-phase design pass. No version is
+  committed.
+- **24-hour soak certification** — the 0.7.0 release runs
+  the tier-1 in-session 60s soak (passes); the tier-3 full
+  certification soak is reserved for the `0.8.0` release-prep
+  phase per the pragmatic-mode (b) decision.
+
 ## [0.6.0] - 2026-05-04
 
 ### Added

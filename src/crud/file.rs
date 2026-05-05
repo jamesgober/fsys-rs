@@ -148,6 +148,13 @@ impl Handle {
     /// Atomically replaces `path` with `data`, preserving the target's
     /// existing metadata.
     ///
+    /// **What "copy" means here:** this is *not* a file-to-file copy
+    /// operation (no source path argument). It is a write that
+    /// **copies the existing target's metadata onto the new payload
+    /// before swapping it in** — mode, ACLs, ownership, timestamps. If
+    /// you need a real file-to-file copy, use
+    /// [`std::fs::copy`]; fsys does not provide one.
+    ///
     /// Implemented as **atomic swap only** — the file at `path` is
     /// either entirely-old or entirely-new at every observable point.
     /// No partial replace, no in-place mutation. Compared to
@@ -343,11 +350,16 @@ impl Handle {
     /// If fewer than `len` bytes are available (EOF), the returned `Vec`
     /// will be shorter than `len`.
     ///
+    /// Symmetric with [`Handle::write_at`] — both target a positioned
+    /// IO operation. Renamed from `read_range` in `0.7.0` per the
+    /// API audit (see `.dev/API-AUDIT-0.7.0.md` H.1 Open Question 2)
+    /// to match POSIX `pread` / `pwrite` symmetry.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidPath`] if `path` escapes the handle root.
     /// - [`Error::Io`] on any IO error.
-    pub fn read_range(&self, path: impl AsRef<Path>, offset: u64, len: usize) -> Result<Vec<u8>> {
+    pub fn read_at(&self, path: impl AsRef<Path>, offset: u64, len: usize) -> Result<Vec<u8>> {
         let path = self.resolve_path(path.as_ref())?;
         let (file, _) = platform::open_read(&path, false)?;
         platform::read_range(&file, offset, len)
@@ -997,7 +1009,7 @@ mod tests {
         let _g = TmpFile(path.clone());
         let h = handle();
         h.write(&path, b"0123456789").expect("write");
-        let chunk = h.read_range(&path, 3, 4).expect("read_range");
+        let chunk = h.read_at(&path, 3, 4).expect("read_at");
         assert_eq!(chunk, b"3456");
     }
 }

@@ -112,10 +112,146 @@ pub(crate) fn probe_drive() -> DriveInfo {
         }
     }
 
-    // PLP — deferred (see crate-level docs for this module).
-    let _: PlpStatus = PlpStatus::Unknown;
+    // PLP detection (0.7.0 R-2): query the volume's vendor +
+    // model via `IOCTL_STORAGE_QUERY_PROPERTY` with
+    // `StorageDeviceProperty`, then consult the lookup table.
+    info.plp = probe_plp_windows(&volume);
 
     info
+}
+
+/// Issues `IOCTL_STORAGE_QUERY_PROPERTY` with
+/// `StorageDeviceProperty` against the volume root and reads the
+/// returned `STORAGE_DEVICE_DESCRIPTOR` for vendor + product
+/// strings. Returns [`PlpStatus::Unknown`] on any error or table
+/// miss.
+fn probe_plp_windows(volume: &OsString) -> PlpStatus {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Ioctl::{
+        PropertyStandardQuery, StorageDeviceProperty, IOCTL_STORAGE_QUERY_PROPERTY,
+        STORAGE_PROPERTY_QUERY,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    // Build the device-namespace path for the volume root. The
+    // GetVolumePathNameW result for a CWD looks like `C:\` —
+    // strip the trailing `\` and prepend `\\.\` to get `\\.\C:`.
+    let s = volume.to_string_lossy();
+    let trimmed = s.trim_end_matches('\\');
+    let drive = trimmed.split('\\').next().unwrap_or("");
+    if drive.len() != 2 || !drive.ends_with(':') {
+        return PlpStatus::Unknown;
+    }
+    let device_path = format!(r"\\.\{drive}");
+    let wide_path: Vec<u16> = std::ffi::OsStr::new(&device_path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // Open the device handle. `GENERIC_READ` is sufficient for the
+    // query; admin privilege is NOT required for
+    // `StorageDeviceProperty`.
+    //
+    // SAFETY: `wide_path` is a NUL-terminated UTF-16 string built
+    // from the volume root we just resolved. `CreateFileW` returns
+    // `INVALID_HANDLE_VALUE` on failure rather than panicking; we
+    // check before using.
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return PlpStatus::Unknown;
+    }
+
+    // Two-step IOCTL: first call returns the size; second call
+    // fills the buffer.
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceProperty,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0],
+    };
+
+    // Adequate buffer for STORAGE_DEVICE_DESCRIPTOR + the embedded
+    // vendor/model/serial strings. 1 KiB is more than enough.
+    let mut buf: Vec<u8> = vec![0u8; 1024];
+    let mut bytes_returned: u32 = 0;
+
+    // SAFETY: `handle` is valid; `&query` points to a stack
+    // STORAGE_PROPERTY_QUERY of the correct size; `buf` is a
+    // 1 KiB byte buffer; `DeviceIoControl` returns 0 on failure.
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            &query as *const _ as *const _,
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+
+    let result = if ok == 0 {
+        PlpStatus::Unknown
+    } else {
+        parse_device_descriptor(&buf)
+    };
+
+    // SAFETY: `handle` was opened by CreateFileW above and not
+    // shared elsewhere. CloseHandle is the matching teardown.
+    let _ = unsafe { CloseHandle(handle) };
+    result
+}
+
+/// Parse the `STORAGE_DEVICE_DESCRIPTOR` returned by
+/// `IOCTL_STORAGE_QUERY_PROPERTY`. The descriptor's
+/// `VendorIdOffset` / `ProductIdOffset` point into the same
+/// buffer at NUL-terminated ASCII strings.
+fn parse_device_descriptor(buf: &[u8]) -> PlpStatus {
+    use windows_sys::Win32::System::Ioctl::STORAGE_DEVICE_DESCRIPTOR;
+
+    if buf.len() < std::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
+        return PlpStatus::Unknown;
+    }
+
+    // SAFETY: we verified the buffer is at least
+    // `size_of::<STORAGE_DEVICE_DESCRIPTOR>()` bytes long; the
+    // pointer cast yields a properly-aligned `*const
+    // STORAGE_DEVICE_DESCRIPTOR` because `Vec<u8>::as_ptr()` is
+    // 8-byte-aligned by the system allocator and the C struct's
+    // alignment is satisfied by 8-byte alignment.
+    let descriptor: &STORAGE_DEVICE_DESCRIPTOR =
+        unsafe { &*(buf.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR) };
+
+    let vendor = c_string_at_offset(buf, descriptor.VendorIdOffset as usize);
+    let model = c_string_at_offset(buf, descriptor.ProductIdOffset as usize);
+
+    crate::hardware::plp::lookup_table(&vendor, &model)
+}
+
+/// Read a NUL-terminated ASCII string at `offset` in `buf`.
+/// Returns an empty string if the offset is out of bounds or the
+/// string is empty.
+fn c_string_at_offset(buf: &[u8], offset: usize) -> String {
+    if offset == 0 || offset >= buf.len() {
+        return String::new();
+    }
+    let tail = &buf[offset..];
+    let nul = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+    String::from_utf8_lossy(&tail[..nul]).trim().to_string()
 }
 
 fn volume_path(path: &Path) -> Option<OsString> {

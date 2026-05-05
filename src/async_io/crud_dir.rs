@@ -54,14 +54,19 @@ impl Handle {
     }
 
     /// Async variant of [`Handle::scan`].
-    pub async fn scan_async(
-        self: Arc<Self>,
-        path: impl AsRef<Path>,
-        recursive: bool,
-    ) -> Result<Vec<DirEntry>> {
+    pub async fn scan_async(self: Arc<Self>, path: impl AsRef<Path>) -> Result<Vec<DirEntry>> {
         super::require_runtime()?;
         let path: PathBuf = path.as_ref().to_path_buf();
-        tokio::task::spawn_blocking(move || self.scan(&path, recursive))
+        tokio::task::spawn_blocking(move || self.scan(&path))
+            .await
+            .map_err(join_error_to_io)?
+    }
+
+    /// Async variant of [`Handle::scan_all`].
+    pub async fn scan_all_async(self: Arc<Self>, path: impl AsRef<Path>) -> Result<Vec<DirEntry>> {
+        super::require_runtime()?;
+        let path: PathBuf = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || self.scan_all(&path))
             .await
             .map_err(join_error_to_io)?
     }
@@ -81,14 +86,19 @@ impl Handle {
     }
 
     /// Async variant of [`Handle::count`].
-    pub async fn count_async(
-        self: Arc<Self>,
-        path: impl AsRef<Path>,
-        recursive: bool,
-    ) -> Result<usize> {
+    pub async fn count_async(self: Arc<Self>, path: impl AsRef<Path>) -> Result<usize> {
         super::require_runtime()?;
         let path: PathBuf = path.as_ref().to_path_buf();
-        tokio::task::spawn_blocking(move || self.count(&path, recursive))
+        tokio::task::spawn_blocking(move || self.count(&path))
+            .await
+            .map_err(join_error_to_io)?
+    }
+
+    /// Async variant of [`Handle::count_all`].
+    pub async fn count_all_async(self: Arc<Self>, path: impl AsRef<Path>) -> Result<usize> {
+        super::require_runtime()?;
+        let path: PathBuf = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || self.count_all(&path))
             .await
             .map_err(join_error_to_io)?
     }

@@ -128,11 +128,11 @@ fn deeply_nested_directory_tree_walks_clean() {
     fs.write(p.join("leaf.txt"), b"reached")
         .expect("write leaf");
 
-    let scan = fs.scan(&root, true).expect("scan deep");
+    let scan = fs.scan_all(&root).expect("scan_all deep");
     // 20 directories + 1 file = 21 entries.
     assert!(scan.len() >= 21, "expected ≥21 entries, got {}", scan.len());
 
-    let count = fs.count(&root, true).expect("count deep");
+    let count = fs.count_all(&root).expect("count_all deep");
     assert_eq!(count, 1, "exactly one regular file in tree");
 }
 

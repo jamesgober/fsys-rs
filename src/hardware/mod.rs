@@ -22,6 +22,7 @@ pub mod cpu;
 pub mod drive;
 pub mod io_primitives;
 pub mod memory;
+pub(crate) mod plp;
 mod probe;
 
 pub use crate::hardware::cpu::{CpuFeatures, CpuInfo};

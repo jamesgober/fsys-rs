@@ -57,6 +57,13 @@ use std::fmt;
 pub enum Method {
     /// Standard full-file synchronisation.
     ///
+    /// **Naming caveat:** `Sync` here refers to *the durability primitive*
+    /// (`fsync(2)` and platform equivalents), **not** "synchronous IO" as
+    /// opposed to async. All durability methods are usable from both the
+    /// sync and async APIs; `Method::Sync` does not mean the handle is
+    /// "blocking-only." If you want async-vs-blocking selection, see
+    /// [`Handle::async_substrate`](crate::Handle::async_substrate).
+    ///
     /// Guarantees that the file's data and metadata are on stable media
     /// before the call returns.
     ///
@@ -132,9 +139,21 @@ pub enum Method {
 
     /// Intent-log (journal) durability mode.
     ///
-    /// **Reserved for `0.7.0`.** Selecting this method returns
+    /// **Reserved — selecting `Method::Journal` returns
     /// [`Error::UnsupportedMethod`](crate::Error::UnsupportedMethod) at
-    /// runtime.
+    /// [`Builder::build`](crate::Builder::build) time. The variant is
+    /// kept in the public API as a forward-compatibility placeholder
+    /// only.**
+    ///
+    /// Originally scoped for 0.7.0 as the WAL-style intent-log path
+    /// (write-ahead log + replay-on-recovery), but explicitly
+    /// **deferred out of 0.7.0 scope** to avoid blocking the alpha
+    /// freeze on a feature that needs its own multi-phase design
+    /// pass. No target version is committed; do not depend on it
+    /// landing in any specific release.
+    ///
+    /// Use [`Method::Sync`], [`Method::Data`], or [`Method::Direct`]
+    /// for crash-safe durability today.
     Journal = 4,
 
     /// Hardware-aware automatic selection.

@@ -33,10 +33,10 @@ use std::path::PathBuf;
 /// - `batch_size_max` defaults to `128` (group-lane count threshold).
 /// - `batch_queue_max` defaults to `1024` (group-lane queue capacity;
 ///   producers block when full).
-/// - `buffer_pool_size` defaults to `64` (per-handle aligned buffer
+/// - `buffer_pool_count` defaults to `64` (per-handle aligned buffer
 ///   pool capacity; see locked decision #6 in
 ///   `.dev/DECISIONS-0.5.0.md`).
-/// - `buffer_pool_block` defaults to `4096` (per-buffer size in bytes).
+/// - `buffer_pool_block_size` defaults to `4096` (per-buffer size in bytes).
 /// - `io_uring_queue_depth` defaults to `128` (Linux io_uring SQ
 ///   depth). Real `io_uring` integration shipped in `0.5.1` after
 ///   the rustc 1.95 ICE workaround landed; see the io_uring blocker
@@ -46,8 +46,8 @@ pub struct Builder {
     root: Option<PathBuf>,
     mode: Mode,
     pipeline_config: PipelineConfig,
-    buffer_pool_size: usize,
-    buffer_pool_block: usize,
+    buffer_pool_count: usize,
+    buffer_pool_block_size: usize,
     io_uring_queue_depth: u32,
 }
 
@@ -60,8 +60,8 @@ impl Builder {
             root: None,
             mode: Mode::Auto,
             pipeline_config: PipelineConfig::DEFAULT,
-            buffer_pool_size: 64,
-            buffer_pool_block: 4096,
+            buffer_pool_count: 64,
+            buffer_pool_block_size: 4096,
             io_uring_queue_depth: 128,
         }
     }
@@ -176,11 +176,11 @@ impl Builder {
     /// `0` is rejected at [`build`](Builder::build) time. Larger
     /// values reduce allocation pressure on Direct workloads at the
     /// cost of higher per-handle resident memory
-    /// (`buffer_pool_size × buffer_pool_block` bytes when fully
+    /// (`buffer_pool_count × buffer_pool_block_size` bytes when fully
     /// populated).
     #[must_use]
-    pub fn buffer_pool_size(mut self, n: usize) -> Self {
-        self.buffer_pool_size = n;
+    pub fn buffer_pool_count(mut self, n: usize) -> Self {
+        self.buffer_pool_count = n;
         self
     }
 
@@ -194,10 +194,10 @@ impl Builder {
     /// For Direct IO workloads with payloads larger than the default,
     /// a 64 KiB or 1 MiB block reduces the number of buffer leases per
     /// op at the cost of higher per-handle memory (see
-    /// [`Builder::buffer_pool_size`]).
+    /// [`Builder::buffer_pool_count`]).
     #[must_use]
-    pub fn buffer_pool_block(mut self, bytes: usize) -> Self {
-        self.buffer_pool_block = bytes;
+    pub fn buffer_pool_block_size(mut self, bytes: usize) -> Self {
+        self.buffer_pool_block_size = bytes;
         self
     }
 
@@ -258,12 +258,12 @@ impl Builder {
         // 0.5.0: configure the per-handle buffer pool slot. The pool
         // is lazily constructed on first Direct-method op; the config
         // captured here is the input to that lazy construction.
-        // `buffer_pool_block` is rounded up to a multiple of the
+        // `buffer_pool_block_size` is rounded up to a multiple of the
         // probed `sector_size` to satisfy alignment when the pool
         // eventually backs Direct IO buffers.
-        let pool_block = align_up(self.buffer_pool_block, sector_size as usize);
+        let pool_block = align_up(self.buffer_pool_block_size, sector_size as usize);
         let pool_config = crate::handle::HandleBufferPoolConfig {
-            capacity: self.buffer_pool_size,
+            capacity: self.buffer_pool_count,
             block_size: pool_block,
             block_align: sector_size as usize,
         };
@@ -448,21 +448,21 @@ mod tests {
     #[test]
     fn test_builder_default_buffer_pool_knobs_match_prompt() {
         let b = Builder::new();
-        assert_eq!(b.buffer_pool_size, 64);
-        assert_eq!(b.buffer_pool_block, 4096);
+        assert_eq!(b.buffer_pool_count, 64);
+        assert_eq!(b.buffer_pool_block_size, 4096);
         assert_eq!(b.io_uring_queue_depth, 128);
     }
 
     #[test]
-    fn test_builder_buffer_pool_size_overrides_default() {
-        let b = Builder::new().buffer_pool_size(16);
-        assert_eq!(b.buffer_pool_size, 16);
+    fn test_builder_buffer_pool_count_overrides_default() {
+        let b = Builder::new().buffer_pool_count(16);
+        assert_eq!(b.buffer_pool_count, 16);
     }
 
     #[test]
-    fn test_builder_buffer_pool_block_overrides_default() {
-        let b = Builder::new().buffer_pool_block(65_536);
-        assert_eq!(b.buffer_pool_block, 65_536);
+    fn test_builder_buffer_pool_block_size_overrides_default() {
+        let b = Builder::new().buffer_pool_block_size(65_536);
+        assert_eq!(b.buffer_pool_block_size, 65_536);
     }
 
     #[test]
@@ -474,11 +474,11 @@ mod tests {
     #[test]
     fn test_builder_buffer_pool_knobs_chain() {
         let b = Builder::new()
-            .buffer_pool_size(32)
-            .buffer_pool_block(8192)
+            .buffer_pool_count(32)
+            .buffer_pool_block_size(8192)
             .io_uring_queue_depth(64);
-        assert_eq!(b.buffer_pool_size, 32);
-        assert_eq!(b.buffer_pool_block, 8192);
+        assert_eq!(b.buffer_pool_count, 32);
+        assert_eq!(b.buffer_pool_block_size, 8192);
         assert_eq!(b.io_uring_queue_depth, 64);
     }
 
@@ -489,8 +489,8 @@ mod tests {
         // rounded up to the probed sector size, so we assert
         // ≥ requested rather than exact equality).
         let h = Builder::new()
-            .buffer_pool_size(8)
-            .buffer_pool_block(4096)
+            .buffer_pool_count(8)
+            .buffer_pool_block_size(4096)
             .build()
             .expect("build");
         let pool = h.buffer_pool().expect("buffer pool");

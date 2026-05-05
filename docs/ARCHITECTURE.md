@@ -1,4 +1,10 @@
-# Architecture
+<h1 align="center">
+  <img width="99" alt="Rust logo" src="https://raw.githubusercontent.com/jamesgober/rust-collection/72baabd71f00e14aa9184efcb16fa3deddda3a0a/assets/rust-logo.svg">
+  <br>
+  <code>FSYS &plus; RUST</code>
+  <br>
+  ARCHITECTURE
+</h1>
 
 `fsys` is layered to keep concerns minimal at each level. Each layer
 depends only on layers below it; cross-layer shortcuts are
@@ -10,13 +16,22 @@ prohibited.
 └────────┬────────────────────────────────┬───────────────────┘
          │                                │
          ▼                                ▼
-┌─────────────────┐              ┌───────────────────┐
-│  CRUD modules   │              │  Async layer      │  (feature)
-│  (file, dir,    │              │  spawn_blocking   │
-│   batch, async) │◀─────────────│  + oneshot batch  │
-└────────┬────────┘              └───────────────────┘
-         │
-         ▼
+┌─────────────────┐    ┌──────────────────────────────────┐
+│  CRUD modules   │    │  Async layer (feature `async`)   │
+│  (file, dir,    │    │                                  │
+│   batch)        │◀───│  Substrate selection:            │
+│                 │    │   • NativeIoUring (Linux+Direct) │
+│                 │    │   • SpawnBlocking (everywhere)   │
+└────────┬────────┘    └────────┬─────────────────────────┘
+         │                      │
+         │                      ▼
+         │             ┌─────────────────────────────┐
+         │             │  Completion driver task     │
+         │             │  (eventfd + tokio AsyncFd,  │
+         │             │   one per Handle, lazy)     │
+         │             └─────────┬───────────────────┘
+         │                       │
+         ▼                       ▼
 ┌─────────────────────────────────────┐
 │  Method backends (sync, data,       │
 │   direct, mmap, auto)               │
@@ -40,6 +55,7 @@ prohibited.
          ▼
 ┌─────────────────────────────────────┐
 │  Hardware probe + OS info + paths   │
+│  (incl. PLP lookup, 0.7.0)          │
 └─────────────────────────────────────┘
 ```
 
@@ -66,8 +82,18 @@ prohibited.
   returned by `Handle::active_durability_primitive()`. Match
   against these to avoid string typos.
 - **`crate::async_io`** — async wrappers (gated behind the `async`
-  Cargo feature). Single-op CRUD via `tokio::task::spawn_blocking`;
-  batch via `tokio::sync::oneshot` through the same dispatcher.
+  Cargo feature). Single-op CRUD has two substrates as of 0.7.0:
+  the **native io_uring substrate** (Linux + `Method::Direct`
+  + ring active + no `FSYS_DISABLE_NATIVE_ASYNC`) submits
+  directly to the per-handle ring and `.await`s a `oneshot`
+  driven by a per-handle completion driver task, while the
+  **`spawn_blocking` fallback** (every other configuration)
+  hops a thread-pool. Read which one a handle uses via
+  `Handle::async_substrate()`. Async batch routes through the
+  group-lane dispatcher via `tokio::sync::oneshot` regardless
+  of substrate.
+- **`crate::substrate`** — `AsyncSubstrate` enum
+  (`NativeIoUring` / `SpawnBlocking`). New in 0.7.0.
 
 ## Data flow — sync write
 

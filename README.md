@@ -1,12 +1,15 @@
 <h1 align="center">
   <img width="99" alt="Rust logo" src="https://raw.githubusercontent.com/jamesgober/rust-collection/72baabd71f00e14aa9184efcb16fa3deddda3a0a/assets/rust-logo.svg">
   <br>
-  <code>FSYS</code>
+  <code>FSYS &plus; RUST</code>
   <br>
-  <sub>FILE SYSTEM IO
+  <sub>FILESYSTEM IO
 </h1>
 <p align="center">
+  <strong>Durable Filesystem and Directory I/O for Rust</strong>
+  <!--
   <strong>Adaptive File System &amp; Directory IO for Rust.</strong>
+-->
 </p>
 <p align="center">
   <a href="https://crates.io/crates/fsys" alt="FSYS on Crates.io"><img alt="Crates.io" src="https://img.shields.io/crates/v/fsys"></a>
@@ -191,7 +194,7 @@ fsys = { version = "0.6.0", features = ["async"] }
 - Performance targets and tuning: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)
 - Crash-safety contract per method: [`docs/CRASH-SAFETY.md`](docs/CRASH-SAFETY.md)
 - Per-platform behavior + capability requirements: [`docs/PLATFORM-NOTES.md`](docs/PLATFORM-NOTES.md)
-- Migration policy: [`docs/MIGRATION.md`](docs/MIGRATION.md)
+- Migration policy: see the *Migration from 0.x to 1.0* section in [`docs/API.md`](docs/API.md) (added in `0.7.0`; replaces the standalone `MIGRATION.md` from `0.6.0`)
 
 
 
