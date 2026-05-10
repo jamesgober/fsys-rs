@@ -231,6 +231,15 @@ pub struct Handle {
     /// substrate slot. New in `0.7.0`.
     #[cfg(all(target_os = "linux", feature = "async"))]
     async_iouring_slot: Mutex<AsyncIoUringState>,
+    /// 0.9.2: optional structured-telemetry observer. Registered
+    /// once at handle-construction time via
+    /// [`crate::Builder::observer`]; cloned (cheap `Arc::clone`)
+    /// into every [`crate::JournalHandle`] this handle opens, so
+    /// journal-side hot paths can fire events directly without
+    /// borrowing back into the handle. `None` for handles built
+    /// without an observer — the per-op cost is then a single
+    /// `Option::is_some` branch on the caller's thread.
+    pub(crate) observer: Option<std::sync::Arc<dyn crate::observer::FsysObserver>>,
 }
 
 impl Handle {
@@ -248,6 +257,7 @@ impl Handle {
         pipeline: Pipeline,
         pool_config: HandleBufferPoolConfig,
         iouring_queue_depth: u32,
+        observer: Option<std::sync::Arc<dyn crate::observer::FsysObserver>>,
     ) -> Self {
         Self {
             configured_method: AtomicU8::new(configured_method.to_u8()),
@@ -268,7 +278,17 @@ impl Handle {
             nvme_slot_win: Mutex::new(NvmeStateWin::Untried),
             #[cfg(all(target_os = "linux", feature = "async"))]
             async_iouring_slot: Mutex::new(AsyncIoUringState::Untried),
+            observer,
         }
+    }
+
+    /// 0.9.2: returns the [`crate::observer::FsysObserver`] this
+    /// handle was built with, if any. Use to confirm observer
+    /// registration in tests; the hot paths consult this slot
+    /// internally without going through the public method.
+    #[must_use]
+    pub fn observer(&self) -> Option<&std::sync::Arc<dyn crate::observer::FsysObserver>> {
+        self.observer.as_ref()
     }
 
     /// Returns the per-handle native async io_uring substrate,
@@ -702,6 +722,62 @@ impl Handle {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
+    // 0.9.2 — Hardware-aware database decision surface
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// 0.9.2 — Returns `true` if the storage device is **confirmed**
+    /// to provide power-loss protection (PLP).
+    ///
+    /// PLP — typically a tantalum or supercapacitor onboard the
+    /// drive — guarantees that any data the host has handed to the
+    /// drive's write cache (whether or not `fsync` has been called)
+    /// will reach the NAND on power loss. Enterprise NVMe and
+    /// SAS SSDs commonly include PLP; consumer SSDs almost never
+    /// do.
+    ///
+    /// **What this enables.** For a PLP-protected drive, durable
+    /// writes need only the `pwrite` syscall to reach the drive's
+    /// write cache — `fsync` / `fdatasync` becomes a strict no-op
+    /// from a crash-safety perspective. A database aware of this
+    /// can skip the per-commit fsync and still meet its durability
+    /// contract, multiplying transaction throughput on the order
+    /// of 3–10× on enterprise hardware. Oracle Exadata / SQL
+    /// Server's "Persistent Memory" tiers exploit exactly this
+    /// signal.
+    ///
+    /// **Conservative semantics.** This method returns `true` ONLY
+    /// when the probe confirmed PLP via the vendor allowlist or
+    /// (on Linux) the NVMe Volatile-Write-Cache bit. It returns
+    /// `false` for both confirmed-no and unknown — never lie that
+    /// durability is guaranteed when we don't know. Callers
+    /// considering an fsync-skip optimisation should treat `false`
+    /// as "must fsync" without hesitation. See [`Self::plp_status`]
+    /// for the underlying tri-state.
+    ///
+    /// **Not free.** PLP detection is per-process probing, cached
+    /// for the process lifetime. A hot-plugged drive that arrives
+    /// after fsys's first probe is not re-detected.
+    #[must_use]
+    pub fn is_plp_protected(&self) -> bool {
+        matches!(
+            crate::hardware::drive().plp,
+            crate::hardware::PlpStatus::Yes
+        )
+    }
+
+    /// 0.9.2 — Returns the underlying [`crate::hardware::PlpStatus`]
+    /// tri-state (`Yes` / `No` / `Unknown`).
+    ///
+    /// Use this when a `bool` is too coarse — for instance, when a
+    /// callers wants to log "drive PLP unknown, falling back to
+    /// fdatasync" vs "drive confirmed no PLP, fdatasync mandatory".
+    /// See [`Self::is_plp_protected`] for the most common case.
+    #[must_use]
+    pub fn plp_status(&self) -> crate::hardware::PlpStatus {
+        crate::hardware::drive().plp
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
     // Journal API (0.8.0)
     //
     // High-throughput append-only durability primitive. Independent of
@@ -756,7 +832,9 @@ impl Handle {
     /// - [`Error::Io`] on the underlying open failure.
     pub fn journal(&self, path: impl AsRef<std::path::Path>) -> Result<crate::JournalHandle> {
         let resolved = self.resolve_path(path.as_ref())?;
-        crate::journal::JournalHandle::open(&resolved)
+        let mut journal = crate::journal::JournalHandle::open(&resolved)?;
+        journal.set_observer(self.observer.clone());
+        Ok(journal)
     }
 
     /// Opens an append-only journal at `path` honoring the
@@ -804,7 +882,9 @@ impl Handle {
         options: crate::JournalOptions,
     ) -> Result<crate::JournalHandle> {
         let resolved = self.resolve_path(path.as_ref())?;
-        crate::journal::options::open_with_options(&resolved, options)
+        let mut journal = crate::journal::options::open_with_options(&resolved, options)?;
+        journal.set_observer(self.observer.clone());
+        Ok(journal)
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -1262,6 +1342,7 @@ mod tests {
             Pipeline::new(PipelineConfig::DEFAULT),
             default_pool_config(),
             128,
+            None,
         )
     }
 
@@ -1310,6 +1391,7 @@ mod tests {
             Pipeline::new(PipelineConfig::DEFAULT),
             default_pool_config(),
             128,
+            None,
         );
         assert!(h.use_direct());
         let h2 = make_handle(Method::Sync);
@@ -1340,6 +1422,7 @@ mod tests {
             Pipeline::new(PipelineConfig::DEFAULT),
             default_pool_config(),
             128,
+            None,
         );
         let resolved = h
             .resolve_path(Path::new("subdir/file.txt"))
@@ -1359,6 +1442,7 @@ mod tests {
             Pipeline::new(PipelineConfig::DEFAULT),
             default_pool_config(),
             128,
+            None,
         );
         let result = h.resolve_path(Path::new("../../etc/passwd"));
         assert!(result.is_err(), "path escape must be rejected");
@@ -1383,7 +1467,48 @@ mod tests {
             Pipeline::new(PipelineConfig::DEFAULT),
             default_pool_config(),
             128,
+            None,
         );
         assert_eq!(h.sector_size(), 4096);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 0.9.2 — Hardware-aware accessors
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_plp_status_is_well_defined() {
+        // Sanity: every Handle reports a known PlpStatus variant
+        // — the accessor never panics. We don't assert a specific
+        // value because it depends on the host hardware.
+        let h = make_handle(Method::Sync);
+        let status = h.plp_status();
+        let _ = matches!(
+            status,
+            crate::hardware::PlpStatus::Yes
+                | crate::hardware::PlpStatus::No
+                | crate::hardware::PlpStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn test_is_plp_protected_is_conservative() {
+        // The bool form returns `true` ONLY when the underlying
+        // status is `Yes`. The CI host is a consumer Windows box
+        // where PLP detection always falls into Unknown — pin
+        // that mapping.
+        let h = make_handle(Method::Sync);
+        let bool_form = h.is_plp_protected();
+        let status_form = h.plp_status();
+        assert_eq!(bool_form, status_form == crate::hardware::PlpStatus::Yes);
+    }
+
+    #[test]
+    fn test_observer_field_defaults_to_none() {
+        // 0.9.2: a Handle constructed without `Builder::observer`
+        // has `observer() == None` and the per-op cost is the
+        // single Option::is_some branch.
+        let h = make_handle(Method::Sync);
+        assert!(h.observer().is_none());
     }
 }

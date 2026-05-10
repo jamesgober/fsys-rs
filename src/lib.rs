@@ -159,7 +159,7 @@
 //! `fs.write_async()` outside a tokio runtime returns
 //! [`Error::AsyncRuntimeRequired`] rather than panicking.
 
-#![doc(html_root_url = "https://docs.rs/fsys/0.9.1")]
+#![doc(html_root_url = "https://docs.rs/fsys/0.9.2")]
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unused_must_use)]
@@ -189,6 +189,7 @@ pub mod hardware;
 pub mod journal;
 pub mod meta;
 pub mod method;
+pub mod observer;
 pub mod os;
 pub mod path;
 pub(crate) mod pipeline;
@@ -264,7 +265,7 @@ pub mod __fuzz {
 
 pub use crate::advice::Advice;
 pub use crate::batch::Batch;
-pub use crate::builder::Builder;
+pub use crate::builder::{Builder, Workload};
 pub use crate::error::{BatchError, Error, Result};
 pub use crate::handle::Handle;
 pub use crate::journal::{

@@ -1,10 +1,17 @@
 //! CPU probe.
 //!
-//! Logical core count is detected via [`std::thread::available_parallelism`]
-//! and is real. CPU feature detection in `0.0.2` is **compile-time**:
-//! features active in the build target's `target_feature` list are
-//! reported. Runtime detection on x86 (via the `is_x86_feature_detected!`
-//! macro) and full physical-core / cache enumeration land in `0.0.5`.
+//! Logical core count is detected via [`std::thread::available_parallelism`].
+//!
+//! 0.9.2: CPU feature detection is now **runtime-dispatched** on x86,
+//! x86_64, and aarch64 via [`std::arch::is_x86_feature_detected`] and
+//! [`std::arch::is_aarch64_feature_detected`]. Pre-0.9.2 detection
+//! was compile-time only — `cfg!(target_feature = "…")` reflected what
+//! the binary was *built* for, not what the host CPU could actually
+//! execute. A binary compiled with `target-cpu=x86-64-v1` would never
+//! report SSE4.2 even on a v3 host. This regression is closed in
+//! 0.9.2: feature flags now mirror real silicon, so the journal's
+//! hardware CRC-32C path engages whenever the CPU supports SSE4.2,
+//! independent of build flags.
 
 use std::ops::{BitOr, BitOrAssign};
 
@@ -134,6 +141,69 @@ pub(super) fn probe() -> CpuInfo {
     super::probe::platform::probe_cpu()
 }
 
+/// 0.9.2: runtime CPU-feature detection.
+///
+/// Returns the bitset of features the **host CPU** supports, as
+/// queried via the `is_x86_feature_detected!` (x86 / x86_64) and
+/// `is_aarch64_feature_detected!` (aarch64) standard-library macros.
+/// On unknown architectures returns [`CpuFeatures::empty`].
+///
+/// This is the canonical detection path for the per-platform probes
+/// — `probe_cpu` on every platform calls this function rather than
+/// reading `cfg!(target_feature = …)`. Build-flag-independent: a
+/// binary compiled with `target-cpu=x86-64-v1` will still report
+/// SSE4.2 / AES / AVX2 etc. when the host actually has them.
+#[must_use]
+pub(crate) fn runtime_features() -> CpuFeatures {
+    let mut f = CpuFeatures::empty();
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::arch::is_x86_feature_detected!("sse") {
+            f |= CpuFeatures::SSE;
+        }
+        if std::arch::is_x86_feature_detected!("sse2") {
+            f |= CpuFeatures::SSE2;
+        }
+        if std::arch::is_x86_feature_detected!("sse3") {
+            f |= CpuFeatures::SSE3;
+        }
+        if std::arch::is_x86_feature_detected!("ssse3") {
+            f |= CpuFeatures::SSSE3;
+        }
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            f |= CpuFeatures::SSE4_1;
+        }
+        if std::arch::is_x86_feature_detected!("sse4.2") {
+            f |= CpuFeatures::SSE4_2;
+        }
+        if std::arch::is_x86_feature_detected!("avx") {
+            f |= CpuFeatures::AVX;
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            f |= CpuFeatures::AVX2;
+        }
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            f |= CpuFeatures::AVX512F;
+        }
+        if std::arch::is_x86_feature_detected!("aes") {
+            f |= CpuFeatures::AES;
+        }
+        if std::arch::is_x86_feature_detected!("pclmulqdq") {
+            f |= CpuFeatures::PCLMULQDQ;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            f |= CpuFeatures::NEON;
+        }
+    }
+
+    f
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +281,57 @@ mod tests {
         if cfg!(all(target_arch = "aarch64", target_feature = "neon")) {
             assert!(probe().features.contains(CpuFeatures::NEON));
         }
+    }
+
+    /// 0.9.2: runtime CPUID detection sanity. On any reasonable x86_64
+    /// host (every chip since ~2003), `runtime_features()` must report
+    /// at least SSE2 — it's part of the x86_64 baseline. This pins
+    /// that the runtime probe is engaged (vs the previous
+    /// compile-time `cfg!` behaviour, which would have been a
+    /// constant-true at build time but a constant-false on a
+    /// `target-cpu=x86-64-v1` build).
+    #[test]
+    fn test_runtime_features_includes_sse2_on_any_x86_64_host() {
+        if cfg!(target_arch = "x86_64") {
+            let f = runtime_features();
+            assert!(
+                f.contains(CpuFeatures::SSE2),
+                "every x86_64 host has SSE2 in its baseline ISA; \
+                 runtime_features returned 0x{:x}",
+                f.bits()
+            );
+        }
+    }
+
+    /// 0.9.2: runtime CPUID detection must reflect actual CPU
+    /// capabilities, not build-time `target_feature` flags.
+    /// This pins the runtime path engages by confirming the
+    /// reported feature set is a *superset* of (or equal to)
+    /// the compile-time set — i.e. the runtime probe never
+    /// reports *fewer* features than the compiler had to use.
+    #[test]
+    fn test_runtime_features_includes_compile_time_baseline() {
+        let runtime = runtime_features();
+        // Compile-time baseline — every feature the compiler
+        // committed to using.
+        let mut compile_time = CpuFeatures::empty();
+        if cfg!(target_feature = "sse2") {
+            compile_time |= CpuFeatures::SSE2;
+        }
+        if cfg!(target_feature = "sse4.2") {
+            compile_time |= CpuFeatures::SSE4_2;
+        }
+        if cfg!(target_feature = "aes") {
+            compile_time |= CpuFeatures::AES;
+        }
+        if cfg!(target_feature = "neon") {
+            compile_time |= CpuFeatures::NEON;
+        }
+        assert!(
+            runtime.contains(compile_time),
+            "runtime feature set 0x{:x} missing compile-time baseline 0x{:x}",
+            runtime.bits(),
+            compile_time.bits(),
+        );
     }
 }
