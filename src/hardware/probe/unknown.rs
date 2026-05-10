@@ -8,7 +8,7 @@
 
 #![cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 
-use crate::hardware::cpu::{CpuFeatures, CpuInfo};
+use crate::hardware::cpu::CpuInfo;
 use crate::hardware::drive::DriveInfo;
 use crate::hardware::io_primitives::IoPrimitives;
 use crate::hardware::memory::MemoryInfo;
@@ -28,7 +28,7 @@ pub(crate) fn probe_cpu() -> CpuInfo {
     CpuInfo {
         cores_logical,
         cores_physical: cores_logical,
-        features: CpuFeatures::empty(),
+        features: super::super::cpu::runtime_features(),
         cache_l1: 0,
         cache_l2: 0,
         cache_l3: 0,

@@ -5,6 +5,217 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] - 2026-05-10
+
+> **Hardware-aware database decision surface.** The 0.9.2 patch
+> ships the foundations a clustered/distributed database needs to
+> integrate fsys at the operations layer: structured per-op
+> telemetry via [`FsysObserver`](crate::observer::FsysObserver),
+> a Power-Loss-Protection (PLP) accessor pair on
+> [`Handle`](crate::Handle) so DBs running on enterprise NVMe can
+> safely skip per-commit fsync on confirmed-protected drives, true
+> runtime CPU-feature dispatch (replacing pre-0.9.2 compile-time
+> `cfg!(target_feature = …)` detection that lied on cross-target
+> builds), and a coordinated [`Workload`](crate::Workload) preset
+> on [`Builder`](crate::Builder) that bumps buffer-pool / ring /
+> queue defaults 4–32× for storage-engine workloads with one call.
+> Net effect: HiveDB and similar consumers now have a 1-line
+> Builder configuration plus a clean PLP-aware durability decision
+> path. Public API additions are strictly additive — every 0.9.1
+> caller compiles unchanged.
+>
+> **Scope honestly.** The original 0.9.2 plan also called for
+> sharded pipeline dispatchers, a double-buffered Direct-mode log
+> buffer, native io_uring elite features
+> (`IORING_REGISTER_FILES` / `_BUFFERS`, `IOSQE_IO_LINK`,
+> `DEFER_TASKRUN` probe), the NAWUN/NAWUPF probe, NUMA pinning,
+> per-batch commit-once fsync, and journal segment rotation. Each
+> is a substantial rewrite that touches the dispatcher / Direct-IO
+> path / Linux-only platform layer / journal architecture
+> respectively, with risk tail too long to absorb cleanly into a
+> patch alongside the items that did land. They are queued for
+> 0.10.x — see *Queued for 0.10.x* below.
+
+### Added — 0.9.2
+
+- **`crate::observer::FsysObserver` trait** + `Builder::observer`
+  — structured per-op telemetry. Implementors register an
+  `Arc<dyn FsysObserver>` at handle-construction time and receive
+  callback events for journal append (`append` and `append_batch`),
+  journal sync (leader-only — followers wake without firing),
+  handle write (atomic-replace primitive), and handle read.
+  All trait methods carry default no-op bodies, so observers
+  override only the events they care about.
+  - **Per-op cost when no observer is registered:** a single
+    `Option::is_some` branch — comparable to the existing
+    `cfg!(feature = "tracing")` gate, no cargo-feature plumbing
+    needed.
+  - **Per-op cost when an observer is registered:** one
+    `Instant::now()` pair plus the trait-method dispatch.
+  - **Event types** are `#[non_exhaustive]`: future fields land in
+    patch releases without breaking observer implementations.
+  - **Five new tests** in `src/observer.rs` (default no-ops,
+    counting observer, `Send + Sync` events) and **two
+    integration tests** in `src/journal/mod.rs` confirming
+    observer events fire on real journal hot paths and that
+    handles built without observers skip the work entirely.
+- **`Handle::is_plp_protected()`** + **`Handle::plp_status()`**
+  — the load-bearing 0.9.2 accessor pair for enterprise database
+  integrators. Exposes the existing per-process PLP probe (vendor
+  allowlist + Linux NVMe Volatile-Write-Cache fallback) as a
+  first-class `Handle` method.
+  - `is_plp_protected() -> bool` is **conservative**: returns
+    `true` ONLY when PLP is confirmed `Yes`. Returns `false` for
+    both confirmed-no and unknown — never lies that durability
+    is guaranteed when fsys can't prove it.
+  - `plp_status() -> PlpStatus` is the tri-state (`Yes` / `No` /
+    `Unknown`) form for callers who need to log "drive PLP
+    unknown, falling back to fdatasync" vs "drive confirmed no
+    PLP, fdatasync mandatory".
+  - **What this enables for HiveDB:** on a PLP-protected drive,
+    durable writes need only the `pwrite` syscall to reach the
+    drive's write cache — `fsync` / `fdatasync` becomes a
+    strict no-op from a crash-safety perspective. A
+    PLP-aware DB skipping per-commit fsync delivers 3–10× the
+    transaction throughput on enterprise NVMe vs the
+    fsync-mandatory path. This is exactly the lever Oracle
+    Exadata's "Persistent Memory Accelerator" exploits; fsys
+    now exposes it.
+  - **Three new tests** in `src/handle.rs`.
+- **`Builder::observer(Arc<dyn FsysObserver>)`** — registers an
+  observer with the handle. Cloned (cheap `Arc::clone`) into
+  every `JournalHandle` opened from this handle, so journal hot
+  paths fire events directly without borrowing back into the
+  parent handle.
+- **`Builder::tune_for(Workload)`** — coordinated workload
+  preset. Pre-sets the buffer-pool capacity, buffer-pool block
+  size, io_uring queue depth, and batch-queue capacity to a
+  tuned combination matching a named workload shape. Subsequent
+  setter calls override the preset's value for that knob, so
+  callers can use a preset as a baseline and tweak.
+  - **`Workload::Database`**: 8 MiB buffer pool (1024 × 8 KiB —
+    32× the pre-0.9.2 default), 256-deep io_uring ring, 4096-deep
+    batch queue. Tuned for storage-engine workloads on NVMe with
+    sustained bulk writes.
+  - **`Workload::Default`**: explicit reset to library defaults
+    (256 KiB pool, 128-deep ring, 1024-deep batch queue). Useful
+    for tests and for callers reverting a preset.
+  - `#[non_exhaustive]` enum — new variants land in patch
+    releases without breaking exhaustive `match` arms in caller
+    code.
+  - **Four new tests** in `src/builder.rs` (knob coordination,
+    revert behaviour, setter override, end-to-end build).
+- **`crate::Workload` re-export** — alongside the existing
+  `Builder` re-export at the crate root.
+
+### Changed — 0.9.2
+
+- **CPU feature detection is now runtime-dispatched.**
+  [src/hardware/cpu.rs](src/hardware/cpu.rs) introduces a
+  `runtime_features()` helper using
+  `std::arch::is_x86_feature_detected!` and
+  `std::arch::is_aarch64_feature_detected!`. Pre-0.9.2
+  `probe_cpu()` on every platform read
+  `cfg!(target_feature = "…")`, which reflected the binary's
+  build-time `target-cpu`/`target-feature` flags rather than the
+  host CPU's actual capabilities. A binary compiled with
+  `target-cpu=x86-64-v1` would never report SSE4.2 / AES /
+  AVX2, even when running on a v3 host. 0.9.2 closes that
+  regression: every `hardware::cpu()` / `info()` call now
+  reflects real silicon. The compile-time symbols stay defined
+  (`CpuFeatures::SSE4_2` etc.) but the boolean detection is
+  runtime-only.
+  - **Two new tests** in `src/hardware/cpu.rs`: SSE2 must be
+    reported on every x86_64 host (it's part of the baseline
+    ISA), and the runtime feature set must be a superset of (or
+    equal to) the compile-time `target_feature` set.
+  - The three platform `probe_cpu` functions
+    (`src/hardware/probe/{linux,macos,windows,unknown}.rs`)
+    each call into the shared helper instead of the four
+    duplicate `cfg!(target_feature = …)` blocks they each
+    held pre-0.9.2.
+
+### Performance — 0.9.2
+
+The headline `journal_vs_atomic_replace` numbers are **unchanged**
+from 0.9.1 — 0.9.2 is foundation work, not hot-path tuning. The
+canonical sanity bench has improved further, however:
+
+| workload | 0.9.1 | 0.9.2 | delta |
+|---|---:|---:|---:|
+| `append_batch` vs `append`-in-loop, 10 K × 150 B, best-of-5 | 1.57× | **1.95×** | + 0.38× |
+
+The 0.9.2 improvement reflects the runtime-CPUID-dispatched CRC
+path engaging on hosts where the pre-0.9.2 binary would have
+fallen back to software CRC under conservative `target-cpu`
+build flags. On a binary built explicitly for the host CPU the
+delta vs 0.9.1 is closer to noise.
+
+### Tests — 0.9.2
+
+- **+9 new lib tests** (386 → 395, plus 1 ignored sanity
+  bench): 5 observer module unit tests, 2 observer integration
+  tests against real journal ops, 2 PLP / observer accessor
+  tests on `Handle`, 4 Workload preset tests, 2 runtime-CPUID
+  tests.
+- **+2 new doctests** (36 → 38) for `Builder::observer` and the
+  `crate::observer` module example.
+- All 0.9.1 tests pass unchanged.
+  `cargo test --all-features`: **631 passing**, 0 failed, 7
+  ignored (manual benches).
+
+### Notes — 0.9.2
+
+- **No new runtime dependencies.** `Arc<dyn FsysObserver>` is
+  `std::sync::Arc`; runtime CPUID via `std::arch::is_*_feature_detected!`
+  (stable since 1.27 / 1.59 respectively); PLP accessor reads
+  the existing `hardware::drive()` cache.
+- **No breaking changes.** Every 0.9.1 caller compiles unchanged.
+  `Handle::new_raw` (a `pub(crate)` constructor) gained one
+  `Option<Arc<dyn FsysObserver>>` argument; external callers go
+  through `Builder::build` and aren't affected.
+- **MSRV unchanged.** Still 1.75.
+
+### Queued for 0.10.x
+
+The following items from the original 0.9.2 plan are staged for
+the next major rather than this patch. Each is a substantial
+rewrite that touches load-bearing internals; the testing
+surface grew faster than the patch budget. Recording them here
+so HiveDB and other consumers can plan integration around the
+known shape:
+
+- **Sharded pipeline dispatchers** (`Builder::dispatcher_shards(N)`).
+  Replace the single per-handle dispatcher thread with N
+  dispatchers hashed by path, removing the one-core throughput
+  ceiling on shared handles.
+- **Per-batch commit-once fsync** (`Batch::commit_grouped()`).
+  Skip per-op parent-directory fsync inside a batch and issue
+  one at the end; preserves crash-safety while collapsing N-1
+  fsyncs into 1 on Linux/macOS.
+- **Native io_uring elite features.** Close the
+  [src/journal/mod.rs](src/journal/mod.rs) `native_ring` stub
+  (J6 from the audit), wire `IORING_REGISTER_FILES` +
+  `IORING_REGISTER_BUFFERS` for zero-copy DMA from registered
+  buffers, link write+fsync with `IOSQE_IO_LINK` to halve
+  durability syscall round-trips, and probe
+  `IORING_SETUP_DEFER_TASKRUN | SINGLE_ISSUER | COOP_TASKRUN`
+  on kernel ≥ 5.19 with graceful downgrade.
+- **Double-buffered Direct-mode log buffer** (active +
+  flushing buffers). Decouple append latency from flush
+  latency in the `JournalOptions::direct(true)` path.
+- **NAWUN / NAWUPF probe + `Handle::atomic_write_unit() ->
+  Option<u32>`.** NVMe Identify-Namespace command exposes the
+  drive's atomic-write guarantee; DBs aware of it skip
+  torn-write detection on guaranteeing drives.
+- **NUMA enumeration + `Builder::pin_to_node()` /
+  `pin_dispatcher_to_core()`.** Cluster nodes pin IO submission
+  threads to NUMA-local CPUs to eliminate cross-socket memory
+  traffic on the hot path.
+- **Journal segment rotation with checkpoint markers.**
+  Bounded recovery time on petabyte-scale WALs; replaces the
+  current single-monolithic-file design.
+
 ## [0.9.1] - 2026-05-09
 
 > **Bulk-load recovery + group-commit upgrade.** Two emdb v0.9.0

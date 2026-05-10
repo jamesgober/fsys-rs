@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::PlpStatus;
-use crate::hardware::cpu::{CpuFeatures, CpuInfo};
+use crate::hardware::cpu::CpuInfo;
 use crate::hardware::drive::{DriveInfo, DriveKind};
 use crate::hardware::io_primitives::IoPrimitives;
 use crate::hardware::memory::MemoryInfo;
@@ -271,7 +271,7 @@ pub(crate) fn probe_cpu() -> CpuInfo {
     CpuInfo {
         cores_logical,
         cores_physical,
-        features: detect_compile_time_features(),
+        features: super::super::cpu::runtime_features(),
         cache_l1,
         cache_l2,
         cache_l3,
@@ -347,46 +347,9 @@ fn parse_cache_size(s: &str) -> Option<usize> {
     })
 }
 
-fn detect_compile_time_features() -> CpuFeatures {
-    let mut f = CpuFeatures::empty();
-    if cfg!(target_feature = "sse") {
-        f |= CpuFeatures::SSE;
-    }
-    if cfg!(target_feature = "sse2") {
-        f |= CpuFeatures::SSE2;
-    }
-    if cfg!(target_feature = "sse3") {
-        f |= CpuFeatures::SSE3;
-    }
-    if cfg!(target_feature = "ssse3") {
-        f |= CpuFeatures::SSSE3;
-    }
-    if cfg!(target_feature = "sse4.1") {
-        f |= CpuFeatures::SSE4_1;
-    }
-    if cfg!(target_feature = "sse4.2") {
-        f |= CpuFeatures::SSE4_2;
-    }
-    if cfg!(target_feature = "avx") {
-        f |= CpuFeatures::AVX;
-    }
-    if cfg!(target_feature = "avx2") {
-        f |= CpuFeatures::AVX2;
-    }
-    if cfg!(target_feature = "avx512f") {
-        f |= CpuFeatures::AVX512F;
-    }
-    if cfg!(target_feature = "aes") {
-        f |= CpuFeatures::AES;
-    }
-    if cfg!(target_feature = "pclmulqdq") {
-        f |= CpuFeatures::PCLMULQDQ;
-    }
-    if cfg!(target_feature = "neon") {
-        f |= CpuFeatures::NEON;
-    }
-    f
-}
+// 0.9.2: `detect_compile_time_features` removed; CPU feature
+// detection is now runtime-dispatched via `cpu::runtime_features()`.
+// See `src/hardware/cpu.rs` for rationale.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IO primitives

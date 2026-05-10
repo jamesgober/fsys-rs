@@ -213,6 +213,11 @@ pub struct JournalHandle {
     /// buffer (the InnoDB / WiredTiger pattern). Buffered-mode
     /// journals retain their lock-free fast path.
     pub(crate) log_buffer: Option<Mutex<LogBuffer>>,
+    /// 0.9.2 — optional structured-telemetry observer cloned in
+    /// from the parent [`crate::Handle`] at journal-open time.
+    /// `None` for journals on observer-less handles. Per-op cost
+    /// when `None`: a single `Option::is_some` branch.
+    pub(crate) observer: Option<std::sync::Arc<dyn crate::observer::FsysObserver>>,
 }
 
 impl JournalHandle {
@@ -292,6 +297,7 @@ impl JournalHandle {
             native_ring: std::sync::OnceLock::new(),
             direct: false,
             log_buffer: None,
+            observer: None,
         })
     }
 
@@ -353,7 +359,22 @@ impl JournalHandle {
             native_ring: std::sync::OnceLock::new(),
             direct: direct_active,
             log_buffer,
+            observer: None,
         })
+    }
+
+    /// 0.9.2 — installs the structured-telemetry observer on this
+    /// journal handle. Called by [`crate::Handle::journal`] /
+    /// [`crate::Handle::journal_with`] right after opening, with
+    /// the parent handle's observer (if any).
+    ///
+    /// Idempotent: calling twice replaces any previously installed
+    /// observer with the new one.
+    pub(crate) fn set_observer(
+        &mut self,
+        observer: Option<std::sync::Arc<dyn crate::observer::FsysObserver>>,
+    ) {
+        self.observer = observer;
     }
 
     /// Returns `true` when this journal is using the Direct-IO
@@ -388,7 +409,25 @@ impl JournalHandle {
             direct = self.direct,
         )
         .entered();
+        // 0.9.2: observer instrumentation. `Option::as_ref` is a
+        // single branch when no observer is registered, and the
+        // `Instant::now()` call is elided by the compiler in that
+        // case (gated on `obs.is_some()`).
+        let obs_start = self.observer.as_ref().map(|_| Instant::now());
+        let result = self.append_inner(record);
+        if let (Some(obs), Some(start)) = (self.observer.as_ref(), obs_start) {
+            let bytes = record.len() as u64 + format::FRAME_OVERHEAD as u64;
+            obs.on_journal_append(crate::observer::JournalAppendEvent {
+                bytes_written: bytes,
+                records: 1,
+                duration: start.elapsed(),
+                error: result.is_err(),
+            });
+        }
+        result
+    }
 
+    fn append_inner(&self, record: &[u8]) -> Result<Lsn> {
         if let Some(buffer_mutex) = &self.log_buffer {
             // Direct-IO log-buffer path. Mutex-serialised: one
             // appender at a time copies its frame into the shared
@@ -531,7 +570,22 @@ impl JournalHandle {
             direct = self.direct,
         )
         .entered();
+        let obs_start = self.observer.as_ref().map(|_| Instant::now());
+        let result = self.append_batch_inner(records);
+        if let (Some(obs), Some(start)) = (self.observer.as_ref(), obs_start) {
+            let bytes = records.iter().map(|r| r.len() as u64).sum::<u64>()
+                + records.len() as u64 * format::FRAME_OVERHEAD as u64;
+            obs.on_journal_append(crate::observer::JournalAppendEvent {
+                bytes_written: bytes,
+                records: u32::try_from(records.len()).unwrap_or(u32::MAX),
+                duration: start.elapsed(),
+                error: result.is_err(),
+            });
+        }
+        result
+    }
 
+    fn append_batch_inner(&self, records: &[&[u8]]) -> Result<Lsn> {
         if records.is_empty() {
             return Ok(Lsn(self.next_lsn.load(Ordering::Acquire)));
         }
@@ -684,6 +738,12 @@ impl JournalHandle {
         // record after the previous leader captured its
         // frontier). The loop body is purely state-machine
         // bookkeeping; the actual fsync runs outside the lock.
+        // 0.9.2: `leader_start` captures wall-time at the
+        // moment we become the leader; the observer (if any)
+        // emits a single event after the fsync completes,
+        // covering both the optional window-wait and the
+        // syscall.
+        let leader_start: Instant;
         {
             let mut state = self.group_commit.state.lock();
             loop {
@@ -697,6 +757,7 @@ impl JournalHandle {
                 }
                 if !state.in_flight {
                     state.in_flight = true;
+                    leader_start = Instant::now();
                     break;
                 }
                 // Become a follower.
@@ -773,12 +834,14 @@ impl JournalHandle {
         // advance `committed_lsn` on failure, so followers
         // re-evaluate and may become the next-cycle leader
         // (where they re-attempt the fsync themselves).
+        let followers_at_commit;
         {
             let mut state = self.group_commit.state.lock();
             if sync_result.is_ok() && frontier > state.committed_lsn {
                 state.committed_lsn = frontier;
                 self.synced_lsn.store(frontier, Ordering::Release);
             }
+            followers_at_commit = state.pending_followers;
             state.in_flight = false;
             // `notify_all` returns the count of woken threads;
             // we don't care for backpressure purposes — every
@@ -789,6 +852,18 @@ impl JournalHandle {
         #[cfg(feature = "tracing")]
         if sync_result.is_ok() {
             tracing::debug!(new_synced_lsn = frontier, "group-commit fsync completed");
+        }
+
+        // 0.9.2 observer hook — leader-only. Followers returned
+        // early at the `committed_lsn >= lsn.0` check above
+        // without ever reaching this point.
+        if let Some(obs) = self.observer.as_ref() {
+            obs.on_journal_sync(crate::observer::JournalSyncEvent {
+                durable_lsn: frontier,
+                duration: leader_start.elapsed(),
+                followers_at_commit,
+                error: sync_result.is_err(),
+            });
         }
 
         sync_result
@@ -1764,6 +1839,86 @@ mod tests {
             speedup > 1.2,
             "append_batch must be at least 1.2× faster than append-loop; got {speedup:.2}×"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 0.9.2 — FsysObserver integration coverage
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn observer_fires_on_append_and_sync() {
+        use crate::observer::{FsysObserver, JournalAppendEvent, JournalSyncEvent};
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+
+        #[derive(Debug, Default)]
+        struct Counts {
+            append_calls: AtomicU64,
+            append_records: AtomicU64,
+            append_bytes: AtomicU64,
+            sync_calls: AtomicU64,
+            last_durable_lsn: AtomicU64,
+        }
+        impl FsysObserver for Counts {
+            fn on_journal_append(&self, e: JournalAppendEvent) {
+                let _ = self.append_calls.fetch_add(1, Ordering::Relaxed);
+                let _ = self
+                    .append_records
+                    .fetch_add(u64::from(e.records), Ordering::Relaxed);
+                let _ = self
+                    .append_bytes
+                    .fetch_add(e.bytes_written, Ordering::Relaxed);
+            }
+            fn on_journal_sync(&self, e: JournalSyncEvent) {
+                let _ = self.sync_calls.fetch_add(1, Ordering::Relaxed);
+                self.last_durable_lsn
+                    .store(e.durable_lsn, Ordering::Relaxed);
+            }
+        }
+
+        let path = tmp_path("observer_e2e");
+        let _g = Cleanup(path.clone());
+        let counts = Arc::new(Counts::default());
+        let fs = crate::builder()
+            .observer(counts.clone() as Arc<dyn FsysObserver>)
+            .build()
+            .expect("build");
+        let log = fs.journal(&path).expect("journal");
+
+        // Three single appends + one batch of three.
+        let _ = log.append(b"alpha").expect("a1");
+        let _ = log.append(b"beta").expect("a2");
+        let _ = log.append(b"gamma").expect("a3");
+        let last = log
+            .append_batch(&[b"delta" as &[u8], b"epsilon", b"zeta"])
+            .expect("batch");
+        log.sync_through(last).expect("sync");
+
+        // 3 append + 1 batch = 4 append-events; batch carried 3
+        // records, single appends carried 1 each.
+        assert_eq!(counts.append_calls.load(Ordering::Relaxed), 4);
+        assert_eq!(counts.append_records.load(Ordering::Relaxed), 6);
+        // 3 single records (5+12 + 4+12 + 5+12 = 50 bytes) +
+        // batch (5+12 + 7+12 + 4+12 = 52 bytes) = 102 bytes.
+        assert_eq!(counts.append_bytes.load(Ordering::Relaxed), 102);
+
+        // One leader-side fsync emitted.
+        assert_eq!(counts.sync_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.last_durable_lsn.load(Ordering::Relaxed), last.0);
+    }
+
+    #[test]
+    fn observer_no_op_when_handle_built_without_observer() {
+        // Sanity: a handle built without an observer must still
+        // function correctly through every append + sync path.
+        // Pre-0.9.2 baseline coverage stays green.
+        let path = tmp_path("observer_absent");
+        let _g = Cleanup(path.clone());
+        let j = JournalHandle::open(&path).expect("open");
+        assert!(j.observer.is_none());
+        let _ = j.append(b"unobserved").expect("append");
+        let _ = j.append_batch(&[b"a" as &[u8], b"b", b"c"]).expect("batch");
+        j.sync_through(j.next_lsn()).expect("sync");
     }
 
     #[test]

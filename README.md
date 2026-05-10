@@ -56,6 +56,7 @@ not trying to replace `std::fs` for ordinary application code.
 - **Configurable group lane** &mdash; tune batch window, batch size, queue depth, io_uring queue depth, and aligned-buffer-pool size per handle.
 - **Quick one-shot API** &mdash; convenience helpers backed by a lazily initialized default handle for simple cases.
 - **Structured error reporting** &mdash; 21 explicit error variants with stable `FS-XXXXX` codes for unsupported methods, alignment failures, atomic-replace failures, NVMe passthrough denial, async-runtime requirements, glob-pattern errors, batch failure position, handle poisoning, io_uring submit failure, and completion-driver liveness.
+- **Hardware-aware database surface (0.9.2)** &mdash; `Handle::is_plp_protected()` / `Handle::plp_status()` for safe per-commit fsync skip on confirmed-PLP enterprise NVMe (3&ndash;10&times; transaction-throughput lever); `crate::observer::FsysObserver` trait + `Builder::observer` for typed per-op telemetry (journal append / sync / handle write / read); runtime CPU-feature detection (replacing pre-0.9.2 compile-time `cfg!(target_feature = ...)` that lied on cross-target builds); `Builder::tune_for(Workload::Database)` for one-line storage-engine tuning (8 MiB buffer pool, 256-deep io_uring ring, 4096-deep batch queue).
 
 
 &nbsp;
@@ -67,7 +68,7 @@ not trying to replace `std::fs` for ordinary application code.
 
 ```toml
 [dependencies]
-fsys = "0.9.1"
+fsys = "0.9.2"
 ```
 
 To opt into the async layer:

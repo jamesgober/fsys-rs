@@ -16,10 +16,12 @@
 
 use crate::handle::Handle;
 use crate::method::Method;
+use crate::observer::FsysObserver;
 use crate::path::Mode;
 use crate::pipeline::{Pipeline, PipelineConfig};
 use crate::{Error, Result};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// A builder for creating a [`Handle`].
 ///
@@ -49,6 +51,7 @@ pub struct Builder {
     buffer_pool_count: usize,
     buffer_pool_block_size: usize,
     io_uring_queue_depth: u32,
+    observer: Option<Arc<dyn FsysObserver>>,
 }
 
 impl Builder {
@@ -63,6 +66,7 @@ impl Builder {
             buffer_pool_count: 64,
             buffer_pool_block_size: 4096,
             io_uring_queue_depth: 128,
+            observer: None,
         }
     }
 
@@ -220,6 +224,95 @@ impl Builder {
         self
     }
 
+    /// 0.9.2 — applies a coordinated workload preset.
+    ///
+    /// Pre-sets the buffer-pool capacity, buffer-pool block size,
+    /// io_uring queue depth, and batch-queue capacity to a tuned
+    /// combination matching a named workload shape. Equivalent to
+    /// calling each underlying setter explicitly, but ensures the
+    /// values stay coordinated as fsys evolves new defaults.
+    ///
+    /// Subsequent setter calls (`buffer_pool_count`,
+    /// `io_uring_queue_depth`, etc.) override the preset's value
+    /// for that knob, so callers can use a preset as a baseline
+    /// and tweak individual fields. Calling `tune_for` after
+    /// individual setters resets those setters to the preset's
+    /// values — apply presets first.
+    ///
+    /// **`Workload::Database`** — tuned for storage-engine
+    /// workloads (HiveDB, embedded KV stores, log-structured
+    /// merge trees) on NVMe with sustained bulk writes. Sets:
+    /// - `buffer_pool_count = 1024`,
+    ///   `buffer_pool_block_size = 8192` (= 8 MiB resident per
+    ///   handle, 32× the 256 KiB pre-0.9.2 default).
+    /// - `io_uring_queue_depth = 256` (= 2× the pre-0.9.2 default).
+    /// - `batch_queue_max = 4096` (= 4× the pre-0.9.2 default).
+    ///
+    /// **`Workload::Default`** — restores the library defaults
+    /// (256 KiB pool, 128-deep ring, 1024-deep batch queue).
+    /// Useful for tests and for callers who want to revert a
+    /// preset before applying a different one.
+    #[must_use]
+    pub fn tune_for(mut self, workload: Workload) -> Self {
+        match workload {
+            Workload::Default => {
+                self.buffer_pool_count = 64;
+                self.buffer_pool_block_size = 4096;
+                self.io_uring_queue_depth = 128;
+                self.pipeline_config.batch_queue_max = 1024;
+            }
+            Workload::Database => {
+                self.buffer_pool_count = 1024;
+                self.buffer_pool_block_size = 8192;
+                self.io_uring_queue_depth = 256;
+                self.pipeline_config.batch_queue_max = 4096;
+            }
+        }
+        self
+    }
+
+    /// 0.9.2 — registers a structured-telemetry observer with this
+    /// handle.
+    ///
+    /// See [`crate::observer::FsysObserver`] for the trait
+    /// contract. The handle keeps an `Arc<dyn FsysObserver>` clone
+    /// for the rest of its lifetime; the observer fires on the
+    /// instrumented hot paths (`Handle::write` / `read`,
+    /// `JournalHandle::append` / `append_batch` / `sync_through`).
+    /// Per-op cost when no observer is registered is a single
+    /// `Option::is_some` branch.
+    ///
+    /// Calling `observer()` twice replaces the previously
+    /// registered observer; only the most recent registration
+    /// survives into [`Builder::build`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::atomic::{AtomicU64, Ordering};
+    /// use std::sync::Arc;
+    /// use fsys::observer::{FsysObserver, JournalSyncEvent};
+    ///
+    /// #[derive(Debug, Default)]
+    /// struct Counter {
+    ///     syncs: AtomicU64,
+    /// }
+    /// impl FsysObserver for Counter {
+    ///     fn on_journal_sync(&self, _: JournalSyncEvent) {
+    ///         self.syncs.fetch_add(1, Ordering::Relaxed);
+    ///     }
+    /// }
+    ///
+    /// let counter = Arc::new(Counter::default());
+    /// let fs = fsys::builder().observer(counter.clone()).build().unwrap();
+    /// # let _ = fs;
+    /// ```
+    #[must_use]
+    pub fn observer(mut self, observer: Arc<dyn FsysObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
     /// Constructs the [`Handle`].
     ///
     /// Resolves `Method::Auto` using the hardware-detection ladder,
@@ -299,6 +392,7 @@ impl Builder {
             pipeline,
             pool_config,
             self.io_uring_queue_depth,
+            self.observer,
         ))
     }
 }
@@ -307,6 +401,34 @@ impl Default for Builder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 0.9.2 — Coordinated workload preset for [`Builder::tune_for`].
+///
+/// Each variant pre-sets a coordinated set of knobs (buffer-pool
+/// capacity, io_uring queue depth, batch queue size) tuned to a
+/// named workload shape. New variants land in patch releases as
+/// the library accumulates production experience with specific
+/// shapes; treat the variants as opt-in starting points, not
+/// load-bearing semantics.
+///
+/// `#[non_exhaustive]` — new variants may be added without bumping
+/// the major version. `match` arms must include a `_` fallback or
+/// they'll fail to compile against future patch releases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Workload {
+    /// The library defaults — 256 KiB buffer pool, 128-deep
+    /// io_uring ring, 1024-deep batch queue. Suitable for
+    /// general file IO; NOT tuned for sustained database
+    /// throughput.
+    Default,
+    /// Storage-engine / database workload preset. 8 MiB buffer
+    /// pool, 256-deep ring, 4096-deep batch queue. Suitable for
+    /// HiveDB, embedded KV stores, log-structured merge trees,
+    /// and any workload with sustained bulk writes against an
+    /// NVMe target.
+    Database,
 }
 
 /// Rounds `n` up to the next multiple of `align`. `align` must be a
@@ -541,5 +663,62 @@ mod tests {
         assert_eq!(align_up(513, 512), 1024);
         // align == 0 is a no-op (defensive)
         assert_eq!(align_up(100, 0), 100);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 0.9.2 — Workload preset coverage
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_tune_for_database_sets_coordinated_knobs() {
+        let b = Builder::new().tune_for(Workload::Database);
+        // Bigger buffer pool — 8 MiB vs the 256 KiB default.
+        assert_eq!(b.buffer_pool_count, 1024);
+        assert_eq!(b.buffer_pool_block_size, 8192);
+        // Deeper io_uring ring (Linux Direct path).
+        assert_eq!(b.io_uring_queue_depth, 256);
+        // Deeper batch queue.
+        assert_eq!(b.pipeline_config.batch_queue_max, 4096);
+    }
+
+    #[test]
+    fn test_tune_for_default_restores_baseline() {
+        let b = Builder::new()
+            .tune_for(Workload::Database)
+            .tune_for(Workload::Default);
+        assert_eq!(b.buffer_pool_count, 64);
+        assert_eq!(b.buffer_pool_block_size, 4096);
+        assert_eq!(b.io_uring_queue_depth, 128);
+        assert_eq!(b.pipeline_config.batch_queue_max, 1024);
+    }
+
+    #[test]
+    fn test_tune_for_then_individual_setter_overrides() {
+        // Setters after `tune_for` must override that preset's
+        // value, so callers can use a preset as a baseline and
+        // tweak.
+        let b = Builder::new()
+            .tune_for(Workload::Database)
+            .buffer_pool_count(2048)
+            .io_uring_queue_depth(512);
+        assert_eq!(b.buffer_pool_count, 2048);
+        assert_eq!(b.io_uring_queue_depth, 512);
+        // The other knobs preserve the preset's values.
+        assert_eq!(b.buffer_pool_block_size, 8192);
+        assert_eq!(b.pipeline_config.batch_queue_max, 4096);
+    }
+
+    #[test]
+    fn test_tune_for_database_builds_handle() {
+        let h = Builder::new()
+            .tune_for(Workload::Database)
+            .build()
+            .expect("database preset build");
+        // The buffer pool config carried into the handle reflects
+        // the preset; pool is lazy-init, so block_size visible
+        // post-build is the rounded-up value.
+        let pool = h.buffer_pool().expect("buffer pool");
+        assert_eq!(pool.capacity(), 1024);
+        assert!(pool.block_size() >= 8192);
     }
 }
