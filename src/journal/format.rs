@@ -108,58 +108,32 @@ pub(crate) const FRAME_MAX_PAYLOAD: u32 = (1 << 28) - 1; // 256 MiB
 // CRC32C (Castagnoli polynomial, used by SCSI / iSCSI / Btrfs /
 // every database WAL since the late 2000s).
 //
-// Implementation: software lookup table fallback. On modern x86 +
-// ARM the Rust compiler with `-C target-feature=+sse4.2` /
-// `+crc` would emit hardware crc32 instructions, but we don't
-// hard-require those features (MSRV 1.75 + cross-platform
-// compatibility). Software crc32c via a precomputed lookup table
-// is ~2 GB/s on a single core — fast enough that checksumming
-// is not a bottleneck on the journal hot path even for 1 MiB
-// records.
+// Implementation (0.9.1): the `crc32c` crate, which performs
+// runtime CPU-feature dispatch — SSE4.2 `crc32` on x86_64 (~30
+// GB/s/core), ARMv8 CRC extensions on aarch64, pure-Rust
+// fallback elsewhere. Replaces the software lookup-table
+// implementation that shipped through 0.9.0 (~2 GB/s/core).
 //
-// The lookup-table entries are computed at compile time so we
-// pay zero startup cost; the table fits in 1 KiB of read-only
-// data.
+// The bit-pattern result is identical: both implementations follow
+// RFC 3720 (initial state 0xFFFFFFFF internally; output is
+// post-NOT). The KAT vectors in this module's tests
+// (`crc32c_known_answer_vectors`) pin the wire format and would
+// break loudly if the implementation deviated.
+//
+// 0.9.1 motivation: the journal's per-frame CRC is hot on the
+// bulk-load path (5 M tight-loop appends in the lmdb_style bench).
+// Hardware acceleration is one of the load-bearing wins behind
+// the post-0.9.0 bulk-load lead recovery vs v0.8.5.
 // ─────────────────────────────────────────────────────────────────
 
-/// Castagnoli (CRC-32C) polynomial reflected:
-/// `x^32 + x^28 + x^27 + x^26 + x^25 + x^23 + x^22 + x^20 + x^19 + x^18 + x^14 + x^13 + x^11 + x^10 + x^9 + x^8 + x^6 + 1`
-/// reflected → `0x82F63B78`.
-const CRC32C_POLY: u32 = 0x82F6_3B78;
-
-/// Precomputed 256-entry CRC-32C lookup table.
-const CRC32C_TABLE: [u32; 256] = build_crc32c_table();
-
-const fn build_crc32c_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut crc = i as u32;
-        let mut j = 0;
-        while j < 8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ CRC32C_POLY
-            } else {
-                crc >> 1
-            };
-            j += 1;
-        }
-        table[i] = crc;
-        i += 1;
-    }
-    table
-}
-
-/// Computes the CRC-32C checksum of `bytes`, starting from the
-/// initial value `0xFFFF_FFFF` and finalising with a bitwise NOT
-/// (the conventional CRC-32C protocol per RFC 3720).
+/// Computes the CRC-32C checksum of `bytes` per RFC 3720.
+///
+/// Hardware-dispatched (SSE4.2 / ARMv8 CRC) at runtime via the
+/// `crc32c` crate; transparently falls back to a Rust software
+/// implementation on hosts without the feature.
 #[inline]
 pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in bytes {
-        crc = (crc >> 8) ^ CRC32C_TABLE[((crc ^ b as u32) & 0xFF) as usize];
-    }
-    !crc
+    ::crc32c::crc32c(bytes)
 }
 
 /// Streaming CRC-32C — useful when checksumming is split across
@@ -169,6 +143,13 @@ pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
 /// Call [`Crc32cBuilder::new`] to start; feed bytes via
 /// [`Crc32cBuilder::update`]; finalise with
 /// [`Crc32cBuilder::finalize`].
+///
+/// 0.9.1: backed by `crc32c::crc32c_append`, which preserves the
+/// runtime CPU-feature dispatch across multi-chunk inputs. The
+/// internal state is the post-NOT (caller-visible) value, so
+/// `Crc32cBuilder::new()` initialises with `0` rather than the
+/// raw `0xFFFF_FFFF` initial register value. The wire-level
+/// output is unchanged.
 pub(crate) struct Crc32cBuilder {
     crc: u32,
 }
@@ -177,23 +158,19 @@ impl Crc32cBuilder {
     /// Begins a new CRC computation.
     #[inline]
     pub(crate) fn new() -> Self {
-        Self { crc: 0xFFFF_FFFF }
+        Self { crc: 0 }
     }
 
     /// Feeds `bytes` into the computation.
     #[inline]
     pub(crate) fn update(&mut self, bytes: &[u8]) {
-        let mut crc = self.crc;
-        for &b in bytes {
-            crc = (crc >> 8) ^ CRC32C_TABLE[((crc ^ b as u32) & 0xFF) as usize];
-        }
-        self.crc = crc;
+        self.crc = ::crc32c::crc32c_append(self.crc, bytes);
     }
 
-    /// Returns the finalised CRC-32C value (post bitwise NOT).
+    /// Returns the finalised CRC-32C value.
     #[inline]
     pub(crate) fn finalize(self) -> u32 {
-        !self.crc
+        self.crc
     }
 }
 

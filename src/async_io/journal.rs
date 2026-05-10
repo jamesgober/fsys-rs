@@ -198,83 +198,68 @@ impl JournalHandle {
 
     /// Native group-commit fsync — submit `IORING_OP_FSYNC(DATASYNC)`
     /// SQE and update synced_lsn after completion.
+    ///
+    /// 0.9.1: ports the sync path's leader/follower coordinator
+    /// to the async substrate. The state mutex is acquired non-
+    /// blocking via `try_lock`; on contention we yield the
+    /// tokio worker rather than parking on a Condvar (which
+    /// would block the worker thread). The async leader skips
+    /// the `group_commit_window` follower-batching wait — async
+    /// callers naturally arrive on a different timescale than
+    /// sync callers, and the io_uring fsync is itself zero-
+    /// syscall-cost on the submitter side.
     async fn sync_through_native(self: Arc<Self>, ring: &AsyncIoUring, lsn: Lsn) -> Result<()> {
         use std::os::fd::AsRawFd;
 
-        // Acquire the sync gate so only one fsync (sync or
-        // native) runs at a time per journal. The gate lock is
-        // held briefly across the SQE submission + completion
-        // wait.
-        //
-        // Note: we use a `try_lock` + spin-with-yield pattern
-        // instead of a blocking `.lock()` because tokio's
-        // std::sync::Mutex::lock would block the runtime worker.
-        // Under heavy concurrent sync_through_async load this
-        // gate is the contention point; coalescing happens
-        // because the second-arriving caller observes
-        // synced_lsn already advanced past their LSN before they
-        // get the gate.
         loop {
-            // Re-check inside the loop so a winner that just
-            // released can be observed before we spin again.
+            // Atomic-load fast path — cheaper than a lock
+            // acquire when the durable frontier already covers
+            // our target.
             if self.synced_lsn.load(Ordering::Acquire) >= lsn.0 {
                 return Ok(());
             }
-            match self.try_acquire_sync_gate() {
-                Ok(_guard) => {
-                    // Double-check after gate acquire.
-                    if self.synced_lsn.load(Ordering::Acquire) >= lsn.0 {
-                        return Ok(());
-                    }
-                    let frontier = self.next_lsn.load(Ordering::Acquire);
-                    let fd = self.file.as_raw_fd();
-                    crate::async_io::iouring_substrate::fdatasync_native(ring, fd).await?;
-                    self.synced_lsn.store(frontier, Ordering::Release);
-                    return Ok(());
-                }
-                Err(_) => {
-                    // Another async caller is doing the fsync.
-                    // Yield to the runtime and re-check.
+            // Non-blocking try_lock so the tokio worker isn't
+            // parked on a contended mutex.
+            let mut state = match self.group_commit.state.try_lock() {
+                Some(g) => g,
+                None => {
                     tokio::task::yield_now().await;
+                    continue;
                 }
+            };
+            if state.committed_lsn >= lsn.0 {
+                return Ok(());
             }
-        }
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "async"))]
-struct SyncGateGuard<'a> {
-    inner: std::sync::MutexGuard<'a, ()>,
-}
-
-#[cfg(all(target_os = "linux", feature = "async"))]
-impl<'a> Drop for SyncGateGuard<'a> {
-    fn drop(&mut self) {
-        // Implicit drop — the inner MutexGuard's Drop releases.
-        let _ = &self.inner;
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "async"))]
-impl JournalHandle {
-    /// Try to acquire the sync gate without blocking. Returns
-    /// the guard if successful. If another caller holds the gate,
-    /// returns Err(()) immediately so we can yield to the runtime
-    /// instead of blocking the tokio worker.
-    fn try_acquire_sync_gate(&self) -> std::result::Result<SyncGateGuard<'_>, ()> {
-        match self.sync_gate.try_lock() {
-            Ok(g) => Ok(SyncGateGuard { inner: g }),
-            Err(std::sync::TryLockError::WouldBlock) => Err(()),
-            Err(std::sync::TryLockError::Poisoned(p)) => {
-                // Poisoned lock — recover and use it. Poisoning
-                // here means a previous holder panicked while
-                // the gate was held; the journal state may be
-                // suspect, but for sync_through purposes we can
-                // still safely fsync.
-                Ok(SyncGateGuard {
-                    inner: p.into_inner(),
-                })
+            if state.in_flight {
+                // Another caller (sync or async) is running
+                // fsync. Drop the lock and yield; on resume,
+                // the synced_lsn fast path or committed_lsn
+                // re-check will likely cover us.
+                drop(state);
+                tokio::task::yield_now().await;
+                continue;
             }
+            // Become leader. Mark in_flight, release the lock
+            // before submitting the io_uring SQE so concurrent
+            // followers can observe the in-flight state.
+            state.in_flight = true;
+            drop(state);
+
+            let frontier = self.next_lsn.load(Ordering::Acquire);
+            let fd = self.file.as_raw_fd();
+            let result = crate::async_io::iouring_substrate::fdatasync_native(ring, fd).await;
+
+            // Re-acquire to publish committed_lsn and clear
+            // in_flight; notify any parked sync-path
+            // followers via cv_followers.
+            let mut state = self.group_commit.state.lock();
+            if result.is_ok() && frontier > state.committed_lsn {
+                state.committed_lsn = frontier;
+                self.synced_lsn.store(frontier, Ordering::Release);
+            }
+            state.in_flight = false;
+            let _ = self.group_commit.cv_followers.notify_all();
+            return result;
         }
     }
 }

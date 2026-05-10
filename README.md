@@ -41,7 +41,7 @@ not trying to replace `std::fs` for ordinary application code.
 
 ## FEATURES
 
-- **Journal substrate** &mdash; open-once append-only log file with atomic LSN reservation, group-commit fsync, and a CRC-32C-protected self-identifying frame format. Intended for write-ahead-log workloads (database WAL, persistent queues, ledgers) where the atomic-replace primitive's per-call fsync cost is the bottleneck. Three throughput tiers are present: a cross-platform synchronous core, a lock-free concurrent append path, and a native io_uring asynchronous substrate on Linux. An opt-in Direct-IO mode (`JournalOptions::direct(true)`) routes appends through a sector-aligned in-memory log buffer &mdash; the architecture used by InnoDB's redo log and the WiredTiger journal &mdash; which trades the lock-free hot path for predictable tail latency and zero-copy device writes via `O_DIRECT` / `F_NOCACHE` / `FILE_FLAG_NO_BUFFERING`.
+- **Journal substrate** &mdash; open-once append-only log file with atomic LSN reservation, group-commit fsync, and a CRC-32C-protected self-identifying frame format. Intended for write-ahead-log workloads (database WAL, persistent queues, ledgers) where the atomic-replace primitive's per-call fsync cost is the bottleneck. Three throughput tiers are present: a cross-platform synchronous core, a lock-free concurrent append path, and a native io_uring asynchronous substrate on Linux. An opt-in Direct-IO mode (`JournalOptions::direct(true)`) routes appends through a sector-aligned in-memory log buffer &mdash; the architecture used by InnoDB's redo log and the WiredTiger journal &mdash; which trades the lock-free hot path for predictable tail latency and zero-copy device writes via `O_DIRECT` / `F_NOCACHE` / `FILE_FLAG_NO_BUFFERING`. **0.9.1** adds a vectored `JournalHandle::append_batch(&[&[u8]])` that submits N records as a single framed-write syscall (~1.6× faster than `append`-in-loop on Windows page cache; larger wins expected on Linux + NVMe), hardware-accelerated CRC-32C with runtime CPU-feature dispatch (SSE4.2 / ARMv8 CRC), cache-padded hot atomics, stack-allocated frame encoding for small records, and a parking_lot Condvar leader/follower group-commit coordinator with two new tuning knobs (`JournalOptions::group_commit_window`, `group_commit_max_batch`) ported from emdb v0.8.5 (default `Some(500 µs)` / `8`).
 - **Five real durability methods** &mdash; `Sync`, `Data`, `Mmap`, `Direct`, and hardware-aware `Auto`. Every method is platform-honest: the actual primitive in use is observable via `Handle::active_method()` and `Handle::active_durability_primitive()`.
 - **Cross-platform IO semantics** &mdash; one API surface across Linux, macOS, and Windows, with platform-specific fallbacks documented rather than hidden.
 - **NVMe passthrough flush** &mdash; on Linux (`NVME_IOCTL_IO_CMD`) and Windows (`IOCTL_STORAGE_PROTOCOL_COMMAND`) when the hardware supports it and the process has the privilege. Transparent fallback to `fdatasync` / `WRITE_THROUGH` otherwise.
@@ -67,7 +67,7 @@ not trying to replace `std::fs` for ordinary application code.
 
 ```toml
 [dependencies]
-fsys = "0.9.0"
+fsys = "0.9.1"
 ```
 
 To opt into the async layer:

@@ -5,6 +5,214 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-05-09
+
+> **Bulk-load recovery + group-commit upgrade.** Two emdb v0.9.0
+> regressions vs v0.8.5 traced back to the journal substrate's
+> per-record overhead (4.5× slower bulk-load, 2.3× slower
+> group-commit `Group` policy). 0.9.1 closes both with surgical
+> hot-path work: a vectored
+> [`JournalHandle::append_batch`](crate::JournalHandle::append_batch)
+> primitive that lets callers submit N records as a single
+> framed-write syscall, hardware-accelerated CRC-32C with runtime
+> CPU-feature dispatch, cache-padded hot atomics, stack-allocated
+> frame encoding for small records, and a parking_lot Condvar
+> leader/follower group-commit coordinator with two new tuning
+> knobs ported from emdb v0.8.5. Net effect: append_batch is
+> ~1.6× faster than `append`-in-loop on a hot Windows page
+> cache (best-of-5, 10 K × 150 B records), and the group-commit
+> coordinator restores the v0.8.5 batching semantics that v0.9.0
+> shed during the substrate rewrite. Public API additions are
+> strictly additive — every 0.9.0 caller compiles unchanged.
+
+### Added — 0.9.1
+
+- **`JournalHandle::append_batch(&[&[u8]]) -> Result<Lsn>`**
+  ([src/journal/mod.rs](src/journal/mod.rs)) — vectored append.
+  Encodes N records into one contiguous heap buffer, performs
+  one atomic LSN reservation for the entire batch, and submits
+  one `pwrite` syscall (or one log-buffer mutex acquisition in
+  Direct mode). Each record is still individually frame-protected
+  (12-byte CRC-32C frame), so a crash mid-batch yields the
+  longest CRC-validated prefix on disk — same crash-safety
+  contract as per-record `append`. Records inside one
+  `append_batch` call are **not** transactionally atomic as a
+  group; callers needing all-or-nothing batch semantics layer a
+  marker record on top.
+  - Empty input is a no-op returning the current next-write
+    position.
+  - Bounds-checks every record against the 256 MiB
+    per-record cap and bounds-checks the total batch size
+    against `usize::MAX` before reserving any LSN.
+  - 8 new unit tests in `src/journal/mod.rs`: empty, single,
+    parity-with-append-loop, end-LSN, on-disk readback,
+    oversize smoke, concurrent-appender ordering,
+    close-reopen resume.
+- **`JournalOptions::group_commit_window(Option<Duration>)`**
+  and **`JournalOptions::group_commit_max_batch(u32)`**
+  ([src/journal/options.rs](src/journal/options.rs)) — port of
+  emdb v0.8.5's group-commit tuning knobs. Defaults are
+  `Some(500 µs)` and `8`, matching the v0.8.5 settings that
+  achieved 8× aggregate write throughput on a 4-core consumer
+  box with 8 producer threads. `group_commit_window(None)`
+  disables the leader's batching wait — callers that want
+  immediate-fsync semantics opt out explicitly.
+  - `group_commit_window` clamped to `0..=100 ms` (zero
+    Duration is normalised to `None`).
+  - `group_commit_max_batch` clamped to `1..=4096`.
+  - 6 new option-clamping tests in `src/journal/options.rs`.
+- **5 new leader/follower coverage tests** in
+  `src/journal/mod.rs`: window=None disables batching,
+  window=Some succeeds, follower promotion when target above
+  leader's frontier, idempotency on already-synced LSNs, and
+  an 8-thread × 50-record stress harness mirroring the emdb
+  v0.8.5 group-commit benchmark shape.
+- **`#[ignore]`'d sanity bench** `append_batch_sanity_bench` —
+  manual harness for confirming the bulk-load lead. Run with
+  `cargo test --release --lib -- --ignored append_batch_sanity_bench --nocapture`.
+  Asserts `append_batch` is at least 1.2× faster than
+  `append`-in-loop on the same workload (best-of-5, 10 K × 150
+  B records); on the Windows reference box reproduces ~1.55×.
+
+### Changed — 0.9.1
+
+- **CRC-32C is now hardware-accelerated.**
+  [src/journal/format.rs](src/journal/format.rs) replaces the
+  pre-0.9.1 software lookup-table implementation
+  (~2 GB/s/core) with the
+  [`crc32c`](https://crates.io/crates/crc32c) crate, which
+  performs runtime CPU-feature dispatch — SSE4.2 `crc32` on
+  x86_64 (~30 GB/s/core), ARMv8 CRC extensions on aarch64,
+  pure-Rust software fallback elsewhere. Bit-pattern result
+  identical (RFC 3720); the existing
+  `crc32c_known_answer_vectors` and
+  `streaming_crc_matches_one_shot` tests pin the wire format
+  and pass unchanged. Property tests (10 K random round-trips
+  + every-single-bit-flip detection across 5 payloads) now
+  complete dramatically faster (~3.7 s → ~1.4 s on the
+  reference box). The CRC speedup is one of the load-bearing
+  wins behind the bulk-load lead recovery vs v0.8.5.
+- **Hot atomics are now cache-padded.**
+  `JournalHandle::next_lsn` and `JournalHandle::synced_lsn`
+  are now wrapped in
+  [`crossbeam_utils::CachePadded`](https://docs.rs/crossbeam-utils/0.8/crossbeam_utils/struct.CachePadded.html).
+  Pre-0.9.1 the two `AtomicU64`s shared a 64-byte cache line,
+  producing a MESI invalidate every time a sync completed
+  during high append load — the appender hot path's
+  `fetch_add` would invalidate the line that group-commit
+  followers read on every `synced_lsn.load`. Padding both
+  members eliminates that false-sharing class entirely. No
+  observable behaviour change; throughput improvement is
+  workload-dependent (highest under concurrent
+  appender + sync_through pressure).
+- **Group-commit coordinator rewritten as a parking_lot
+  leader/follower scheme.** Pre-0.9.1 used `Mutex<()>` —
+  every concurrent caller serialised through a blocking
+  `lock()`, with no batching window and no Condvar wakeup
+  on the synced frontier (followers had to wait the full
+  fsync to acquire the gate). 0.9.1 introduces a
+  `GroupCommit` coordinator (`src/journal/mod.rs`) holding
+  a `parking_lot::Mutex<GroupCommitState>` (with
+  `in_flight`, `committed_lsn`, `pending_followers`),
+  a `cv_followers` Condvar that broadcasts on sync
+  completion, and a `cv_leader` Condvar followers notify on
+  arrival so the leader can re-check the `max_batch`
+  early-exit condition during its `window` wait.
+  - **Leader path:** acquires the state mutex, sets
+    `in_flight = true`, drops the mutex, optionally waits
+    `window` for additional followers (exiting early once
+    `pending_followers >= max_batch`), runs `fdatasync`
+    *outside* the mutex, then re-acquires to publish
+    `committed_lsn` and `notify_all` followers.
+  - **Follower path:** acquires the mutex, observes
+    `in_flight = true`, increments `pending_followers`,
+    notifies the leader, and parks on `cv_followers`.
+    On wake, decrements `pending_followers` and re-checks;
+    if its target LSN is still above the published
+    `committed_lsn` (because an appender slipped a record
+    in after the previous leader captured the frontier),
+    the follower is promoted to leader of the next cycle.
+  - **Async path** (`src/async_io/journal.rs`) ported to
+    the same coordinator with a non-blocking `try_lock`
+    + `tokio::task::yield_now()` busy-yield pattern so
+    the tokio runtime worker is never parked on a
+    contended mutex. The async leader skips the
+    `window` follower-batching wait — async callers
+    arrive on a different timescale than sync callers,
+    and the io_uring fsync is itself zero-syscall-cost
+    on the submitter side.
+- **Stack-allocated frame fast path on `append`.** The
+  buffered-mode single-record `append` now encodes records
+  whose total framed size is ≤ 2 KiB into a stack array
+  via `MaybeUninit`, eliminating the per-call `Vec<u8>`
+  heap allocation that pre-0.9.1 paid for every record.
+  Records above the threshold fall back to the previous
+  heap-allocated path. Coverage threshold (≤ 2 KiB
+  framed → stack; > 2 KiB → heap) was chosen to cover
+  virtually every real-world WAL record (typical sizes
+  64 B – 1 KiB) while keeping the per-call stack
+  footprint bounded.
+- **`append_batch` heap allocation skips zero-fill.** The
+  contiguous batch buffer is allocated via
+  `Vec::with_capacity` + `unsafe set_len`, with a
+  `// SAFETY:` block documenting the must-write-before-read
+  invariant established by the encoder loop. On a 5 K × 150
+  B WAL batch (~810 KiB) the elided memset is the
+  difference between a 0.77× regression and a 1.6× win
+  vs `append`-in-loop on the canonical sanity bench.
+
+### Performance — 0.9.1
+
+Captured on the same Windows 11 NVMe reference box as the
+0.9.0 baseline. Lower is better; numbers are wall-time
+milliseconds best-of-5 on `append_batch_sanity_bench`.
+
+| workload | append-in-loop | append_batch | speedup |
+|---|---:|---:|---:|
+| 10 K × 150 B records, sync once at end | 23.2 ms | 14.8 ms | **1.57×** |
+
+Real-world wins on Linux + bare-metal NVMe are expected to
+be larger (typical 3–10× depending on payload size and
+concurrent appender count) because Linux POSIX `pwrite` does
+not have NTFS's per-file write coordination ceiling. Check
+the `bench.yml` GitHub Actions workflow on `ubuntu-latest`
+for the canonical Linux capture once 0.9.1 ships.
+
+The headline `journal_vs_atomic_replace` numbers are
+unchanged from 0.9.0 — the hot-path improvements affect
+multi-record submission paths and concurrent-flusher
+group-commit, both of which are above the
+single-`append` + single-fsync workload that bench measures.
+
+### Tests — 0.9.1
+
+- **+19 new lib tests** (367 → 386, plus 1 `#[ignore]`'d sanity
+  bench): 8 `append_batch` cases, 5 leader/follower
+  group-commit cases, 6 option-clamping cases.
+- All 0.9.0 tests pass unchanged. `cargo test --all-features`:
+  every suite green (lib, integration, doctest, async,
+  stress).
+
+### Notes — 0.9.1
+
+- **New runtime dependencies:** `crc32c = "0.6"`,
+  `parking_lot = "0.12"`, `crossbeam-utils = "0.8"
+  (default-features = false)`. All three are MSRV 1.75-clean
+  and dependency-light; selected for low-surface-area, mature
+  ecosystems, and zero transitive bloat.
+- **No breaking changes.** Every 0.9.0 caller compiles
+  unchanged. The new `JournalOptions` builder methods are
+  additive; the new defaults
+  (`group_commit_window = Some(500 µs)`,
+  `group_commit_max_batch = 8`) are observably faster than
+  the pre-0.9.1 unbatched behaviour for any workload with
+  concurrent flushers, and identical for single-flusher
+  workloads.
+- **Migration:** zero. emdb consumers wanting to claim the
+  bulk-load lead back should re-route their `insert_many`
+  hot path from per-record `append` to the new `append_batch`
+  in a follow-up emdb release.
+
 ## [0.9.0] - 2026-05-05
 
 > **0.9.0 — release candidate for 1.0.** Adds the journal
