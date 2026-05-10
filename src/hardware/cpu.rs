@@ -44,9 +44,11 @@ impl CpuFeatures {
     pub const AVX2: Self = Self(1 << 7);
     /// AVX-512 Foundation (x86).
     pub const AVX512F: Self = Self(1 << 8);
-    /// AES-NI (x86).
+    /// Hardware AES instructions — AES-NI on x86,
+    /// Crypto-Extensions `aes` on ARMv8.
     pub const AES: Self = Self(1 << 9);
-    /// Carryless multiplication (x86).
+    /// Carryless / polynomial multiplication — PCLMULQDQ on x86,
+    /// `pmull` on ARMv8.
     pub const PCLMULQDQ: Self = Self(1 << 10);
     /// ARM NEON / AArch64 ASIMD.
     pub const NEON: Self = Self(1 << 11);
@@ -198,6 +200,20 @@ pub(crate) fn runtime_features() -> CpuFeatures {
     {
         if std::arch::is_aarch64_feature_detected!("neon") {
             f |= CpuFeatures::NEON;
+        }
+        // ARMv8 Crypto Extensions — `aes` is the AES instruction
+        // and `pmull` is the polynomial-multiply (the ARM
+        // equivalent of x86 PCLMULQDQ). Apple Silicon (M-series)
+        // ships both as part of the ARMv8.2 baseline, so a
+        // Rust build for aarch64-apple-darwin has them in its
+        // compile-time `target_feature` set; we mirror that at
+        // runtime so the AES / PCLMULQDQ flags reflect the
+        // host capability regardless of architecture.
+        if std::arch::is_aarch64_feature_detected!("aes") {
+            f |= CpuFeatures::AES;
+        }
+        if std::arch::is_aarch64_feature_detected!("pmull") {
+            f |= CpuFeatures::PCLMULQDQ;
         }
     }
 
