@@ -4,7 +4,7 @@
 ######################################################
 [package]
 name    = "fsys"
-version = "0.9.0"
+version = "0.9.1"
 
 # METADATA
 readme  = "README.md"
@@ -141,6 +141,35 @@ crossbeam-channel = "0.5"
 # `crossbeam-channel`, ~2K LOC vs the umbrella's 10–20× larger surface,
 # version-pinnable independently. No transitive deps.
 crossbeam-queue = "0.3"
+
+# `CachePadded<T>` newtype that aligns and pads its inner value to
+# the platform's cache-line size. Used in 0.9.1 to eliminate the
+# false-sharing ping-pong between the journal's `next_lsn` (mutated
+# by every appender) and `synced_lsn` (read by every group-commit
+# follower). Same maintainers as crossbeam-channel / crossbeam-queue;
+# zero transitive deps; const-friendly construction.
+crossbeam-utils = { version = "0.8", default-features = false }
+
+# Hardware-accelerated CRC-32C (Castagnoli, RFC 3720). Runtime
+# CPUID dispatch on x86_64 (SSE4.2 `crc32` instruction) and ARMv8
+# (CRC extensions); pure-Rust fallback elsewhere. ~30 GB/s on
+# modern x86 vs the previous ~2 GB/s software lookup table — the
+# 5×+ speedup on the journal's per-frame CRC is the load-bearing
+# 0.9.1 fix for the bulk-load regression vs v0.8.5.
+# Selected over `crc32fast` (which targets the *standard*
+# CRC-32 polynomial, not Castagnoli) and over hand-rolled
+# `target_feature` SIMD (would require nightly + MSRV bump).
+# `crc32c` 0.6 is MSRV 1.46-clean and dependency-free.
+crc32c = "0.6"
+
+# `Mutex` + `Condvar` with futex-backed wait/wake (Linux), no
+# poisoning, and `wait_for` / `wait_while` ergonomics that the
+# std-lib equivalents lack. Used in 0.9.1 to replace the journal's
+# blocking `Mutex<()>` group-commit gate with a leader/follower
+# Condvar pattern that ports v0.8.5 emdb's working scheme.
+# Smaller, faster, and less footgun-prone than `std::sync::{Mutex,
+# Condvar}` for the deep-internal coordination paths fsys uses.
+parking_lot = "0.12"
 
 # Cross-platform memory-mapped IO for `Method::Mmap` (D-6 +
 # `CHANGELOG.md`). The original `memmap` crate is unmaintained;
