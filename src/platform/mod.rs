@@ -343,10 +343,7 @@ pub(crate) fn sync_full(file: &std::fs::File) -> crate::Result<()> {
     not(target_os = "linux"),
     allow(unused_variables, clippy::needless_pass_by_value)
 )]
-pub(crate) fn set_write_lifetime_hint(
-    file: &std::fs::File,
-    hint_ordinal: u8,
-) -> crate::Result<()> {
+pub(crate) fn set_write_lifetime_hint(file: &std::fs::File, hint_ordinal: u8) -> crate::Result<()> {
     #[cfg(target_os = "linux")]
     {
         imp::fcntl_set_rw_hint(file, hint_ordinal)
