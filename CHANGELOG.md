@@ -125,11 +125,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reflects real silicon. The compile-time symbols stay defined
   (`CpuFeatures::SSE4_2` etc.) but the boolean detection is
   runtime-only.
+  - **Cross-arch AES / PCLMULQDQ.** The `AES` and `PCLMULQDQ`
+    flags are no longer x86-only — Apple Silicon (M-series)
+    and other ARMv8 hosts with the Crypto Extensions feature
+    set are detected via `is_aarch64_feature_detected!("aes")`
+    and `is_aarch64_feature_detected!("pmull")` respectively.
+    Doc comments on `CpuFeatures::AES` and
+    `CpuFeatures::PCLMULQDQ` are updated to reflect the
+    cross-arch semantics; the bit pattern is preserved so the
+    flag set is portable between x86 and aarch64 consumers.
+    Load-bearing for HiveDB's planned AES-GCM at-rest path on
+    Apple Silicon deployments.
   - **Two new tests** in `src/hardware/cpu.rs`: SSE2 must be
     reported on every x86_64 host (it's part of the baseline
     ISA), and the runtime feature set must be a superset of (or
-    equal to) the compile-time `target_feature` set.
-  - The three platform `probe_cpu` functions
+    equal to) the compile-time `target_feature` set. The
+    superset assertion exercises both arches — on Apple
+    Silicon it confirms AES + NEON are runtime-detected; on
+    x86_64 it confirms SSE2 + SSE4.2 + AES are
+    runtime-detected.
+  - The four platform `probe_cpu` functions
     (`src/hardware/probe/{linux,macos,windows,unknown}.rs`)
     each call into the shared helper instead of the four
     duplicate `cfg!(target_feature = …)` blocks they each
