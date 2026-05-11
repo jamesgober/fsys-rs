@@ -66,8 +66,9 @@ pub(crate) use group::{BatchOp, HandleSnapshot};
 /// Configuration knobs for the group-lane pipeline.
 ///
 /// Set by the [`crate::Builder`] (`batch_window_ms`, `batch_size_max`,
-/// `batch_queue_max`). Defaults match the prompt: 1 ms window, 128 ops
-/// per batch, 1024-deep queue.
+/// `batch_queue_max`, `dispatcher_shards`). Defaults: 1 ms window,
+/// 128 ops per batch, 1024-deep queue, 1 dispatcher (single-thread
+/// per handle, identical to pre-0.9.3 behaviour).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PipelineConfig {
     /// Maximum time the dispatcher waits for additional jobs after the
@@ -80,17 +81,31 @@ pub(crate) struct PipelineConfig {
     pub batch_size_max: usize,
     /// Bounded queue capacity. When the queue is full, callers
     /// submitting a batch *block* until space is available (decision #4
-    /// — bounded queue with blocking submission).
+    /// — bounded queue with blocking submission). Each shard has its
+    /// own queue of this capacity; with `dispatcher_shards = N` the
+    /// aggregate queue depth is `N × batch_queue_max`.
     pub batch_queue_max: usize,
+    /// 0.9.3: number of dispatcher threads per handle. Default `1`
+    /// preserves pre-0.9.3 behaviour exactly (single-threaded
+    /// dispatch, one queue, one thread). Values `> 1` spawn N
+    /// dispatcher threads each with their own bounded queue; batches
+    /// are routed to a shard via hash of the first op's path so all
+    /// ops in one batch land on the same dispatcher (preserving the
+    /// strict within-batch submission-order contract). Cross-batch
+    /// ordering across shards is **not** guaranteed — but that was
+    /// already the case for cross-batch ordering generally.
+    /// Clamped to `1..=64`.
+    pub dispatcher_shards: usize,
 }
 
 impl PipelineConfig {
     /// Default configuration. 1 ms window, 128 ops per batch, 1024-deep
-    /// queue.
+    /// queue per shard, 1 shard (single dispatcher).
     pub const DEFAULT: PipelineConfig = PipelineConfig {
         batch_window_ms: 1,
         batch_size_max: 128,
         batch_queue_max: 1024,
+        dispatcher_shards: 1,
     };
 }
 
@@ -100,19 +115,27 @@ impl Default for PipelineConfig {
     }
 }
 
-/// Per-handle pipeline owning the lazy dispatcher.
+/// Per-handle pipeline owning the lazy dispatcher(s).
 ///
-/// `Pipeline` is `Send + Sync`. The dispatcher thread, when spawned,
-/// runs independently of the calling thread; communication is via
+/// `Pipeline` is `Send + Sync`. Dispatcher threads, when spawned, run
+/// independently of the calling thread; communication is via
 /// [`crossbeam_channel`]. On drop, the pipeline runs the shutdown
-/// protocol: send the shutdown signal, drop the work-queue sender so
-/// the dispatcher sees `Disconnected` after draining, then wait on
-/// `done_rx.recv_timeout(5s)` and join the thread.
+/// protocol on every shard: signal shutdown, drop the work-queue
+/// sender so each dispatcher sees `Disconnected` after draining, then
+/// wait on each `done_rx.recv_timeout(5s)` and join its thread.
+///
+/// 0.9.3: holds a `Vec<DispatcherInner>` (one entry per shard). The
+/// default `PipelineConfig::DEFAULT` sets `dispatcher_shards = 1`, so
+/// the vector is one-element-long and behaviour is identical to
+/// pre-0.9.3. Higher shard counts spawn N independent dispatchers
+/// hashed by the first op's path; ops within one batch always land
+/// on the same shard.
 pub(crate) struct Pipeline {
     config: PipelineConfig,
-    /// `None` until the first batch submit, then `Some(...)` for the
+    /// `None` until the first batch submit, then
+    /// `Some(Vec<DispatcherInner>)` (one entry per shard) for the
     /// rest of this `Pipeline`'s lifetime (or until `Drop` runs).
-    inner: Mutex<Option<DispatcherInner>>,
+    inner: Mutex<Option<Vec<DispatcherInner>>>,
 }
 
 /// Channels and join handle owned by the pipeline once the dispatcher
@@ -169,8 +192,10 @@ impl Pipeline {
         &self,
         ops: Vec<BatchOp>,
         snapshot: HandleSnapshot,
+        grouped: bool,
     ) -> std::result::Result<(), BatchError> {
-        let job_tx = match self.dispatcher_sender() {
+        let shard = pick_shard(&ops, self.config.dispatcher_shards);
+        let job_tx = match self.dispatcher_sender(shard) {
             Some(tx) => tx,
             None => return Err(shutdown_err()),
         };
@@ -180,6 +205,7 @@ impl Pipeline {
             ops,
             snapshot,
             response: crate::pipeline::group::BatchResponse::Sync(response_tx),
+            grouped,
         };
 
         // Bounded send: blocks when the queue is full; returns Err iff
@@ -216,8 +242,10 @@ impl Pipeline {
         &self,
         ops: Vec<BatchOp>,
         snapshot: HandleSnapshot,
+        grouped: bool,
     ) -> std::result::Result<(), BatchError> {
-        let job_tx = match self.dispatcher_sender() {
+        let shard = pick_shard(&ops, self.config.dispatcher_shards);
+        let job_tx = match self.dispatcher_sender(shard) {
             Some(tx) => tx,
             None => return Err(shutdown_err()),
         };
@@ -227,6 +255,7 @@ impl Pipeline {
             ops,
             snapshot,
             response: crate::pipeline::group::BatchResponse::Async(response_tx),
+            grouped,
         };
 
         // Try-send retry loop: yields to the runtime when the
@@ -254,13 +283,17 @@ impl Pipeline {
         }
     }
 
-    /// Returns a clone of the dispatcher's job sender, spawning the
-    /// dispatcher thread if it has not been spawned yet.
+    /// Returns a clone of the requested shard's job sender, spawning
+    /// the dispatcher fleet if it has not been spawned yet.
+    ///
+    /// 0.9.3: all N shards are spawned together on the first batch
+    /// submit. `shard` is the destination shard index (`< N`) chosen
+    /// by [`pick_shard`].
     ///
     /// Returns `None` only when [`Pipeline::drop`] has already
     /// taken the inner — at that point the pipeline is shutting down
     /// and any pending submit must fail with `ShutdownInProgress`.
-    fn dispatcher_sender(&self) -> Option<Sender<BatchJob>> {
+    fn dispatcher_sender(&self, shard: usize) -> Option<Sender<BatchJob>> {
         // Tolerate poisoned mutex by recovering the inner — the lock is
         // never held across user code or potentially-panicking sections,
         // so poisoning here means the *prior* OS-level thread death
@@ -270,10 +303,36 @@ impl Pipeline {
             Err(p) => p.into_inner(),
         };
         if guard.is_none() {
-            *guard = Some(spawn_dispatcher(self.config));
+            *guard = Some(spawn_dispatcher_fleet(self.config));
         }
-        guard.as_ref().map(|i| i.job_tx.clone())
+        guard
+            .as_ref()
+            .and_then(|fleet| fleet.get(shard).map(|d| d.job_tx.clone()))
     }
+}
+
+/// 0.9.3: picks the destination shard for a batch.
+///
+/// Hashes the first op's primary path so all ops in a batch land on
+/// the same shard — preserves the within-batch submission-order
+/// contract (one dispatcher per shard executes its work serially).
+/// Empty batches map to shard `0`. With `n_shards = 1` returns `0`
+/// unconditionally without hashing.
+fn pick_shard(ops: &[BatchOp], n_shards: usize) -> usize {
+    if n_shards <= 1 {
+        return 0;
+    }
+    let Some(first) = ops.first() else { return 0 };
+    let path: &std::path::Path = match first {
+        BatchOp::Write { path, .. } => path,
+        BatchOp::Delete { path } => path,
+        BatchOp::Copy { src, .. } => src,
+    };
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    path.hash(&mut h);
+    (h.finish() % n_shards as u64) as usize
 }
 
 /// Constructs an [`Error::ShutdownInProgress`] wrapped in a
@@ -286,33 +345,47 @@ fn shutdown_err() -> BatchError {
     }
 }
 
-/// Spawns the dispatcher thread and returns the channel handles owned
-/// by the pipeline.
+/// 0.9.3: spawns the entire dispatcher fleet (N threads) and returns
+/// one `DispatcherInner` per shard. Each shard has its own bounded
+/// MPMC queue, its own shutdown channel, and its own thread.
 ///
 /// If the OS refuses to spawn a thread (rare — out of memory or hit
-/// thread limit), the move-closure containing the receivers is dropped,
-/// and any subsequent `submit` will see `Disconnected` and return
-/// `ShutdownInProgress`. This is the same observable behaviour as a
-/// dispatcher that has cleanly exited; the rest of the pipeline degrades
-/// without panicking.
-fn spawn_dispatcher(config: PipelineConfig) -> DispatcherInner {
-    let (job_tx, job_rx) = bounded::<BatchJob>(config.batch_queue_max);
-    let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
-    let (done_tx, done_rx) = bounded::<()>(1);
+/// thread limit), the move-closure containing that shard's receivers
+/// is dropped, and any subsequent `submit` to that shard will see
+/// `Disconnected` and return `ShutdownInProgress`. Other shards
+/// remain operable. The rest of the pipeline degrades without
+/// panicking — same observable contract as pre-0.9.3.
+fn spawn_dispatcher_fleet(config: PipelineConfig) -> Vec<DispatcherInner> {
+    let n = config.dispatcher_shards.max(1);
+    let mut fleet = Vec::with_capacity(n);
+    for shard_idx in 0..n {
+        let (job_tx, job_rx) = bounded::<BatchJob>(config.batch_queue_max);
+        let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
+        let (done_tx, done_rx) = bounded::<()>(1);
 
-    let thread = thread::Builder::new()
-        .name("fsys-dispatcher".into())
-        .spawn(move || {
-            group::run_dispatcher(config, job_rx, shutdown_rx, done_tx);
-        })
-        .ok();
+        // Distinct thread name per shard for diagnostics; the single-
+        // shard default keeps the original `fsys-dispatcher` name so
+        // observability tooling that pinned to it doesn't break.
+        let name = if n == 1 {
+            "fsys-dispatcher".to_string()
+        } else {
+            format!("fsys-dispatcher-{shard_idx}")
+        };
+        let thread = thread::Builder::new()
+            .name(name)
+            .spawn(move || {
+                group::run_dispatcher(config, job_rx, shutdown_rx, done_tx);
+            })
+            .ok();
 
-    DispatcherInner {
-        job_tx,
-        shutdown_tx,
-        done_rx,
-        thread,
+        fleet.push(DispatcherInner {
+            job_tx,
+            shutdown_tx,
+            done_rx,
+            thread,
+        });
     }
+    fleet
 }
 
 impl Drop for Pipeline {
@@ -322,32 +395,48 @@ impl Drop for Pipeline {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let Some(mut inner) = guard.take() else {
+        let Some(fleet) = guard.take() else {
             return;
         };
-        // Drop the guard first so the dispatcher (if it's stalled trying
-        // to acquire something — it shouldn't be, but defensive) is not
-        // blocked by us.
+        // Drop the guard first so dispatchers (if stalled trying to
+        // acquire something — defensive) are not blocked by us.
         drop(guard);
 
-        // Step 1: signal shutdown.
-        let _ = inner.shutdown_tx.send(());
-        // Step 2: drop the producer side so the dispatcher's `select!`
-        // sees `Disconnected` after it has drained.
-        drop(inner.job_tx);
-        drop(inner.shutdown_tx);
+        // Step 1: signal shutdown to every shard in parallel.
+        for shard in &fleet {
+            let _ = shard.shutdown_tx.send(());
+        }
 
-        // Step 3: wait for the dispatcher's final ack with a 5s hard
-        // timeout, then join. If the timeout elapses, forget the
-        // JoinHandle so `Drop` does not block forever — this path is
-        // defensive and never expected to trigger; documented diagnostic
-        // gap arrives with `tracing` integration in 0.7.0.
-        let dispatcher_acked = inner.done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
-        if let Some(thread) = inner.thread.take() {
-            if dispatcher_acked {
-                let _ = thread.join();
-            } else {
-                std::mem::forget(thread);
+        // Step 2: drop every shard's producer side so each
+        // dispatcher's `select!` sees `Disconnected` after draining.
+        // We move-out the channels we still need (done_rx, thread)
+        // while letting job_tx and shutdown_tx drop here.
+        let mut done_handles: Vec<(Receiver<()>, Option<JoinHandle<()>>)> =
+            Vec::with_capacity(fleet.len());
+        for shard in fleet {
+            let DispatcherInner {
+                job_tx,
+                shutdown_tx,
+                done_rx,
+                thread,
+            } = shard;
+            drop(job_tx);
+            drop(shutdown_tx);
+            done_handles.push((done_rx, thread));
+        }
+
+        // Step 3: wait for each shard's final ack with a 5s hard
+        // timeout, then join. If a timeout elapses for any shard,
+        // forget that thread's JoinHandle so `Drop` does not block
+        // forever; remaining shards still get joined cleanly.
+        for (done_rx, thread_slot) in done_handles {
+            let dispatcher_acked = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            if let Some(thread) = thread_slot {
+                if dispatcher_acked {
+                    let _ = thread.join();
+                } else {
+                    std::mem::forget(thread);
+                }
             }
         }
     }
@@ -398,6 +487,200 @@ mod tests {
         assert_eq!(c.batch_window_ms, 1);
         assert_eq!(c.batch_size_max, 128);
         assert_eq!(c.batch_queue_max, 1024);
+        // 0.9.3: default shard count = 1 (single-dispatcher).
+        assert_eq!(c.dispatcher_shards, 1);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 0.9.3 — Sharded dispatcher coverage
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pick_shard_returns_zero_when_unsharded() {
+        // dispatcher_shards = 1 → always shard 0 (no hashing).
+        assert_eq!(pick_shard(&[], 1), 0);
+        let ops = vec![BatchOp::Write {
+            path: PathBuf::from("/x"),
+            data: vec![],
+        }];
+        assert_eq!(pick_shard(&ops, 1), 0);
+    }
+
+    #[test]
+    fn test_pick_shard_empty_batch_maps_to_zero() {
+        // Empty batches always go to shard 0 regardless of N.
+        assert_eq!(pick_shard(&[], 8), 0);
+    }
+
+    #[test]
+    fn test_pick_shard_is_deterministic_per_path() {
+        // The same path must always hash to the same shard.
+        let ops = vec![BatchOp::Write {
+            path: PathBuf::from("/data/segment.00001"),
+            data: vec![],
+        }];
+        let a = pick_shard(&ops, 16);
+        let b = pick_shard(&ops, 16);
+        assert_eq!(a, b);
+        assert!(a < 16);
+    }
+
+    #[test]
+    fn test_pick_shard_uses_first_op_path() {
+        // Two batches with different first-op paths land on
+        // (possibly) different shards. We can't assert they
+        // differ — hash collisions exist — but we can confirm
+        // the function reads the first op's path.
+        let a = vec![BatchOp::Write {
+            path: PathBuf::from("/data/a"),
+            data: vec![],
+        }];
+        let b = vec![BatchOp::Delete {
+            path: PathBuf::from("/data/a"),
+        }];
+        // Same path string → same shard regardless of op variant.
+        assert_eq!(pick_shard(&a, 8), pick_shard(&b, 8));
+    }
+
+    #[test]
+    fn test_pick_shard_copy_uses_src_path() {
+        let copy = vec![BatchOp::Copy {
+            src: PathBuf::from("/data/src"),
+            dst: PathBuf::from("/elsewhere/dst"),
+        }];
+        let write = vec![BatchOp::Write {
+            path: PathBuf::from("/data/src"),
+            data: vec![],
+        }];
+        assert_eq!(pick_shard(&copy, 8), pick_shard(&write, 8));
+    }
+
+    #[test]
+    fn test_pipeline_spawns_n_dispatchers_when_sharded() {
+        // dispatcher_shards = 4 → first submit must spawn 4
+        // independent dispatchers.
+        let p = Pipeline::new(PipelineConfig {
+            dispatcher_shards: 4,
+            ..PipelineConfig::DEFAULT
+        });
+        p.submit(Vec::new(), snapshot_default(), false)
+            .expect("submit");
+        let guard = p.inner.lock().unwrap();
+        let fleet = guard.as_ref().expect("fleet must exist");
+        assert_eq!(fleet.len(), 4);
+        // Every shard must have a live thread handle.
+        for shard in fleet.iter() {
+            assert!(shard.thread.is_some());
+        }
+    }
+
+    #[test]
+    fn test_multi_shard_executes_writes_across_paths() {
+        // End-to-end: 4 shards, 16 writes to distinct paths. Every
+        // write must land on disk regardless of which shard handled
+        // it.
+        let p = Pipeline::new(PipelineConfig {
+            dispatcher_shards: 4,
+            ..PipelineConfig::DEFAULT
+        });
+        let mut paths = Vec::new();
+        for i in 0..16 {
+            let path = tmp_path(&format!("multi_shard_{i:02}"));
+            paths.push(path.clone());
+            p.submit(
+                vec![BatchOp::Write {
+                    path,
+                    data: format!("payload-{i:02}").into_bytes(),
+                }],
+                snapshot_default(),
+                false,
+            )
+            .expect("submit");
+        }
+        for (i, path) in paths.iter().enumerate() {
+            let bytes = std::fs::read(path).expect("read");
+            assert_eq!(bytes, format!("payload-{i:02}").into_bytes());
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn test_multi_shard_concurrent_submitters() {
+        // 8 threads each submit 16 batches concurrently against a
+        // 4-shard pipeline. All ops must complete; no deadlock; no
+        // shard left behind.
+        use std::sync::Arc;
+        let p = Arc::new(Pipeline::new(PipelineConfig {
+            dispatcher_shards: 4,
+            ..PipelineConfig::DEFAULT
+        }));
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for t in 0..8u32 {
+            let p = p.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut written = Vec::new();
+                for i in 0..16u32 {
+                    let path = tmp_path(&format!("concurrent_t{t:02}_i{i:02}"));
+                    p.submit(
+                        vec![BatchOp::Write {
+                            path: path.clone(),
+                            data: format!("t{t}-i{i}").into_bytes(),
+                        }],
+                        snapshot_default(),
+                        false,
+                    )
+                    .expect("submit");
+                    written.push(path);
+                }
+                written
+            }));
+        }
+        let mut all_paths = Vec::new();
+        for h in handles {
+            all_paths.extend(h.join().expect("join"));
+        }
+        assert_eq!(all_paths.len(), 128);
+        for p in &all_paths {
+            assert!(std::fs::metadata(p).is_ok(), "missing: {}", p.display());
+            let _ = std::fs::remove_file(p);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "multi-shard concurrent test exceeded 30s: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_multi_shard_clean_shutdown_drains_all_shards() {
+        // 4 shards, submit batches across multiple paths, then
+        // drop the pipeline. Drop must signal shutdown and join
+        // every shard's thread within the 5s budget.
+        let p = Pipeline::new(PipelineConfig {
+            dispatcher_shards: 4,
+            ..PipelineConfig::DEFAULT
+        });
+        for i in 0..16 {
+            let path = tmp_path(&format!("drop_shard_{i:02}"));
+            p.submit(
+                vec![BatchOp::Write {
+                    path: path.clone(),
+                    data: vec![],
+                }],
+                snapshot_default(),
+                false,
+            )
+            .expect("submit");
+            let _ = std::fs::remove_file(&path);
+        }
+        let start = Instant::now();
+        drop(p);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drop must complete within 5s; took {elapsed:?}"
+        );
     }
 
     #[test]
@@ -412,7 +695,7 @@ mod tests {
     fn test_pipeline_submit_spawns_dispatcher_on_first_call() {
         let p = Pipeline::new(PipelineConfig::DEFAULT);
         // Empty batch is a degenerate case but should still round-trip.
-        let r = p.submit(Vec::new(), snapshot_default());
+        let r = p.submit(Vec::new(), snapshot_default(), false);
         assert!(r.is_ok(), "empty batch should succeed: {:?}", r);
         let guard = p.inner.lock().unwrap();
         assert!(guard.is_some(), "dispatcher must exist after first submit");
@@ -427,7 +710,7 @@ mod tests {
             path: path.clone(),
             data: b"hello-pipeline".to_vec(),
         }];
-        p.submit(ops, snapshot_default()).expect("submit");
+        p.submit(ops, snapshot_default(), false).expect("submit");
         let actual = std::fs::read(&path).expect("read");
         assert_eq!(actual, b"hello-pipeline");
     }
@@ -451,7 +734,7 @@ mod tests {
                 data: b"third".to_vec(),
             },
         ];
-        p.submit(ops, snapshot_default()).expect("submit");
+        p.submit(ops, snapshot_default(), false).expect("submit");
         // Strict input order → last write wins.
         assert_eq!(std::fs::read(&path).unwrap(), b"third");
     }
@@ -462,7 +745,7 @@ mod tests {
         let path = tmp_path("delete");
         std::fs::write(&path, b"to-be-deleted").unwrap();
         let ops = vec![BatchOp::Delete { path: path.clone() }];
-        p.submit(ops, snapshot_default()).expect("submit");
+        p.submit(ops, snapshot_default(), false).expect("submit");
         assert!(!path.exists(), "file should be gone");
     }
 
@@ -478,7 +761,7 @@ mod tests {
             src: src.clone(),
             dst: dst.clone(),
         }];
-        p.submit(ops, snapshot_default()).expect("submit");
+        p.submit(ops, snapshot_default(), false).expect("submit");
         assert_eq!(std::fs::read(&dst).unwrap(), b"copy-me");
     }
 
@@ -505,7 +788,7 @@ mod tests {
                 data: b"never".to_vec(),
             },
         ];
-        let result = p.submit(ops, snapshot_default());
+        let result = p.submit(ops, snapshot_default(), false);
         let err = result.expect_err("expected failure on op 1");
         assert_eq!(err.failed_at, 1, "failed_at index");
         assert_eq!(err.completed, 1, "completed count");
@@ -519,7 +802,7 @@ mod tests {
         {
             let p = Pipeline::new(PipelineConfig::DEFAULT);
             // Spawn the dispatcher.
-            p.submit(Vec::new(), snapshot_default()).unwrap();
+            p.submit(Vec::new(), snapshot_default(), false).unwrap();
         } // drop runs here
         let elapsed = start.elapsed();
         assert!(
@@ -547,7 +830,7 @@ mod tests {
                         path,
                         data: format!("t{}w{}", t, w).into_bytes(),
                     }];
-                    p.submit(ops, snapshot_default()).unwrap();
+                    p.submit(ops, snapshot_default(), false).unwrap();
                 }
             }));
         }

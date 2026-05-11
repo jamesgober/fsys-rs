@@ -138,6 +138,13 @@ pub(crate) struct BatchJob {
     pub snapshot: HandleSnapshot,
     /// Response channel. Sync or async per [`BatchResponse`].
     pub response: BatchResponse,
+    /// 0.9.3: when `true`, the dispatcher skips per-op
+    /// `sync_parent_dir` calls and issues exactly one
+    /// `sync_parent_dir` per unique parent directory after all
+    /// ops in this job complete successfully. Backs
+    /// [`crate::Batch::commit_grouped`]. Default `false`
+    /// preserves the per-op parent-dir sync of pre-0.9.3.
+    pub grouped: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -296,21 +303,56 @@ fn process_jobs(jobs: Vec<BatchJob>) {
 /// #5). The dispatcher thread itself never unwinds.
 fn process_jobs_with<F>(jobs: Vec<BatchJob>, executor: F)
 where
-    F: Fn(BatchOp, &HandleSnapshot) -> Result<()>,
+    F: Fn(BatchOp, &HandleSnapshot, bool) -> Result<()>,
 {
+    use std::collections::BTreeMap;
+
     for job in jobs {
         let response = job.response;
         let snapshot = job.snapshot;
         let ops = job.ops;
+        let grouped = job.grouped;
         let mut completed: usize = 0;
         let mut failure: Option<(usize, Error)> = None;
+        // 0.9.3: accumulate one representative file path per
+        // unique parent directory in grouped mode. After all
+        // ops succeed, we issue one `sync_parent_dir` per
+        // unique parent rather than the N-per-op cost the
+        // regular path incurs. The map's key is the parent
+        // directory; the value is some file path inside it that
+        // `sync_parent_dir` (which takes a file path and
+        // internally `.parent()`s it) can consume directly.
+        // Only populated when `grouped == true`.
+        let mut grouped_parents: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
 
         for (idx, op) in ops.into_iter().enumerate() {
+            // For the grouped path we need to remember each
+            // op's parent dir BEFORE handing the op to the
+            // executor (which consumes the op by move).
+            let parent_repr: Option<(PathBuf, PathBuf)> = if grouped {
+                match &op {
+                    BatchOp::Write { path, .. } => {
+                        path.parent().map(|p| (PathBuf::from(p), path.clone()))
+                    }
+                    BatchOp::Copy { dst, .. } => {
+                        dst.parent().map(|p| (PathBuf::from(p), dst.clone()))
+                    }
+                    BatchOp::Delete { .. } => None,
+                }
+            } else {
+                None
+            };
             // Per-op catch_unwind. A panicking op fails its own batch
             // but does NOT take down the dispatcher.
-            let res = std::panic::catch_unwind(AssertUnwindSafe(|| executor(op, &snapshot)));
+            let res =
+                std::panic::catch_unwind(AssertUnwindSafe(|| executor(op, &snapshot, grouped)));
             match res {
-                Ok(Ok(())) => completed += 1,
+                Ok(Ok(())) => {
+                    completed += 1;
+                    if let Some((parent, repr_file)) = parent_repr {
+                        let _ = grouped_parents.entry(parent).or_insert(repr_file);
+                    }
+                }
                 Ok(Err(e)) => {
                     failure = Some((idx, e));
                     break;
@@ -319,6 +361,21 @@ where
                     failure = Some((idx, Error::Io(std::io::Error::other("batch op panicked"))));
                     break;
                 }
+            }
+        }
+
+        // 0.9.3 grouped commit: if every op succeeded, issue
+        // exactly one `sync_parent_dir` per unique parent
+        // directory. This collapses the N-per-op cost of the
+        // regular path into one-per-unique-dir, which for the
+        // typical "all ops in the batch live under the same
+        // directory" workload is just one syscall total.
+        // Best-effort, matching pre-0.9.3 semantics where
+        // `sync_parent_dir` errors were swallowed by
+        // `execute_write`.
+        if grouped && failure.is_none() {
+            for repr in grouped_parents.values() {
+                let _ = platform::sync_parent_dir(repr);
             }
         }
 
@@ -341,11 +398,11 @@ where
 // Op execution — leaner extraction of crud::file::write semantics.
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn execute_op(op: BatchOp, snapshot: &HandleSnapshot) -> Result<()> {
+fn execute_op(op: BatchOp, snapshot: &HandleSnapshot, grouped: bool) -> Result<()> {
     match op {
-        BatchOp::Write { path, data } => execute_write(&path, &data, snapshot),
+        BatchOp::Write { path, data } => execute_write(&path, &data, snapshot, grouped),
         BatchOp::Delete { path } => execute_delete(&path),
-        BatchOp::Copy { src, dst } => execute_copy(&src, &dst, snapshot),
+        BatchOp::Copy { src, dst } => execute_copy(&src, &dst, snapshot, grouped),
     }
 }
 
@@ -353,7 +410,7 @@ fn execute_op(op: BatchOp, snapshot: &HandleSnapshot) -> Result<()> {
 /// minus the `update_active_method` callback. See decisions D-1 and
 /// D-4(c) in `.dev/DECISIONS-0.4.0.md` for why this duplication exists
 /// and where it folds back together in `0.5.0`.
-fn execute_write(path: &Path, data: &[u8], snapshot: &HandleSnapshot) -> Result<()> {
+fn execute_write(path: &Path, data: &[u8], snapshot: &HandleSnapshot, grouped: bool) -> Result<()> {
     let temp = Handle::gen_temp_path(path);
 
     // Step 1: open the temp file (Direct IO if requested).
@@ -420,7 +477,14 @@ fn execute_write(path: &Path, data: &[u8], snapshot: &HandleSnapshot) -> Result<
     }
 
     // Step 6: best-effort parent-dir sync (no-op on Windows).
-    let _ = platform::sync_parent_dir(path);
+    // 0.9.3: in grouped mode, the dispatcher amortises this
+    // call across the whole batch — it accumulates unique
+    // parent directories and issues one `sync_parent_dir` per
+    // unique parent after the entire batch succeeds, instead
+    // of paying per-op.
+    if !grouped {
+        let _ = platform::sync_parent_dir(path);
+    }
 
     Ok(())
 }
@@ -435,13 +499,13 @@ fn execute_delete(path: &Path) -> Result<()> {
 }
 
 /// Read-then-write copy. Atomic at the destination via [`execute_write`].
-fn execute_copy(src: &Path, dst: &Path, snapshot: &HandleSnapshot) -> Result<()> {
+fn execute_copy(src: &Path, dst: &Path, snapshot: &HandleSnapshot, grouped: bool) -> Result<()> {
     // Read source via std::fs::read for simplicity. The platform-optimised
     // `copy_file` primitive (copy_file_range / clonefile) is a nice-to-have
     // but does not give atomic-at-destination semantics. The group lane
     // chooses the atomic-replace path for consistency with `Handle::write`.
     let data = std::fs::read(src).map_err(Error::Io)?;
-    execute_write(dst, &data, snapshot)
+    execute_write(dst, &data, snapshot, grouped)
 }
 
 /// Selects the flush primitive based on method. Mirrors the
@@ -514,7 +578,7 @@ mod tests {
     fn test_execute_write_creates_file_with_payload() {
         let path = tmp_path("write_creates");
         let _g = TmpFile(path.clone());
-        execute_write(&path, b"payload", &snapshot()).expect("write");
+        execute_write(&path, b"payload", &snapshot(), false).expect("write");
         assert_eq!(std::fs::read(&path).unwrap(), b"payload");
     }
 
@@ -523,7 +587,7 @@ mod tests {
         let path = tmp_path("write_replaces");
         let _g = TmpFile(path.clone());
         std::fs::write(&path, b"old").unwrap();
-        execute_write(&path, b"new", &snapshot()).expect("replace");
+        execute_write(&path, b"new", &snapshot(), false).expect("replace");
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
@@ -531,7 +595,7 @@ mod tests {
     fn test_execute_write_empty_payload_is_valid() {
         let path = tmp_path("empty_write");
         let _g = TmpFile(path.clone());
-        execute_write(&path, b"", &snapshot()).expect("empty");
+        execute_write(&path, b"", &snapshot(), false).expect("empty");
         assert_eq!(std::fs::read(&path).unwrap(), b"");
     }
 
@@ -557,7 +621,7 @@ mod tests {
         let _g1 = TmpFile(src.clone());
         let _g2 = TmpFile(dst.clone());
         std::fs::write(&src, b"copy-payload").unwrap();
-        execute_copy(&src, &dst, &snapshot()).expect("copy");
+        execute_copy(&src, &dst, &snapshot(), false).expect("copy");
         assert_eq!(std::fs::read(&dst).unwrap(), b"copy-payload");
     }
 
@@ -571,11 +635,12 @@ mod tests {
                 data: b"w".to_vec(),
             },
             &snapshot(),
+            false,
         )
         .expect("write op");
         assert_eq!(std::fs::read(&p1).unwrap(), b"w");
 
-        execute_op(BatchOp::Delete { path: p1.clone() }, &snapshot()).expect("delete op");
+        execute_op(BatchOp::Delete { path: p1.clone() }, &snapshot(), false).expect("delete op");
         assert!(!p1.exists());
 
         let src = tmp_path("op_copy_src");
@@ -589,6 +654,7 @@ mod tests {
                 dst: dst.clone(),
             },
             &snapshot(),
+            false,
         )
         .expect("copy op");
         assert_eq!(std::fs::read(&dst).unwrap(), b"c");
@@ -600,7 +666,7 @@ mod tests {
         // directory must fail.
         let dir = tmp_path("write_to_dir");
         std::fs::create_dir_all(&dir).unwrap();
-        let result = execute_write(&dir, b"x", &snapshot());
+        let result = execute_write(&dir, b"x", &snapshot(), false);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -674,6 +740,7 @@ mod tests {
             ops,
             snapshot: snapshot(),
             response: BatchResponse::Sync(tx),
+            grouped: false,
         };
         (job, rx)
     }
@@ -694,7 +761,7 @@ mod tests {
                 data: vec![3],
             },
         ]);
-        let executor = |op: BatchOp, _snap: &HandleSnapshot| -> Result<()> {
+        let executor = |op: BatchOp, _snap: &HandleSnapshot, _grouped: bool| -> Result<()> {
             if let BatchOp::Write { path, .. } = &op {
                 if path.to_string_lossy().contains("__panic__") {
                     panic!("test-induced panic for catch_unwind verification");
@@ -733,7 +800,7 @@ mod tests {
             data: vec![],
         }]);
 
-        let executor = |op: BatchOp, _snap: &HandleSnapshot| -> Result<()> {
+        let executor = |op: BatchOp, _snap: &HandleSnapshot, _grouped: bool| -> Result<()> {
             if let BatchOp::Write { path, .. } = &op {
                 if path.to_string_lossy().contains("__panic__") {
                     panic!("test-induced panic");
@@ -767,7 +834,8 @@ mod tests {
                 data: vec![],
             },
         ]);
-        let executor = |_op: BatchOp, _snap: &HandleSnapshot| -> Result<()> { Ok(()) };
+        let executor =
+            |_op: BatchOp, _snap: &HandleSnapshot, _grouped: bool| -> Result<()> { Ok(()) };
         process_jobs_with(vec![job], executor);
         let result = rx.recv().expect("response");
         assert!(result.is_ok());

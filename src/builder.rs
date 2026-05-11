@@ -224,6 +224,47 @@ impl Builder {
         self
     }
 
+    /// 0.9.3 — Sets the number of group-lane dispatcher threads per
+    /// handle.
+    ///
+    /// Default `1` preserves pre-0.9.3 behaviour exactly: a single
+    /// dispatcher thread per handle, one bounded MPMC queue, every
+    /// batch processed serially in submission order. Values `> 1`
+    /// spawn N dispatcher threads on the first batch submit; each
+    /// has its own bounded queue, and batches are routed to a shard
+    /// via hash of the first op's primary path. All ops inside one
+    /// `Batch::commit()` land on the same shard so the within-batch
+    /// submission-order contract is preserved.
+    ///
+    /// **When to raise it.** On multi-core hosts where a single
+    /// handle is the throughput bottleneck for *parallel* batch
+    /// submitters writing to *different files* (e.g. a database
+    /// flushing many SST tables concurrently). On these workloads
+    /// the pre-0.9.3 single dispatcher was a hard one-core ceiling;
+    /// `dispatcher_shards = num_cpus::get()` lifts it.
+    ///
+    /// **When to leave it at 1.** Single-writer workloads,
+    /// latency-sensitive workloads (each shard has its own time
+    /// window, so cross-shard ordering across batches is not
+    /// guaranteed — but it was never guaranteed at the
+    /// pipeline-level anyway), and any workload where batches
+    /// rarely touch distinct paths (sharding by hash collapses to
+    /// one shard when all batches target the same path).
+    ///
+    /// Clamped to `1..=64`. The high cap reflects that >64
+    /// dispatcher threads per handle is pathological;
+    /// `num_cpus::get()` is the natural ceiling for any realistic
+    /// host.
+    ///
+    /// Aggregate queue depth scales with shard count: with
+    /// `batch_queue_max(1024)` and `dispatcher_shards(8)`, the
+    /// pipeline can hold 8 × 1024 = 8 K batches in flight.
+    #[must_use]
+    pub fn dispatcher_shards(mut self, shards: usize) -> Self {
+        self.pipeline_config.dispatcher_shards = shards.clamp(1, 64);
+        self
+    }
+
     /// 0.9.2 — applies a coordinated workload preset.
     ///
     /// Pre-sets the buffer-pool capacity, buffer-pool block size,

@@ -140,39 +140,95 @@ impl<'a> Batch<'a> {
     /// See [`Handle::write_batch`] for the full error contract.
     pub fn commit(self) -> std::result::Result<(), BatchError> {
         let Self { handle, ops } = self;
-
-        // Path resolution — one pass, fail-fast on the first invalid
-        // path. Allocates one new Vec to receive resolved BatchOps; the
-        // input ops are consumed (we already own them).
-        let mut resolved: Vec<BatchOp> = Vec::with_capacity(ops.len());
-        for (i, op) in ops.into_iter().enumerate() {
-            match op {
-                BatchOp::Write { path, data } => {
-                    let p = handle
-                        .resolve_path(&path)
-                        .map_err(|e| pre_submit_err(i, e))?;
-                    resolved.push(BatchOp::Write { path: p, data });
-                }
-                BatchOp::Delete { path } => {
-                    let p = handle
-                        .resolve_path(&path)
-                        .map_err(|e| pre_submit_err(i, e))?;
-                    resolved.push(BatchOp::Delete { path: p });
-                }
-                BatchOp::Copy { src, dst } => {
-                    let s = handle
-                        .resolve_path(&src)
-                        .map_err(|e| pre_submit_err(i, e))?;
-                    let d = handle
-                        .resolve_path(&dst)
-                        .map_err(|e| pre_submit_err(i, e))?;
-                    resolved.push(BatchOp::Copy { src: s, dst: d });
-                }
-            }
-        }
-
+        let resolved = resolve_ops(handle, ops)?;
         handle.submit_batch(resolved)
     }
+
+    /// 0.9.3 — **Grouped commit.** Same as [`Self::commit`] except
+    /// the dispatcher amortises parent-directory `fsync` calls
+    /// across the entire batch instead of paying one per op.
+    ///
+    /// **The mechanic.** Each op still does its own data
+    /// `fdatasync` (the temp file's content is durable before the
+    /// rename — that's required for atomic-replace correctness).
+    /// What changes is the **post-rename** `sync_parent_dir` step:
+    /// the regular path calls it once per op, the grouped path
+    /// accumulates unique parent directories and calls it once per
+    /// unique parent after the entire batch succeeds.
+    ///
+    /// **The numbers.** A typical "flush 1024 SST files into one
+    /// directory" batch pays 1024 `sync_parent_dir` syscalls under
+    /// [`Self::commit`] and exactly **one** under
+    /// [`Self::commit_grouped`]. On Linux/macOS each
+    /// `sync_parent_dir` is a real `fsync` on the directory file
+    /// descriptor (microseconds to milliseconds depending on
+    /// filesystem and dirty-page load). On Windows the call is a
+    /// no-op (directory durability is implicit), so this method
+    /// is observably equivalent to [`Self::commit`] on Windows.
+    ///
+    /// **The trade-off.** Under regular `commit`, every op is
+    /// individually durable on return (including its dirent
+    /// update). Under `commit_grouped`, ops are durable *as a
+    /// set* on return — a crash mid-batch may leave a prefix of
+    /// the renames visible while the dirent updates have not yet
+    /// landed on the journal. The per-op data is on disk
+    /// regardless (its data fsync still happened), so on the
+    /// next fsync/reboot the filesystem journal replays the
+    /// dirent updates. Callers that need per-op dirent
+    /// durability (rare — usually only when each op IS a
+    /// transaction commit) should use [`Self::commit`].
+    ///
+    /// **When to use it.** Bulk loads, SST flushes, database
+    /// checkpoint emissions — any workload where the batch is
+    /// the durability unit, not the individual op.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`Self::commit`].
+    pub fn commit_grouped(self) -> std::result::Result<(), BatchError> {
+        let Self { handle, ops } = self;
+        let resolved = resolve_ops(handle, ops)?;
+        handle.submit_batch_grouped(resolved)
+    }
+}
+
+/// Resolves every op's path(s) against the handle's root, returning
+/// a fresh vec of resolved [`BatchOp`]s ready for submission. On the
+/// first path-resolution failure, returns a [`BatchError`] with
+/// `failed_at` = the offending op's index, `completed = 0` — no op
+/// has been dispatched yet. Shared by [`Batch::commit`] and
+/// [`Batch::commit_grouped`].
+fn resolve_ops(
+    handle: &Handle,
+    ops: Vec<BatchOp>,
+) -> std::result::Result<Vec<BatchOp>, BatchError> {
+    let mut resolved: Vec<BatchOp> = Vec::with_capacity(ops.len());
+    for (i, op) in ops.into_iter().enumerate() {
+        match op {
+            BatchOp::Write { path, data } => {
+                let p = handle
+                    .resolve_path(&path)
+                    .map_err(|e| pre_submit_err(i, e))?;
+                resolved.push(BatchOp::Write { path: p, data });
+            }
+            BatchOp::Delete { path } => {
+                let p = handle
+                    .resolve_path(&path)
+                    .map_err(|e| pre_submit_err(i, e))?;
+                resolved.push(BatchOp::Delete { path: p });
+            }
+            BatchOp::Copy { src, dst } => {
+                let s = handle
+                    .resolve_path(&src)
+                    .map_err(|e| pre_submit_err(i, e))?;
+                let d = handle
+                    .resolve_path(&dst)
+                    .map_err(|e| pre_submit_err(i, e))?;
+                resolved.push(BatchOp::Copy { src: s, dst: d });
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 fn pre_submit_err(index: usize, e: crate::Error) -> BatchError {
@@ -378,5 +434,125 @@ mod tests {
             crate::Error::InvalidPath { .. } => { /* expected */ }
             ref other => panic!("expected InvalidPath, got {:?}", other),
         }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 0.9.3 — Batch::commit_grouped() coverage
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_commit_grouped_executes_writes_in_order() {
+        let h = handle();
+        let p = tmp_path("grouped_order");
+        let _g = TmpFile(p.clone());
+        let mut b = h.batch();
+        let _ = b
+            .write(&p, b"first")
+            .write(&p, b"second")
+            .write(&p, b"third");
+        b.commit_grouped().expect("commit_grouped");
+        // Same strict-order contract as commit() — last write wins.
+        assert_eq!(std::fs::read(&p).unwrap(), b"third");
+    }
+
+    #[test]
+    fn test_commit_grouped_mixed_ops_into_one_directory() {
+        // Common shape: many writes to files under one parent
+        // directory. The grouped path should issue exactly one
+        // sync_parent_dir; we can't easily assert that on
+        // Windows (no-op), but we can verify all files land
+        // and the call succeeds.
+        let h = handle();
+        let a = tmp_path("grouped_a");
+        let bp = tmp_path("grouped_b");
+        let c = tmp_path("grouped_c");
+        let _ga = TmpFile(a.clone());
+        let _gb = TmpFile(bp.clone());
+        let _gc = TmpFile(c.clone());
+
+        let mut b = h.batch();
+        let _ = b
+            .write(&a, b"alpha")
+            .write(&bp, b"bravo")
+            .write(&c, b"charlie");
+        b.commit_grouped().expect("commit_grouped mixed");
+
+        assert_eq!(std::fs::read(&a).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(&bp).unwrap(), b"bravo");
+        assert_eq!(std::fs::read(&c).unwrap(), b"charlie");
+    }
+
+    #[test]
+    fn test_commit_grouped_empty_batch_succeeds() {
+        let h = handle();
+        let b = h.batch();
+        b.commit_grouped()
+            .expect("empty grouped batch should succeed");
+    }
+
+    #[test]
+    fn test_commit_grouped_reports_failure_index() {
+        // The grouped path preserves the same error contract as
+        // commit(): on the first failure, no further ops are
+        // attempted and the post-batch parent-dir sync is also
+        // skipped (we never reach a "successful" state).
+        let h = handle();
+        let good = tmp_path("grouped_good");
+        let bad_dir = tmp_path("grouped_bad_dir");
+        let _g1 = TmpFile(good.clone());
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        struct DirGuard(PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _g2 = DirGuard(bad_dir.clone());
+
+        let mut b = h.batch();
+        let _ = b
+            .write(&good, b"ok")
+            .write(&bad_dir, b"target-is-dir-must-fail")
+            .write(&good, b"never-reached");
+        let err = b.commit_grouped().expect_err("expected failure on op 1");
+        assert_eq!(err.failed_at, 1);
+        assert_eq!(err.completed, 1);
+        assert_eq!(std::fs::read(&good).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn test_commit_grouped_path_resolution_failure() {
+        // Path-escape rejection happens before any dispatch, so
+        // it returns the same pre-submit error shape as commit().
+        let root = std::env::temp_dir().join(format!(
+            "fsys_batch_grouped_root_{}_{}",
+            std::process::id(),
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct DirGuard(PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _rg = DirGuard(root.clone());
+
+        let h = Builder::new()
+            .root(&root)
+            .method(Method::Sync)
+            .build()
+            .expect("build with root");
+
+        let mut b = h.batch();
+        let _ = b
+            .write("ok-1", b"a")
+            .write("../../etc/passwd", b"escape")
+            .write("ok-2", b"b");
+        let err = b
+            .commit_grouped()
+            .expect_err("escape must be rejected in grouped mode too");
+        assert_eq!(err.failed_at, 1);
+        assert_eq!(err.completed, 0);
     }
 }
