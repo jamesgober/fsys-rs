@@ -323,6 +323,40 @@ pub(crate) fn sync_full(file: &std::fs::File) -> crate::Result<()> {
     imp::sync_full(file)
 }
 
+/// 0.9.4 — Sets the per-file NVMe write-lifetime hint
+/// (`F_SET_RW_HINT` on Linux).
+///
+/// `hint_ordinal` is the 0-based discriminant of
+/// [`crate::WriteLifetimeHint`]:
+/// `0 = Short`, `1 = Medium`, `2 = Long`, `3 = Extreme`.
+///
+/// **Platforms:**
+/// - **Linux**: applies the `F_SET_RW_HINT` fcntl. Failure
+///   (older kernels, drives without multi-stream, FS rejection)
+///   returns `Err` — the journal-open path swallows the error
+///   because the hint is advisory.
+/// - **macOS / Windows / unknown**: silent no-op. The hint
+///   primitive doesn't exist; returning `Ok(())` is the honest
+///   answer (we successfully did nothing).
+#[inline]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(unused_variables, clippy::needless_pass_by_value)
+)]
+pub(crate) fn set_write_lifetime_hint(
+    file: &std::fs::File,
+    hint_ordinal: u8,
+) -> crate::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        imp::fcntl_set_rw_hint(file, hint_ordinal)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+}
+
 /// 0.9.4 — Barrier-grade sync. Cheaper than [`sync_full`]
 /// where the platform supports it.
 ///
