@@ -16,7 +16,7 @@
   <a href="https://crates.io/crates/fsys" alt="Download"><img alt="Crates.io Downloads" src="https://img.shields.io/crates/d/fsys?color=%230099ff"></a>
   <a href="https://docs.rs/fsys" title="Mod Events Documentation"><img alt="docs.rs" src="https://img.shields.io/docsrs/fsys"></a>
   <a href="https://github.com/jamesgober/fsys-rs/actions/workflows/ci.yml" title="CI status"><img alt="CI" src="https://github.com/jamesgober/fsys-rs/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <img alt="MSRV" src="https://img.shields.io/badge/rustc-1.75%2B-blue.svg?style=flat-square">
+  <img alt="MSRV" src="https://img.shields.io/badge/msrv-1.75%2B-blue.svg?style=flat-square" title="Rust Version">
 </p>
 
 **FSYS** (`fsys-rs`) is a low-level file and directory IO crate for Rust.
@@ -78,7 +78,7 @@ To opt into the async layer:
 
 ```toml
 [dependencies]
-fsys = { version = "0.9.0", features = ["async"] }
+fsys = { version = "0.9.4", features = ["async"] }
 ```
 
 <br>
