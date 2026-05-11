@@ -1612,7 +1612,15 @@ release-candidate-to-1.0 runway.
 ### Added
 - Initial release. Reserved name on crates.io. No public API.
 
-[Unreleased]: https://github.com/jamesgober/fsys-rs/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/fsys-rs/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/jamesgober/fsys-rs/compare/v0.9.2...v0.9.3
+[0.9.2]: https://github.com/jamesgober/fsys-rs/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/jamesgober/fsys-rs/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/jamesgober/fsys-rs/compare/v0.7.0...v0.9.0
+[0.7.0]: https://github.com/jamesgober/fsys-rs/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/jamesgober/fsys-rs/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/jamesgober/fsys-rs/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/jamesgober/fsys-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/fsys-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/fsys-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/fsys-rs/compare/v0.1.0...v0.2.0
