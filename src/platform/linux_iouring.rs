@@ -101,6 +101,19 @@ enum Op {
         fd: RawFd,
         reply: Sender<Result<()>>,
     },
+    /// 0.9.4: linked write + fsync(DATASYNC). The two SQEs are
+    /// pushed back-to-back with `IOSQE_IO_LINK` set on the
+    /// Write so the kernel executes them as a single chain and
+    /// only signals completion of the chain when both have
+    /// executed. Halves the durability syscall round-trip vs
+    /// submitting two independent SQEs and waiting for each.
+    WriteLinkedFsync {
+        fd: RawFd,
+        buf_ptr: usize,
+        buf_len: usize,
+        offset: u64,
+        reply: Sender<Result<usize>>,
+    },
 }
 
 impl IoUringRing {
@@ -123,7 +136,15 @@ impl IoUringRing {
         // and channel transport of `IoUring` is awkward (it's
         // `!Sync`, and the cleaner pattern is to keep all
         // `IoUring`-typed values out of struct fields).
-        match io_uring::IoUring::new(queue_depth) {
+        // 0.9.4: probe builds with the elite setup flags
+        // (`COOP_TASKRUN` / `SINGLE_ISSUER` / `DEFER_TASKRUN`) that
+        // the host kernel supports. The probe in
+        // `iouring_features::features()` happens at most once per
+        // process; ring construction here just calls
+        // `apply(&mut builder)` to set the cached bits.
+        let mut probe_builder = io_uring::IoUring::builder();
+        super::iouring_features::apply(&mut probe_builder);
+        match probe_builder.build(queue_depth) {
             Ok(_probe) => {}
             Err(source) => return Err(Error::IoUringSetupFailed { source }),
         }
@@ -187,6 +208,45 @@ impl IoUringRing {
         rr.recv().map_err(|_| owner_dead())?
     }
 
+    /// 0.9.4: Submits a **linked** `Write` + `Fsync(DATASYNC)`
+    /// pair against `fd` and returns once both have executed.
+    ///
+    /// The two SQEs are pushed back-to-back with the `Write`
+    /// carrying `IOSQE_IO_LINK`; the kernel executes them as a
+    /// single chain and only delivers completions once both
+    /// have run. Equivalent to `write_at(fd, buf, offset)`
+    /// followed by `fdatasync(fd)`, but with **half** the
+    /// `io_uring_enter(2)` round-trips and one merged
+    /// kernel-side completion-processing pass.
+    ///
+    /// Returns the number of bytes written (the `Write`'s
+    /// CQE result). The fsync's success/failure is reported as
+    /// part of the chain — on fsync failure, the entire call
+    /// returns an error and the caller MUST assume the fsync
+    /// did not durably commit the write.
+    ///
+    /// The caller's `&[u8]` borrow is held alive across the
+    /// blocking reply receive (same contract as
+    /// [`Self::write_at`]).
+    pub(crate) fn write_at_linked_fsync(
+        &self,
+        fd: RawFd,
+        buf: &[u8],
+        offset: u64,
+    ) -> Result<usize> {
+        let (rt, rr) = bounded::<Result<usize>>(1);
+        let buf_ptr = buf.as_ptr() as usize;
+        let buf_len = buf.len();
+        self.send(Op::WriteLinkedFsync {
+            fd,
+            buf_ptr,
+            buf_len,
+            offset,
+            reply: rt,
+        })?;
+        rr.recv().map_err(|_| owner_dead())?
+    }
+
     fn send(&self, op: Op) -> Result<()> {
         self.tx
             .as_ref()
@@ -215,7 +275,14 @@ impl Drop for IoUringRing {
 /// (see module docs). Inlining the submit/poll logic per opcode is
 /// the workaround.
 fn owner_loop(queue_depth: u32, rx: Receiver<Op>) {
-    let mut ring = match io_uring::IoUring::new(queue_depth) {
+    // 0.9.4: build with the same elite setup flags the
+    // `IoUringRing::new` probe accepted. `iouring_features::apply`
+    // reads the process-cached probe result, so this is the same
+    // flag set the probe succeeded with — no second kernel probe
+    // happens here.
+    let mut builder = io_uring::IoUring::builder();
+    super::iouring_features::apply(&mut builder);
+    let mut ring = match builder.build(queue_depth) {
         Ok(r) => r,
         // The probe in `IoUringRing::new` already succeeded; if
         // reconstruction fails here it's a transient kernel issue.
@@ -323,6 +390,85 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>) {
                 };
                 let _ = reply.send(result);
             }
+
+            Op::WriteLinkedFsync {
+                fd,
+                buf_ptr,
+                buf_len,
+                offset,
+                reply,
+            } => {
+                // 0.9.4: linked Write + Fsync(DATASYNC). The
+                // Write SQE carries IOSQE_IO_LINK so the
+                // kernel queues the following Fsync to run
+                // only after the Write completes successfully.
+                // We submit both SQEs and wait for both CQEs;
+                // the Write's byte count is the reported result.
+                let write_entry = io_uring::opcode::Write::new(
+                    io_uring::types::Fd(fd),
+                    buf_ptr as *const u8,
+                    buf_len as u32,
+                )
+                .offset(offset)
+                .build()
+                .flags(io_uring::squeue::Flags::IO_LINK);
+                let fsync_entry = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
+                    .flags(io_uring::types::FsyncFlags::DATASYNC)
+                    .build();
+                // SAFETY: submitter blocks on `reply.recv()`
+                // holding the caller's `&[u8]` borrow alive
+                // for the duration of this submission; the
+                // kernel reads `buf_len` bytes at `buf_ptr`.
+                // Both invariants hold while the submitter
+                // waits. Pushing two SQEs is atomic per the
+                // io-uring crate's `SubmissionQueue::push`
+                // contract — we hold the queue across both
+                // pushes without yielding.
+                let push_result = unsafe {
+                    let mut sq = ring.submission();
+                    sq.push(&write_entry).and_then(|()| sq.push(&fsync_entry))
+                };
+                if push_result.is_err() {
+                    let _ = reply.send(Err(io_err(
+                        "io_uring submission queue full (linked write+fsync)",
+                    )));
+                    continue;
+                }
+                // Wait for BOTH completions — submit_and_wait(2).
+                let result = match ring.submit_and_wait(2) {
+                    Ok(_) => {
+                        // Drain both CQEs. The completion order
+                        // is the submission order (write first,
+                        // fsync second) when the chain succeeds;
+                        // if the write fails the fsync's CQE
+                        // carries -ECANCELED. Either way, we
+                        // need both before reporting.
+                        let cqe1 = ring.completion().next();
+                        let cqe2 = ring.completion().next();
+                        match (cqe1, cqe2) {
+                            (Some(w), Some(f)) => {
+                                if w.result() < 0 {
+                                    Err(Error::Io(std::io::Error::from_raw_os_error(-w.result())))
+                                } else if f.result() < 0 {
+                                    // Write succeeded but fsync
+                                    // failed — the caller MUST
+                                    // treat the write as not
+                                    // durable. Surface the fsync
+                                    // error.
+                                    Err(Error::Io(std::io::Error::from_raw_os_error(-f.result())))
+                                } else {
+                                    Ok(w.result() as usize)
+                                }
+                            }
+                            _ => Err(io_err(
+                                "io_uring completion queue short on linked write+fsync",
+                            )),
+                        }
+                    }
+                    Err(e) => Err(Error::Io(e)),
+                };
+                let _ = reply.send(result);
+            }
         }
     }
 }
@@ -395,6 +541,127 @@ pub(crate) fn nvme_flush_capable(fd: RawFd) -> Option<NvmeAccess> {
         .ok()?;
 
     Some(NvmeAccess { char_dev, nsid })
+}
+
+/// 0.9.4 — Issues an NVMe Identify Namespace (admin opcode 0x06,
+/// CNS=0x00) command via `NVME_IOCTL_ADMIN_CMD` and returns the
+/// 4096-byte response buffer. Used by the drive probe to extract
+/// the namespace's atomic-write guarantees (NAWUN, NAWUPF, NACWU)
+/// which downstream callers consult via
+/// [`crate::Handle::atomic_write_unit`].
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] wrapping `EACCES` / `EPERM` (privilege
+/// denied), `EINVAL` (kernel rejected the ioctl), or the NVMe
+/// status code if the controller rejected the command. Probe
+/// callers treat any error as "atomic-write unit unknown" and
+/// leave the relevant `DriveInfo` fields at `None`.
+pub(crate) fn nvme_identify_namespace(nvme_fd: RawFd, nsid: u32) -> Result<[u8; 4096]> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct NvmePassthruCmd {
+        opcode: u8,
+        flags: u8,
+        rsvd1: u16,
+        nsid: u32,
+        cdw2: u32,
+        cdw3: u32,
+        metadata: u64,
+        addr: u64,
+        metadata_len: u32,
+        data_len: u32,
+        cdw10: u32,
+        cdw11: u32,
+        cdw12: u32,
+        cdw13: u32,
+        cdw14: u32,
+        cdw15: u32,
+        timeout_ms: u32,
+        result: u32,
+    }
+
+    // NVME_IOCTL_ADMIN_CMD = _IOWR('N', 0x41, struct nvme_passthru_cmd)
+    //   dir=3 (RW) << 30 | size=64 << 16 | 'N' (0x4e) << 8 | nr=0x41
+    //   = 0xc040_4e41.
+    const NVME_IOCTL_ADMIN_CMD: libc::c_ulong = 0xc040_4e41;
+    // NVMe admin opcode: IDENTIFY.
+    const OPC_IDENTIFY: u8 = 0x06;
+    // CDW10[0..8] = CNS (Controller or Namespace Structure).
+    // CNS = 0x00 → Identify Namespace structure for the namespace
+    // specified in the NSID field.
+    const CNS_NAMESPACE: u32 = 0x0000_0000;
+    const ID_BUF_LEN: usize = 4096;
+
+    // Identify response is 4096 bytes; on most kernels the kernel
+    // requires the user buffer to be at least 4-byte-aligned. We
+    // own a stack array (`[u8; 4096]`) which is 1-byte aligned
+    // by default; if any kernel rejects it we'd have to bounce
+    // through a heap allocation. So far no platform reference
+    // documents a >4-byte requirement for the ADMIN_CMD path.
+    let mut buf = [0u8; ID_BUF_LEN];
+
+    let mut cmd = NvmePassthruCmd {
+        opcode: OPC_IDENTIFY,
+        nsid,
+        addr: buf.as_mut_ptr() as u64,
+        data_len: ID_BUF_LEN as u32,
+        cdw10: CNS_NAMESPACE,
+        ..Default::default()
+    };
+
+    // SAFETY: `nvme_fd` is owned by the caller for the duration
+    // of this synchronous call. `&mut cmd` points to a
+    // stack-allocated `NvmePassthruCmd` matching the kernel's
+    // expected size. The kernel writes up to `data_len` bytes to
+    // `cmd.addr` (our `buf`), which is alive on this stack
+    // frame for the duration of the syscall. `ioctl` returns -1
+    // on error; we surface `errno` via `last_os_error`.
+    let rc = unsafe { libc::ioctl(nvme_fd, NVME_IOCTL_ADMIN_CMD, &mut cmd) };
+    if rc < 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    // The kernel sets `cmd.result` to the NVMe completion status;
+    // 0 means success. Non-zero means the controller rejected the
+    // command (e.g. command not supported, namespace inactive).
+    if cmd.result != 0 {
+        return Err(Error::Io(std::io::Error::other(format!(
+            "NVMe Identify Namespace returned status 0x{:x}",
+            cmd.result
+        ))));
+    }
+    Ok(buf)
+}
+
+/// 0.9.4 — Parses the **NAWUN** and **NAWUPF** fields from a
+/// 4096-byte NVMe Identify Namespace response.
+///
+/// Returns `(nawun_lba, nawupf_lba)` — each as a count of
+/// **logical blocks**, **0-based** per the NVMe spec. A value of
+/// `Some(0)` means "atomic for one logical block" (the base
+/// guarantee); a value of `Some(N)` means "atomic for `N + 1`
+/// logical blocks". `None` is returned when the field is the
+/// NVMe sentinel `0xFFFF` (unsupported) — only an explicit
+/// guarantee should be reported to callers.
+///
+/// NAWUN (bytes 74-75) is the atomic-write guarantee in normal
+/// operation; NAWUPF (bytes 76-77) is the atomic-write
+/// guarantee under power-fail. NAWUPF is the load-bearing one
+/// for crash-safe atomic writes — it's what
+/// [`crate::Handle::atomic_write_unit`] exposes (converted to
+/// bytes).
+pub(crate) fn parse_nawun_nawupf(id_buf: &[u8; 4096]) -> (Option<u32>, Option<u32>) {
+    // Both fields are 16-bit little-endian.
+    let nawun = u16::from_le_bytes([id_buf[74], id_buf[75]]);
+    let nawupf = u16::from_le_bytes([id_buf[76], id_buf[77]]);
+    let cvt = |v: u16| -> Option<u32> {
+        if v == u16::MAX {
+            None
+        } else {
+            Some(v as u32)
+        }
+    };
+    (cvt(nawun), cvt(nawupf))
 }
 
 /// Issues an NVMe FLUSH (opcode 0x00) on `nvme_fd` for namespace
@@ -658,5 +925,77 @@ mod tests {
                 "sector {i} content drift — owner-thread serialisation broken",
             );
         }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 0.9.4 — Linked write+fsync + NAWUN/NAWUPF parser
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn write_at_linked_fsync_round_trips_under_owner_thread() {
+        // End-to-end: submit a linked Write + Fsync(DATASYNC)
+        // chain via the new API. The owner thread pushes two
+        // SQEs with IOSQE_IO_LINK and waits for both CQEs. We
+        // verify the byte count comes back correct and the
+        // content is on disk after sync_data has run.
+        let Some(ring) = ring_or_skip() else { return };
+        let path = tmp_path("linked_write_fsync");
+        let _g = Cleanup(path.clone());
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let fd = f.as_raw_fd();
+        let payload = b"linked write + fsync";
+        let n = ring.write_at_linked_fsync(fd, payload, 0).unwrap();
+        assert_eq!(n, payload.len());
+        drop(f);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes, payload);
+    }
+
+    #[test]
+    fn parse_nawun_nawupf_extracts_le_u16_at_offset_74_76() {
+        // Construct a synthetic 4096-byte Identify Namespace
+        // response with known values at bytes 74-75 (NAWUN) and
+        // 76-77 (NAWUPF), both little-endian.
+        let mut id = [0u8; 4096];
+        // NAWUN = 0x0007 → "atomic for 8 logical blocks"
+        id[74] = 0x07;
+        id[75] = 0x00;
+        // NAWUPF = 0x000F → "atomic for 16 logical blocks"
+        id[76] = 0x0F;
+        id[77] = 0x00;
+        let (nawun, nawupf) = parse_nawun_nawupf(&id);
+        assert_eq!(nawun, Some(7));
+        assert_eq!(nawupf, Some(15));
+    }
+
+    #[test]
+    fn parse_nawun_nawupf_sentinel_0xffff_reads_as_none() {
+        // The NVMe sentinel 0xFFFF means "unsupported" — must
+        // surface as None so callers don't mistake "65 535 LBA
+        // atomic guarantee" for "no guarantee".
+        let mut id = [0u8; 4096];
+        id[74] = 0xFF;
+        id[75] = 0xFF;
+        id[76] = 0xFF;
+        id[77] = 0xFF;
+        let (nawun, nawupf) = parse_nawun_nawupf(&id);
+        assert_eq!(nawun, None);
+        assert_eq!(nawupf, None);
+    }
+
+    #[test]
+    fn parse_nawun_nawupf_zero_means_one_block_guarantee() {
+        // A value of 0 in NAWUN/NAWUPF is 0-based: it means
+        // "atomic for exactly one logical block" (the base
+        // NVMe per-LBA guarantee). It is NOT the sentinel.
+        let id = [0u8; 4096];
+        let (nawun, nawupf) = parse_nawun_nawupf(&id);
+        assert_eq!(nawun, Some(0));
+        assert_eq!(nawupf, Some(0));
     }
 }

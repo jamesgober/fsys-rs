@@ -642,28 +642,47 @@ fn iouring_write_direct(
     let mut buf = crate::platform::AlignedBuf::new(aligned_len, ss)?;
     buf.as_mut_slice()[..data.len()].copy_from_slice(data);
 
-    let n = ring.write_at(file.as_raw_fd(), buf.as_slice(), 0)?;
-    if n != aligned_len {
-        return Err(Error::Io(std::io::Error::other(
-            "io_uring short write on Direct path",
-        )));
-    }
     // O_DIRECT minimises cache effects but does not imply durability.
     // The atomic-replace contract requires the bytes to be on stable
-    // storage before the rename. Two paths:
+    // storage before the rename. Three paths:
     //
     // 1. NVMe passthrough flush (locked decision D-2). Sends NVMe
     //    FLUSH (opcode 0x00) directly to the controller via the
     //    legacy `NVME_IOCTL_IO_CMD` ioctl. Bypasses the kernel's
     //    fsync path entirely — the controller flushes its volatile
     //    write cache and acknowledges. Requires NVMe hardware +
-    //    `CAP_SYS_ADMIN`-level access.
-    // 2. Standard fallback: io_uring `Fsync(DATASYNC)` SQE — the
-    //    0.5.1 path. Used when NVMe passthrough is unavailable.
+    //    `CAP_SYS_ADMIN`-level access. Write and flush are
+    //    submitted as separate calls because the NVMe FLUSH is an
+    //    ioctl on a different fd (`/dev/nvmeX`), not an io_uring
+    //    SQE — linking is not applicable.
+    // 2. **0.9.4 linked write+fsync (`IOSQE_IO_LINK`).** When NVMe
+    //    passthrough is unavailable, submit Write + Fsync(DATASYNC)
+    //    as a linked SQE chain in one `io_uring_enter(2)` round-
+    //    trip instead of two. Halves the syscall-entry cost of the
+    //    durable-write path; kernel batches both completions in a
+    //    single submit-and-wait.
+    // 3. Standard fallback when the linked submission cannot be
+    //    used (e.g. SQ queue full at link time): write + fdatasync
+    //    as separate calls (the 0.5.1 path).
     if let Some(access) = nvme {
+        let n = ring.write_at(file.as_raw_fd(), buf.as_slice(), 0)?;
+        if n != aligned_len {
+            return Err(Error::Io(std::io::Error::other(
+                "io_uring short write on Direct path",
+            )));
+        }
         crate::platform::linux_iouring::nvme_flush_ioctl(access.char_dev.as_raw_fd(), access.nsid)?;
     } else {
-        ring.fdatasync(file.as_raw_fd())?;
+        // 0.9.4: linked write + fsync. The owner thread pushes
+        // both SQEs with IOSQE_IO_LINK and waits for both CQEs;
+        // halves the durability syscall round-trip vs the
+        // pre-0.9.4 two-submit path.
+        let n = ring.write_at_linked_fsync(file.as_raw_fd(), buf.as_slice(), 0)?;
+        if n != aligned_len {
+            return Err(Error::Io(std::io::Error::other(
+                "io_uring short write on Direct path (linked write+fsync)",
+            )));
+        }
     }
     Ok(())
 }

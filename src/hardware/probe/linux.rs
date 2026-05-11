@@ -99,7 +99,63 @@ pub(crate) fn probe_drive() -> DriveInfo {
     // `Direct + NVMe FLUSH`).
     info.plp = probe_plp_linux(&block_dir);
 
+    // 0.9.4 — NAWUN / NAWUPF probe (NVMe only). Issues an NVMe
+    // Identify Namespace ioctl via the existing passthrough
+    // infrastructure. Failure (non-NVMe drive, missing
+    // `/dev/nvmeX` privilege, kernel rejection, sentinel
+    // `0xFFFF`) leaves both fields at their `None` default —
+    // the absence of an explicit guarantee is the correct
+    // answer when fsys cannot determine it.
+    if matches!(info.kind, DriveKind::Nvme) {
+        if let Some((nawun, nawupf)) = probe_nawun_nawupf_linux(&block_dir) {
+            info.nawun_lba = nawun;
+            info.nawupf_lba = nawupf;
+        }
+    }
+
     info
+}
+
+/// 0.9.4 — Probes NAWUN / NAWUPF via NVMe Identify Namespace.
+///
+/// Returns `Some((nawun_lba, nawupf_lba))` on a successful
+/// probe (each as `Option<u32>` because the NVMe sentinel
+/// `0xFFFF` means "unsupported" and the absence of an
+/// explicit guarantee is the right answer to report).
+/// Returns `None` when the probe could not run at all — no
+/// `/dev/nvmeX` character device resolvable, ioctl rejected,
+/// privilege denied, etc.
+///
+/// The probe opens `/dev/nvmeX` directly (not the block
+/// device); this typically requires `CAP_SYS_ADMIN` or
+/// membership in the `disk` group. Unprivileged callers get
+/// `None` and the caller observes the fields at their default
+/// (which is also `None`) — observable, not a silent failure.
+fn probe_nawun_nawupf_linux(block_dir: &std::path::Path) -> Option<(Option<u32>, Option<u32>)> {
+    use crate::platform::linux_iouring;
+    use std::os::fd::AsRawFd;
+
+    // Resolve namespace ID. `/sys/block/nvme0n1/nsid` is the
+    // canonical source; default to 1 if missing.
+    let nsid = std::fs::read_to_string(block_dir.join("nsid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(1);
+
+    // Resolve `/dev/nvmeX` (character device) from the block
+    // device name. For `nvme0n1` the char device is `/dev/nvme0`.
+    let dev_name = block_dir.file_name().and_then(|n| n.to_str())?;
+    let char_name = dev_name
+        .split('n')
+        .next()
+        .map(|prefix| format!("/dev/{prefix}"))?;
+    let nvme = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&char_name)
+        .ok()?;
+    let id_buf = linux_iouring::nvme_identify_namespace(nvme.as_raw_fd(), nsid).ok()?;
+    Some(linux_iouring::parse_nawun_nawupf(&id_buf))
 }
 
 /// Reads `vendor` and `model` from sysfs and consults the

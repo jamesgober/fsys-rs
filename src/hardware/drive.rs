@@ -72,6 +72,27 @@ pub struct DriveInfo {
     pub total_bytes: u64,
     /// Available (free) capacity in bytes. `0` means unknown.
     pub available_bytes: u64,
+    /// 0.9.4 — NVMe **NAWUN** (Namespace Atomic Write Unit
+    /// Normal), as a 0-based count of logical blocks. `Some(N)`
+    /// means writes of up to `(N + 1) × logical_sector` bytes
+    /// are atomic on this device in normal operation. `None`
+    /// when the field could not be probed (non-NVMe drive,
+    /// `EACCES` on the namespace identify ioctl, NVMe sentinel
+    /// `0xFFFF` indicating unsupported, or non-Linux platform —
+    /// the namespace-identify probe currently lives in the Linux
+    /// platform layer only).
+    pub nawun_lba: Option<u32>,
+    /// 0.9.4 — NVMe **NAWUPF** (Namespace Atomic Write Unit
+    /// Power Fail), as a 0-based count of logical blocks.
+    /// `Some(N)` means writes of up to `(N + 1) × logical_sector`
+    /// bytes survive a power-fail atomically. **This is the
+    /// load-bearing atomic-write guarantee for crash-safety
+    /// reasoning** — databases aware of it can skip torn-write
+    /// detection on writes up to this size.
+    /// [`crate::Handle::atomic_write_unit`] exposes the byte-count
+    /// derivative for callers. `None` for the same reasons as
+    /// `nawun_lba`.
+    pub nawupf_lba: Option<u32>,
 }
 
 impl Default for DriveInfo {
@@ -85,6 +106,8 @@ impl Default for DriveInfo {
             queue_depth: 1,
             total_bytes: 0,
             available_bytes: 0,
+            nawun_lba: None,
+            nawupf_lba: None,
         }
     }
 }

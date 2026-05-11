@@ -5,6 +5,201 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] - 2026-05-11
+
+> **io_uring elite — Linux.** Three Linux-only optimisations
+> behind cross-platform additive API: the kernel setup-flag
+> ladder (`COOP_TASKRUN` / `SINGLE_ISSUER` / `DEFER_TASKRUN`),
+> linked `Write + Fsync(DATASYNC)` via `IOSQE_IO_LINK` to halve
+> the durable-write syscall round-trip on the atomic-replace
+> Direct path, and a real NAWUN / NAWUPF probe so databases can
+> safely skip torn-write detection on guaranteeing drives.
+> Every Linux-only path is `#[cfg(target_os = "linux")]`-gated;
+> macOS / Windows / unknown platforms see zero behavioural
+> change, and the new `Handle::atomic_write_unit` accessor
+> returns the conservative `None` when fsys can't confirm an
+> atomic guarantee.
+
+### Added — 0.9.4
+
+- **`Handle::atomic_write_unit() -> Option<u32>`** — exposes
+  the NVMe **NAWUPF** (Namespace Atomic Write Unit Power Fail)
+  in **bytes**, or `None` when fsys couldn't confirm it.
+  Databases aware of it skip torn-write detection on writes
+  up to this size (a hot-path optimisation for write-heavy
+  workloads on enterprise NVMe; torn-write detection
+  typically costs an extra checksum + per-write branch).
+  - The conversion is byte-friendly: NVMe reports NAWUPF as
+    a 0-based count of logical blocks; this method does the
+    `(N + 1) × logical_sector` arithmetic so callers don't
+    need to know the sector size.
+  - Conservative semantics match
+    [`Handle::is_plp_protected`] from 0.9.2: returns `None`
+    whenever fsys cannot confirm the guarantee — non-NVMe
+    drive, privilege denied on `/dev/nvmeX`, NVMe sentinel
+    `0xFFFF` (unsupported), or non-Linux platform. Callers
+    MUST treat `None` as "no atomic guarantee — protect every
+    write".
+  - Probed once per process via `crate::hardware::info` (same
+    cache as PLP / drive kind / sector sizes).
+- **`DriveInfo::nawun_lba: Option<u32>`** +
+  **`DriveInfo::nawupf_lba: Option<u32>`** — public fields on
+  the `pub use`d `DriveInfo` struct. Each is the 0-based count
+  of logical blocks per the NVMe spec (`Some(0)` = atomic for
+  one logical block; `Some(N)` = atomic for `N + 1` logical
+  blocks; `None` = unknown / sentinel / non-NVMe / non-Linux).
+  Use [`Handle::atomic_write_unit`] for the byte-converted
+  load-bearing field; consult the raw `_lba` fields when you
+  need both NAWUN (normal-op atomic) and NAWUPF (power-fail
+  atomic) separately.
+- **`crate::platform::linux_iouring::nvme_identify_namespace`**
+  + **`parse_nawun_nawupf`** (Linux only, `pub(crate)`).
+  Issues NVMe Identify Namespace (admin opcode 0x06,
+  `CNS=0x00`) via `NVME_IOCTL_ADMIN_CMD` and parses the
+  4096-byte response. Used by the Linux drive probe; not
+  part of the public API.
+- **`crate::platform::iouring_features`** (new internal
+  module, Linux only) — process-cached probe for the elite
+  setup flags (`COOP_TASKRUN` / `SINGLE_ISSUER` /
+  `DEFER_TASKRUN`). Probes once via a tiered walk
+  (DEFER+SINGLE+COOP → SINGLE+COOP → COOP → none), caches
+  via `OnceLock`, then `apply(&mut Builder)` re-applies the
+  cached bits to every ring construction.
+- **`crate::platform::linux_iouring::IoUringRing::write_at_linked_fsync`**
+  (Linux only, `pub(crate)`) — submits a Write SQE with
+  `IOSQE_IO_LINK` followed by an Fsync(DATASYNC) SQE; the
+  kernel chains them and the call waits for **both**
+  completions. Wired into the
+  `Method::Direct` + `Linux` + no-NVMe-passthrough write
+  path so the durable-write syscall round-trip drops from
+  two `io_uring_enter(2)` calls to one.
+
+### Changed — 0.9.4
+
+- **Both io_uring ring constructors now apply the elite setup
+  flags supported by the host kernel.** `IoUringRing::new` and
+  `AsyncIoUring::new` both call
+  `crate::platform::iouring_features::apply(&mut builder)`
+  before `.build(queue_depth)`. The cached probe runs at most
+  once per process; subsequent ring constructions just re-apply
+  the cached bits at zero kernel-syscall cost. On hosts where
+  every elite flag is rejected (kernel ≤ 5.18) the behaviour
+  is identical to pre-0.9.4 (vanilla `IoUring::new`).
+- **`iouring_write_direct` (Linux atomic-replace Direct path)**
+  now uses the linked `Write + Fsync(DATASYNC)` SQE chain
+  when NVMe passthrough is **not** available. NVMe-passthrough
+  path is unchanged (the FLUSH ioctl runs on a different fd
+  and isn't chainable). Empty-payload fast-path unchanged
+  (no Write to link).
+- **Linux drive probe (`hardware::probe::linux::probe_drive`)**
+  now issues NVMe Identify Namespace on detected NVMe drives
+  and populates `DriveInfo::nawun_lba` / `nawupf_lba` from
+  bytes 74-77 of the response. Failure at any step
+  (non-NVMe, no `/dev/nvmeX` access, ioctl rejection, NVMe
+  sentinel `0xFFFF`) leaves both fields at their `None`
+  default — fsys never lies about an atomic-write guarantee
+  it couldn't confirm.
+
+### Performance — 0.9.4
+
+The headline append/journal numbers are **unchanged** from
+0.9.3 — 0.9.4 is Linux-only kernel-IO work, orthogonal to the
+cross-platform journal/pipeline hot paths benched on the
+Windows reference box.
+
+Expected wins on Linux:
+- **Linked write+fsync on the atomic-replace Direct path:**
+  one `io_uring_enter(2)` syscall instead of two for every
+  Direct write that lacks NVMe passthrough. Per-call cost
+  drop is workload-dependent (~3-8 µs of syscall-entry +
+  context-switch overhead per write on a quiet host).
+- **DEFER_TASKRUN on kernel ≥ 6.1:** reduced tail latency
+  via deferred task work — completions are processed at
+  `io_uring_enter` boundaries instead of forcefully
+  interrupting userspace tasks. Most visible on highly
+  concurrent submitter workloads where the IPI cost was
+  observable; quiet workloads see a noise-floor change.
+- **SINGLE_ISSUER on kernel ≥ 6.0:** kernel-side
+  optimisations that assume a single submitter task — fsys
+  satisfies this naturally (one ring, one owner thread or
+  one async task).
+- **NAWUPF-aware durability skip (database-side):** on a
+  drive reporting `Some(7)`, an 8-LBA atomic guarantee
+  means a 4 KiB write on a 512-byte-sector drive is
+  atomic across power-fail. A database aware of this can
+  drop torn-write checksums for writes up to that size,
+  saving the checksum compute and the per-write branch.
+
+Capture canonical Linux numbers on the bare-metal Linux NVMe
+reference box (or WSL2 Ubuntu) once available — these wins
+are workload-shape-dependent.
+
+### Tests — 0.9.4
+
+- **+2 cross-platform lib tests** (409 → 411 on Windows): both
+  on `Handle::atomic_write_unit` (well-formed return value;
+  round-trip equivalence with `DriveInfo::nawupf_lba`).
+- **+7 Linux-cfg-gated tests** (415 → 422 on Linux): 3 in
+  `iouring_features` (DEFER ⇒ SINGLE invariant, cache
+  stability, builds-without-panic); 1 in `linux_iouring`
+  for `write_at_linked_fsync` end-to-end round-trip; 3
+  parser tests for `parse_nawun_nawupf` (LE u16 extraction,
+  `0xFFFF` sentinel → `None`, zero → `Some(0)` for 1-LBA
+  guarantee).
+- All 0.9.3 tests pass unchanged.
+  `cargo test --all-features` on Windows: **647 passing**,
+  0 failed, 7 ignored (manual benches).
+- `cargo clippy --all-targets --all-features -- -D warnings`:
+  clean.
+
+### Notes — 0.9.4
+
+- **No new runtime dependencies.** Setup-flag probe uses
+  the existing `io-uring = "0.6"` crate; NVMe Identify
+  Namespace uses the existing `libc` dependency.
+- **No breaking changes.** Every 0.9.3 caller compiles
+  unchanged. New public surface (`Handle::atomic_write_unit`,
+  `DriveInfo::nawun_lba`, `DriveInfo::nawupf_lba`) is
+  strictly additive.
+- **`DriveInfo` is `#[non_exhaustive]` via `pub use`** —
+  callers constructing `DriveInfo` directly (rare; the
+  intended path is the cached `hardware::drive()`) would
+  need to add the two new fields, but pattern-matching
+  with `..` is unaffected.
+- **MSRV unchanged.** Still 1.75.
+- **All Linux-only code paths are
+  `#[cfg(target_os = "linux")]`-gated.** macOS / Windows /
+  unknown platforms see no compile-time or runtime change
+  from 0.9.4.
+
+### Queued for 0.9.5 ("Direct-mode + register-tier + 1.0-RC prep")
+
+The original 0.9.4 plan included `IORING_REGISTER_FILES` and
+`IORING_REGISTER_BUFFERS`. Both require architectural changes
+to the owner-thread design (current rings carry raw fds in
+each SQE; registered files need a per-handle fd table
+maintained on the owner thread). Deferred to 0.9.5 where the
+journal substrate's `native_ring` already owns a per-handle
+ring — the integration point is more contained there.
+
+- **`IORING_REGISTER_FILES`** — fixed fd table. Saves
+  per-SQE fd validation cost on rings doing many ops per
+  second on a small set of fds (the journal hot path).
+- **`IORING_REGISTER_BUFFERS`** — zero-copy DMA from
+  registered buffer pool with `IORING_OP_WRITE_FIXED`.
+  Buffers must be pinned in memory; the existing aligned
+  buffer pool is the natural integration point.
+- **Double-buffered Direct-mode log buffer** (active +
+  flushing) — decouples journal-append latency from
+  flush latency in `JournalOptions::direct(true)`.
+- **macOS `F_BARRIERFSYNC`** — cheaper than `F_FULLFSYNC`
+  with the same atomicity guarantee.
+- **`F_SET_RW_HINT`** for journal append (Linux NVMe
+  write-lifetime hint).
+- **NVMe `WRITE ZEROES` / `DEALLOCATE`** for fast
+  truncate + hole-punch via device command.
+- **Final audit + polish + 1.0-RC stability commitment doc.**
+
 ## [0.9.3] - 2026-05-11
 
 > **Pipeline throughput tier.** 0.9.3 lifts the one-core ceiling
@@ -1612,7 +1807,8 @@ release-candidate-to-1.0 runway.
 ### Added
 - Initial release. Reserved name on crates.io. No public API.
 
-[Unreleased]: https://github.com/jamesgober/fsys-rs/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/jamesgober/fsys-rs/compare/v0.9.4...HEAD
+[0.9.4]: https://github.com/jamesgober/fsys-rs/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/jamesgober/fsys-rs/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/jamesgober/fsys-rs/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/jamesgober/fsys-rs/compare/v0.9.0...v0.9.1

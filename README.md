@@ -58,6 +58,7 @@ not trying to replace `std::fs` for ordinary application code.
 - **Structured error reporting** &mdash; 21 explicit error variants with stable `FS-XXXXX` codes for unsupported methods, alignment failures, atomic-replace failures, NVMe passthrough denial, async-runtime requirements, glob-pattern errors, batch failure position, handle poisoning, io_uring submit failure, and completion-driver liveness.
 - **Hardware-aware database surface (0.9.2)** &mdash; `Handle::is_plp_protected()` / `Handle::plp_status()` for safe per-commit fsync skip on confirmed-PLP enterprise NVMe (3&ndash;10&times; transaction-throughput lever); `crate::observer::FsysObserver` trait + `Builder::observer` for typed per-op telemetry (journal append / sync / handle write / read); runtime CPU-feature detection (replacing pre-0.9.2 compile-time `cfg!(target_feature = ...)` that lied on cross-target builds); `Builder::tune_for(Workload::Database)` for one-line storage-engine tuning (8 MiB buffer pool, 256-deep io_uring ring, 4096-deep batch queue).
 - **Pipeline throughput tier (0.9.3)** &mdash; `Builder::dispatcher_shards(N)` spawns N independent dispatcher threads per handle, each with its own bounded queue; batches hash-routed by first op's path so within-batch order is preserved while concurrent submitters writing to different files scale near-linearly with shard count (was a one-core ceiling pre-0.9.3). `Batch::commit_grouped()` amortises parent-directory `fsync` across the entire batch &mdash; one syscall per unique parent directory instead of one per op &mdash; for bulk-load / SST-flush / checkpoint workloads where the batch is the durability unit.
+- **io_uring elite &mdash; Linux (0.9.4)** &mdash; process-cached kernel-feature probe applies `IORING_SETUP_COOP_TASKRUN` / `SINGLE_ISSUER` / `DEFER_TASKRUN` to every io_uring ring fsys constructs (kernel &ge; 5.19 / 6.0 / 6.1 respectively, with graceful downgrade on older kernels); linked `Write + Fsync(DATASYNC)` via `IOSQE_IO_LINK` halves the durable-write syscall round-trip on the atomic-replace Direct path; NAWUN / NAWUPF probe via NVMe Identify Namespace exposes `Handle::atomic_write_unit() -> Option<u32>` so databases on guaranteeing drives can safely skip torn-write detection on writes up to that size. macOS / Windows behaviour unchanged &mdash; every Linux-only path is `#[cfg(target_os = "linux")]`-gated.
 
 
 &nbsp;
@@ -69,7 +70,7 @@ not trying to replace `std::fs` for ordinary application code.
 
 ```toml
 [dependencies]
-fsys = "0.9.3"
+fsys = "0.9.4"
 ```
 
 To opt into the async layer:
