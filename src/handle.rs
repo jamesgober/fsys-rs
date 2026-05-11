@@ -765,6 +765,52 @@ impl Handle {
         )
     }
 
+    /// 0.9.4 — Returns the device's **atomic-write unit** (NAWUPF)
+    /// in **bytes**, or `None` when the probe could not determine
+    /// it.
+    ///
+    /// **NAWUPF** is the NVMe "Namespace Atomic Write Unit Power
+    /// Fail" — the largest write size the device guarantees will
+    /// be atomically committed across a power-fail event.
+    /// Databases aware of it can **skip torn-write detection** on
+    /// writes up to this size (a hot-path optimisation for
+    /// write-heavy workloads on enterprise NVMe: torn-write
+    /// detection typically costs an extra checksum + a per-write
+    /// branch).
+    ///
+    /// **The conversion.** NAWUPF is reported by the device as a
+    /// 0-based count of logical blocks: `NAWUPF = N` means
+    /// `(N + 1) × logical_sector` bytes are atomically committed.
+    /// This method returns the byte count directly, so callers
+    /// don't need to know the logical sector size.
+    ///
+    /// **Conservative semantics, same as
+    /// [`Self::is_plp_protected`].** Returns `None` whenever
+    /// fsys cannot confirm the guarantee — non-NVMe drive,
+    /// privilege denied on `/dev/nvmeX`, NVMe sentinel `0xFFFF`
+    /// (unsupported), or non-Linux platform (the probe currently
+    /// lives in the Linux platform layer; future patches may add
+    /// Windows / macOS NVMe-Identify-Namespace paths). Callers
+    /// MUST treat `None` as "no atomic guarantee — protect every
+    /// write".
+    ///
+    /// **Probing happens once at handle creation** (via
+    /// [`crate::hardware::info`]) and the result is cached for
+    /// the lifetime of the process. Hot-plug is not re-probed.
+    #[must_use]
+    pub fn atomic_write_unit(&self) -> Option<u32> {
+        let drive = crate::hardware::drive();
+        let n_lba = drive.nawupf_lba?;
+        // NAWUPF is 0-based per the NVMe spec; the device
+        // guarantees (N + 1) logical blocks atomically. Use
+        // checked arithmetic — paranoid against pathological
+        // u32 wraparound on values near u32::MAX (which only
+        // shows up if the parser ever skipped the 0xFFFF
+        // sentinel check, which it doesn't).
+        let blocks = n_lba.checked_add(1)?;
+        blocks.checked_mul(drive.logical_sector)
+    }
+
     /// 0.9.2 — Returns the underlying [`crate::hardware::PlpStatus`]
     /// tri-state (`Yes` / `No` / `Unknown`).
     ///
@@ -1525,5 +1571,61 @@ mod tests {
         // single Option::is_some branch.
         let h = make_handle(Method::Sync);
         assert!(h.observer().is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 0.9.4 — NAWUPF accessor
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_atomic_write_unit_returns_well_defined_option() {
+        // The accessor must return either `Some(bytes)` where
+        // `bytes` is a positive multiple of the logical sector,
+        // or `None`. It must never panic. The actual value
+        // depends on host hardware:
+        // - Enterprise NVMe with NAWUPF probed: Some(N×sector).
+        // - Consumer NVMe / non-Linux: None.
+        let h = make_handle(Method::Sync);
+        let result = h.atomic_write_unit();
+        if let Some(bytes) = result {
+            let drive = crate::hardware::drive();
+            assert!(
+                bytes >= drive.logical_sector,
+                "atomic_write_unit ({bytes} bytes) must be at \
+                 least one logical sector ({}); NAWUPF is 0-based \
+                 so the minimum guarantee is one sector",
+                drive.logical_sector
+            );
+            assert_eq!(
+                bytes % drive.logical_sector,
+                0,
+                "atomic_write_unit must be an integer multiple \
+                 of the logical sector size; got {bytes} bytes \
+                 with sector {}",
+                drive.logical_sector
+            );
+        }
+    }
+
+    #[test]
+    fn test_atomic_write_unit_is_conservative() {
+        // The conservative-fallback contract: `None` means
+        // "fsys cannot confirm an atomic guarantee — protect
+        // every write". On a typical Windows / macOS test host
+        // the NAWUPF probe lives in the Linux platform layer
+        // only, so the field stays `None` and the accessor
+        // returns `None`. We can't assert this conditionally
+        // across CI hosts without flaky behaviour, but we CAN
+        // confirm the round-trip equivalence between the
+        // accessor and the underlying drive-info field.
+        let h = make_handle(Method::Sync);
+        let drive = crate::hardware::drive();
+        let accessor_some = h.atomic_write_unit().is_some();
+        let field_some = drive.nawupf_lba.is_some();
+        assert_eq!(
+            accessor_some, field_some,
+            "Handle::atomic_write_unit must be Some iff \
+             DriveInfo::nawupf_lba is Some"
+        );
     }
 }

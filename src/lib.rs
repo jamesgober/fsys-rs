@@ -159,7 +159,7 @@
 //! `fs.write_async()` outside a tokio runtime returns
 //! [`Error::AsyncRuntimeRequired`] rather than panicking.
 
-#![doc(html_root_url = "https://docs.rs/fsys/0.9.3")]
+#![doc(html_root_url = "https://docs.rs/fsys/0.9.4")]
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unused_must_use)]

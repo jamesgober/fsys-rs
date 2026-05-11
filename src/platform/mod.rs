@@ -33,6 +33,14 @@ use linux as imp;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux_iouring;
 
+// io_uring kernel-feature probe — Linux only. Runs a single
+// process-wide probe (cached via OnceLock) for the elite setup
+// flags COOP_TASKRUN / SINGLE_ISSUER / DEFER_TASKRUN, then
+// applies the supported subset to every ring built by the
+// crate. New in 0.9.4.
+#[cfg(target_os = "linux")]
+pub(crate) mod iouring_features;
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]

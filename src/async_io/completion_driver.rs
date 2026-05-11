@@ -129,8 +129,15 @@ impl AsyncIoUring {
     /// Spawns the owner task on the current tokio runtime — must be
     /// called from inside a runtime context.
     pub(crate) fn new(queue_depth: u32) -> Result<Self> {
-        // Probe ring construction synchronously.
-        match io_uring::IoUring::new(queue_depth) {
+        // 0.9.4: probe with the elite setup flags
+        // (`COOP_TASKRUN` / `SINGLE_ISSUER` / `DEFER_TASKRUN`) the
+        // host kernel supports. The cached probe in
+        // `iouring_features::features()` runs at most once per
+        // process; subsequent ring constructions just re-apply
+        // the cached bits.
+        let mut probe_builder = io_uring::IoUring::builder();
+        crate::platform::iouring_features::apply(&mut probe_builder);
+        match probe_builder.build(queue_depth) {
             Ok(_probe) => {}
             Err(source) => return Err(Error::IoUringSetupFailed { source }),
         }
@@ -328,7 +335,11 @@ async fn owner_loop(queue_depth: u32, eventfd_raw: RawFd, mut rx: mpsc::Unbounde
     // Reconstruct the ring on this task's stack. (We probed it
     // synchronously in `AsyncIoUring::new` to surface kernel
     // failure as a clean error.)
-    let mut ring = match io_uring::IoUring::new(queue_depth) {
+    // 0.9.4: apply the cached elite setup flags so this ring
+    // gets the same kernel feature set the probe accepted.
+    let mut builder = io_uring::IoUring::builder();
+    crate::platform::iouring_features::apply(&mut builder);
+    let mut ring = match builder.build(queue_depth) {
         Ok(r) => r,
         Err(_) => return, // owned_fd drops, eventfd closes once
     };
