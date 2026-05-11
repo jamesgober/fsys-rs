@@ -62,7 +62,7 @@ pub(crate) mod log_buffer;
 pub mod options;
 pub mod reader;
 
-pub use options::JournalOptions;
+pub use options::{JournalOptions, SyncMode, WriteLifetimeHint};
 pub use reader::{JournalIter, JournalReader, JournalRecord, JournalTailState};
 
 use crate::{Error, Result};
@@ -218,6 +218,14 @@ pub struct JournalHandle {
     /// `None` for journals on observer-less handles. Per-op cost
     /// when `None`: a single `Option::is_some` branch.
     pub(crate) observer: Option<std::sync::Arc<dyn crate::observer::FsysObserver>>,
+    /// 0.9.4 — durability primitive choice for `sync_through`.
+    /// `SyncMode::Full` (default) calls
+    /// `file.sync_data()` (the platform's full media-durability
+    /// primitive); `SyncMode::Barrier` calls
+    /// `platform::sync_barrier()` (cheaper on macOS with PLP).
+    /// Captured at journal-open time from
+    /// `JournalOptions::sync_mode`.
+    pub(crate) sync_mode: options::SyncMode,
 }
 
 impl JournalHandle {
@@ -278,6 +286,12 @@ impl JournalHandle {
             .open(path)
             .map_err(Error::Io)?;
 
+        // 0.9.4 — apply the optional NVMe write-lifetime hint
+        // on Linux. Failure is non-fatal (older kernels, drives
+        // without multi-stream, filesystems that reject the
+        // fcntl) — the hint is advisory.
+        Self::apply_write_lifetime_hint(&file, options.write_lifetime_hint);
+
         // Resume: next_lsn = current file length. Seek to end so
         // that any sneaky `write()` (which we don't use, but
         // belt-and-braces) lands at the right place.
@@ -298,6 +312,7 @@ impl JournalHandle {
             direct: false,
             log_buffer: None,
             observer: None,
+            sync_mode: options.sync_mode,
         })
     }
 
@@ -306,6 +321,30 @@ impl JournalHandle {
     /// buffer. On reopen, scans the existing file for the
     /// last-clean LSN and rehydrates the partial trailing sector
     /// into the buffer.
+    /// 0.9.4 — Applies the optional NVMe write-lifetime hint to
+    /// the journal file on Linux. No-op on other platforms (the
+    /// hint primitive is Linux-specific). No-op when `hint` is
+    /// `None`. Failure to set the hint (older kernel, FS
+    /// rejection, drive without multi-stream) is silently
+    /// ignored — the hint is advisory; missing it costs at most
+    /// some NAND garbage-collection efficiency, never
+    /// correctness.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    fn apply_write_lifetime_hint(file: &File, hint: Option<options::WriteLifetimeHint>) {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(h) = hint {
+                let ordinal: u8 = match h {
+                    options::WriteLifetimeHint::Short => 0,
+                    options::WriteLifetimeHint::Medium => 1,
+                    options::WriteLifetimeHint::Long => 2,
+                    options::WriteLifetimeHint::Extreme => 3,
+                };
+                let _ = crate::platform::linux::fcntl_set_rw_hint(file, ordinal);
+            }
+        }
+    }
+
     fn open_direct(path: &Path, options: JournalOptions) -> Result<Self> {
         // Resolve the resume cursor by scanning the existing file
         // (if any) for the last cleanly-decoded frame's end LSN.
@@ -323,6 +362,11 @@ impl JournalHandle {
         // back to a buffered handle (still functional, observable
         // via `is_direct_active`).
         let (file, direct_active) = open_direct_journal(path, sector_size)?;
+
+        // 0.9.4 — apply the optional NVMe write-lifetime hint.
+        // Same non-fatal-on-failure contract as the buffered
+        // constructor.
+        Self::apply_write_lifetime_hint(&file, options.write_lifetime_hint);
 
         // If Direct-IO was rejected by the filesystem
         // (`open_direct_journal` returned `direct_active = false`),
@@ -360,6 +404,7 @@ impl JournalHandle {
             direct: direct_active,
             log_buffer,
             observer: None,
+            sync_mode: options.sync_mode,
         })
     }
 
@@ -825,7 +870,18 @@ impl JournalHandle {
         // appenders may make progress during the call; their
         // writes may or may not be covered, depending on
         // kernel scheduling.
-        let sync_result = self.file.sync_data().map_err(Error::Io);
+        //
+        // 0.9.4: route through `sync_mode`. `Full` (default)
+        // keeps the pre-0.9.4 behaviour bit-for-bit
+        // (`file.sync_data()`); `Barrier` calls
+        // `platform::sync_barrier` which is cheaper on macOS
+        // with PLP, identical on Linux (fdatasync is already
+        // barrier-grade), no-op on Windows. See `SyncMode`
+        // docs for the safety contract.
+        let sync_result = match self.sync_mode {
+            options::SyncMode::Full => self.file.sync_data().map_err(Error::Io),
+            options::SyncMode::Barrier => crate::platform::sync_barrier(&self.file),
+        };
 
         // Re-acquire state to publish the result. If the fsync
         // failed, we still clear `in_flight` and notify
@@ -1919,6 +1975,81 @@ mod tests {
         let _ = j.append(b"unobserved").expect("append");
         let _ = j.append_batch(&[b"a" as &[u8], b"b", b"c"]).expect("batch");
         j.sync_through(j.next_lsn()).expect("sync");
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 0.9.4 — SyncMode + WriteLifetimeHint integration
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn sync_mode_full_round_trips_through_journal() {
+        // Default SyncMode::Full uses file.sync_data() — the
+        // pre-0.9.4 path. Bit-for-bit-preserved behaviour:
+        // append, sync_through, observe synced_lsn advance.
+        let path = tmp_path("sync_mode_full");
+        let _g = Cleanup(path.clone());
+        let opts = JournalOptions::new().sync_mode(options::SyncMode::Full);
+        let j = JournalHandle::open_with_options(&path, opts).expect("open");
+        let lsn = j.append(b"full-sync payload").expect("append");
+        j.sync_through(lsn).expect("sync_through full");
+        assert!(j.synced_lsn() >= lsn);
+    }
+
+    #[test]
+    fn sync_mode_barrier_round_trips_through_journal() {
+        // SyncMode::Barrier goes through platform::sync_barrier.
+        // On Linux it's fdatasync (same path); on Windows it's a
+        // no-op; on macOS it's F_BARRIERFSYNC. All three return
+        // Ok on a healthy fs — the journal's sync_through must
+        // complete and advance synced_lsn regardless of the
+        // underlying primitive.
+        let path = tmp_path("sync_mode_barrier");
+        let _g = Cleanup(path.clone());
+        let opts = JournalOptions::new().sync_mode(options::SyncMode::Barrier);
+        let j = JournalHandle::open_with_options(&path, opts).expect("open");
+        let lsn = j.append(b"barrier-sync payload").expect("append");
+        j.sync_through(lsn).expect("sync_through barrier");
+        assert!(j.synced_lsn() >= lsn);
+    }
+
+    #[test]
+    fn write_lifetime_hint_open_succeeds_for_every_variant() {
+        // The hint is advisory — every variant must succeed
+        // through open_with_options regardless of whether the
+        // host kernel / filesystem / drive actually honours it.
+        // On Linux ≥ 4.13 the fcntl runs; on every other
+        // platform it's a no-op. Either way, open must succeed
+        // and the journal must function normally.
+        for hint in [
+            options::WriteLifetimeHint::Short,
+            options::WriteLifetimeHint::Medium,
+            options::WriteLifetimeHint::Long,
+            options::WriteLifetimeHint::Extreme,
+        ] {
+            let path = tmp_path(&format!("rw_hint_{hint:?}"));
+            let _g = Cleanup(path.clone());
+            let opts = JournalOptions::new().write_lifetime_hint(Some(hint));
+            let j = JournalHandle::open_with_options(&path, opts)
+                .expect("open with write_lifetime_hint must succeed");
+            let lsn = j.append(b"hint payload").expect("append");
+            j.sync_through(lsn).expect("sync_through");
+            assert!(j.synced_lsn() >= lsn);
+        }
+    }
+
+    #[test]
+    fn sync_mode_and_lifetime_hint_compose() {
+        // Combining the two new options must work — no hidden
+        // ordering dependency between them.
+        let path = tmp_path("sync_and_hint");
+        let _g = Cleanup(path.clone());
+        let opts = JournalOptions::new()
+            .sync_mode(options::SyncMode::Barrier)
+            .write_lifetime_hint(Some(options::WriteLifetimeHint::Long));
+        let j = JournalHandle::open_with_options(&path, opts).expect("open");
+        let lsn = j.append(b"compose payload").expect("append");
+        j.sync_through(lsn).expect("sync_through");
+        assert!(j.synced_lsn() >= lsn);
     }
 
     #[test]

@@ -323,6 +323,52 @@ pub(crate) fn sync_full(file: &std::fs::File) -> crate::Result<()> {
     imp::sync_full(file)
 }
 
+/// 0.9.4 — Barrier-grade sync. Cheaper than [`sync_full`]
+/// where the platform supports it.
+///
+/// **Platform mapping:**
+/// - **macOS:** `fcntl(F_BARRIERFSYNC)` — ordering guarantee
+///   without forcing the drive to flush its write cache to
+///   media. Crash-safe **only** on drives with PLP (or when
+///   paired with an eventual `sync_full` at a commit
+///   boundary). Dramatically cheaper than `F_FULLFSYNC` on
+///   Apple Silicon NVMe.
+/// - **Linux:** `fdatasync(2)` — already barrier-grade by
+///   default; same as `sync_data`.
+/// - **Windows:** no-op. `FILE_FLAG_WRITE_THROUGH` already
+///   provides durable-on-return semantics for every write;
+///   there is no separate barrier primitive to call.
+/// - **Unknown:** falls back to `sync_data`.
+///
+/// **Used internally** by [`crate::JournalHandle::sync_through`]
+/// when the journal was opened with
+/// `JournalOptions::sync_mode(SyncMode::Barrier)`. The default
+/// `SyncMode::Full` retains the pre-0.9.4 behaviour (every
+/// `sync_through` calls `sync_data` → `fsync`/`F_FULLFSYNC`).
+#[inline]
+pub(crate) fn sync_barrier(file: &std::fs::File) -> crate::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        imp::sync_barrier(file)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // fdatasync IS the barrier-grade primitive on Linux.
+        imp::sync_data(file)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // WRITE_THROUGH already made every write durable on
+        // return; the per-handle file has nothing pending.
+        let _ = file;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        imp::sync_data(file)
+    }
+}
+
 /// Atomically renames `from` to `to`, replacing `to` if it exists.
 ///
 /// # Platform-specific behavior

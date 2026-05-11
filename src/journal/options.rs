@@ -66,6 +66,107 @@ pub(crate) const MAX_GROUP_COMMIT_MAX_BATCH: u32 = 4096;
 /// indefinitely.
 pub(crate) const MAX_GROUP_COMMIT_WINDOW: Duration = Duration::from_millis(100);
 
+/// 0.9.4 — NVMe write-lifetime hint applied to the journal file.
+///
+/// Linux exposes `F_SET_RW_HINT` (kernel ≥ 4.13) for telling the
+/// storage stack the expected lifetime of data the application
+/// is about to write. NVMe drives with multi-stream support use
+/// the hint to **cluster similar-lifetime data into the same
+/// NAND erase block**, dramatically reducing garbage-collection
+/// write amplification on log-structured workloads. Drives
+/// without multi-stream silently ignore the hint — it's a hint,
+/// not a contract.
+///
+/// **For journal workloads**, `Long` is almost always the right
+/// answer: WAL records, redo logs, and append-only ledgers
+/// have a long, predictable on-disk lifetime — they live until
+/// a checkpoint truncates the journal. Telling the drive this
+/// lets it pack journal data together and away from short-lived
+/// data (page-cache writeback, scratch files), so the GC churn
+/// on the journal's NAND blocks drops.
+///
+/// **Platforms**: Linux only. macOS / Windows / unknown
+/// silently ignore the hint (no equivalent primitive, no
+/// degradation in semantics).
+///
+/// `None` (the default) leaves the file's hint at the system
+/// default (`NOT_SET`). Pre-0.9.4 behaviour preserved exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WriteLifetimeHint {
+    /// `RWH_WRITE_LIFE_SHORT` — short-lived data (page-cache
+    /// writeback, tmp files). Not normally appropriate for a
+    /// journal.
+    Short,
+    /// `RWH_WRITE_LIFE_MEDIUM` — medium lifetime.
+    Medium,
+    /// `RWH_WRITE_LIFE_LONG` — long-lived data. The right
+    /// choice for nearly every journal workload.
+    Long,
+    /// `RWH_WRITE_LIFE_EXTREME` — data that lives essentially
+    /// forever (database table files, archive logs). Stronger
+    /// than `Long`; appropriate for journals that rarely
+    /// truncate (e.g. permanent audit logs).
+    Extreme,
+}
+
+/// 0.9.4 — Per-`sync_through` durability primitive selection.
+///
+/// `Full` is the default — `sync_through` calls the platform's
+/// full media-durability primitive (`fsync` on Linux,
+/// `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows). This
+/// matches pre-0.9.4 behaviour exactly.
+///
+/// `Barrier` opts the journal into the cheaper barrier-grade
+/// primitive where one exists. See the variant docs for the
+/// per-platform semantics and the safety contract — this mode
+/// is **only** appropriate on drives with PLP (power-loss
+/// protection) or under explicit eventual-`sync_full` discipline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SyncMode {
+    /// Full media-durability sync. Default. Every
+    /// `JournalHandle::sync_through` call invokes:
+    /// - Linux: `fsync(2)` via `file.sync_data()` (which on
+    ///   Linux maps to `fdatasync` — already barrier-grade for
+    ///   our purposes).
+    /// - macOS: `fcntl(F_FULLFSYNC)` — forces the drive to
+    ///   flush its volatile write cache to media.
+    /// - Windows: `FlushFileBuffers` — equivalent to
+    ///   `FILE_FLAG_WRITE_THROUGH` write completion.
+    ///
+    /// Safe on every drive, every workload. Pays the full
+    /// media-durability cost on macOS even when the drive has
+    /// PLP.
+    #[default]
+    Full,
+    /// Barrier-grade sync — provides ordering and write-cache
+    /// commit without forcing a full media flush. Cheaper than
+    /// `Full` on macOS (dramatically so on Apple Silicon NVMe),
+    /// identical on Linux (`fdatasync` is already barrier-grade),
+    /// no-op on Windows (`FILE_FLAG_WRITE_THROUGH` already
+    /// provides durable-on-return semantics).
+    ///
+    /// **Crash-safety contract.** `Barrier` mode is correct
+    /// **only** under one of:
+    /// 1. The drive has PLP confirmed (see
+    ///    [`crate::Handle::is_plp_protected`]). PLP guarantees
+    ///    data in the drive's write cache survives power
+    ///    failure, so the barrier's "committed to device" is
+    ///    sufficient.
+    /// 2. The caller follows up with an eventual `sync_full`
+    ///    (`SyncMode::Full`) at a commit boundary — e.g. a
+    ///    database transaction commit. Barrier syncs between
+    ///    those commit boundaries provide ordering; the final
+    ///    full sync flushes the cache.
+    ///
+    /// Choosing `Barrier` on a drive **without** PLP and
+    /// **without** eventual full-sync discipline is a
+    /// data-durability bug. The library cannot enforce this —
+    /// it's a contract callers opt into by name.
+    Barrier,
+}
+
 /// Per-journal opt-in configuration.
 ///
 /// Construct via [`JournalOptions::new`] (or [`Default::default`])
@@ -105,6 +206,22 @@ pub struct JournalOptions {
     /// once at least this many followers have joined. New in
     /// 0.9.1; default `8`.
     pub(crate) group_commit_max_batch: u32,
+    /// 0.9.4 — per-`sync_through` durability primitive choice.
+    /// Default [`SyncMode::Full`] preserves pre-0.9.4 behaviour
+    /// (every `sync_through` invokes the platform's full
+    /// media-durability sync). [`SyncMode::Barrier`] opts into
+    /// the cheaper barrier-grade primitive on macOS (PLP drives
+    /// only) and is a no-op on other platforms — see
+    /// [`SyncMode::Barrier`] for the safety contract.
+    pub(crate) sync_mode: SyncMode,
+    /// 0.9.4 — optional NVMe write-lifetime hint applied via
+    /// `fcntl(F_SET_RW_HINT)` at journal-open time (Linux
+    /// only). `None` leaves the file's hint at the system
+    /// default (pre-0.9.4 behaviour). `Some(WriteLifetimeHint::Long)`
+    /// is the typical journal choice — lets multi-stream NVMe
+    /// cluster journal data into long-lived NAND blocks,
+    /// reducing GC write amplification.
+    pub(crate) write_lifetime_hint: Option<WriteLifetimeHint>,
 }
 
 impl Default for JournalOptions {
@@ -117,7 +234,8 @@ impl JournalOptions {
     /// Returns a fresh `JournalOptions` with library-default values:
     /// `direct = false`, `log_buffer_kib = 64`,
     /// `group_commit_window = Some(500 µs)`,
-    /// `group_commit_max_batch = 8`. Equivalent to
+    /// `group_commit_max_batch = 8`,
+    /// `sync_mode = SyncMode::Full`. Equivalent to
     /// [`Default::default`].
     pub fn new() -> Self {
         Self {
@@ -125,6 +243,8 @@ impl JournalOptions {
             log_buffer_kib: DEFAULT_LOG_BUFFER_KIB,
             group_commit_window: DEFAULT_GROUP_COMMIT_WINDOW,
             group_commit_max_batch: DEFAULT_GROUP_COMMIT_MAX_BATCH,
+            sync_mode: SyncMode::Full,
+            write_lifetime_hint: None,
         }
     }
 
@@ -256,6 +376,56 @@ impl JournalOptions {
             max_batch.clamp(MIN_GROUP_COMMIT_MAX_BATCH, MAX_GROUP_COMMIT_MAX_BATCH);
         self
     }
+
+    /// 0.9.4 — Selects the durability primitive used by
+    /// [`crate::JournalHandle::sync_through`].
+    ///
+    /// Default [`SyncMode::Full`] preserves pre-0.9.4 behaviour
+    /// (every `sync_through` invokes the platform's full
+    /// media-durability sync — `fsync` on Linux, `F_FULLFSYNC`
+    /// on macOS, `FlushFileBuffers` on Windows).
+    ///
+    /// [`SyncMode::Barrier`] opts into the barrier-grade
+    /// primitive — cheaper than `Full` on macOS (especially
+    /// Apple Silicon NVMe), identical on Linux (`fdatasync` is
+    /// already barrier-grade), no-op on Windows. Crash-safe
+    /// **only** on drives with PLP or under explicit
+    /// eventual-`sync_full` discipline at commit boundaries.
+    /// See [`SyncMode::Barrier`] for the full safety contract.
+    ///
+    /// Typical use: a database paired with
+    /// [`crate::Handle::is_plp_protected`] — if the drive
+    /// reports PLP, open the journal with `Barrier` for the
+    /// dramatically cheaper macOS sync path; otherwise use the
+    /// default `Full`.
+    pub fn sync_mode(mut self, mode: SyncMode) -> Self {
+        self.sync_mode = mode;
+        self
+    }
+
+    /// 0.9.4 — Sets the NVMe write-lifetime hint to apply at
+    /// journal-open time via `fcntl(F_SET_RW_HINT)` on Linux.
+    ///
+    /// Setting `Some(WriteLifetimeHint::Long)` is the canonical
+    /// journal-workload choice. Multi-stream NVMe drives use the
+    /// hint to cluster long-lived journal data into NAND blocks
+    /// separate from short-lived writes (page-cache flush, scratch
+    /// files), reducing garbage-collection write amplification on
+    /// the journal's blocks. Drives without multi-stream support
+    /// silently ignore the hint.
+    ///
+    /// **Platforms.** Linux only. macOS / Windows / unknown
+    /// silently ignore the call (no equivalent primitive) — the
+    /// builder method is universal so callers don't need to
+    /// `cfg` around it.
+    ///
+    /// **Default `None`** leaves the file's hint at the system
+    /// default. Pre-0.9.4 behaviour preserved exactly when the
+    /// method is not called.
+    pub fn write_lifetime_hint(mut self, hint: Option<WriteLifetimeHint>) -> Self {
+        self.write_lifetime_hint = hint;
+        self
+    }
 }
 
 /// Internal: opens a journal honoring `options`. Called by
@@ -346,5 +516,70 @@ mod tests {
 
         let o = JournalOptions::new().group_commit_max_batch(64);
         assert_eq!(o.group_commit_max_batch, 64);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 0.9.4 — SyncMode + WriteLifetimeHint coverage
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn default_sync_mode_is_full() {
+        // SyncMode::Full preserves pre-0.9.4 behaviour. Default
+        // must NEVER silently downgrade to Barrier without a
+        // caller opting in — the safety contract requires
+        // explicit acknowledgement of the PLP requirement.
+        let o = JournalOptions::default();
+        assert_eq!(o.sync_mode, SyncMode::Full);
+    }
+
+    #[test]
+    fn sync_mode_round_trips() {
+        let o = JournalOptions::new().sync_mode(SyncMode::Barrier);
+        assert_eq!(o.sync_mode, SyncMode::Barrier);
+        let o = o.sync_mode(SyncMode::Full);
+        assert_eq!(o.sync_mode, SyncMode::Full);
+    }
+
+    #[test]
+    fn default_write_lifetime_hint_is_none() {
+        // None means "leave at system default" — pre-0.9.4
+        // behaviour preserved exactly. The hint is opt-in.
+        let o = JournalOptions::default();
+        assert_eq!(o.write_lifetime_hint, None);
+    }
+
+    #[test]
+    fn write_lifetime_hint_round_trips() {
+        for hint in [
+            WriteLifetimeHint::Short,
+            WriteLifetimeHint::Medium,
+            WriteLifetimeHint::Long,
+            WriteLifetimeHint::Extreme,
+        ] {
+            let o = JournalOptions::new().write_lifetime_hint(Some(hint));
+            assert_eq!(o.write_lifetime_hint, Some(hint));
+        }
+        // Setting None explicitly leaves the file at the system
+        // default — same as never calling the method.
+        let o = JournalOptions::new().write_lifetime_hint(None);
+        assert_eq!(o.write_lifetime_hint, None);
+    }
+
+    #[test]
+    fn sync_mode_is_copy_and_eq() {
+        // SyncMode is `Copy + Eq` so callers can stash it in
+        // fields, compare it cheaply, and pass it by value.
+        let a = SyncMode::Full;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(SyncMode::Full, SyncMode::Barrier);
+    }
+
+    #[test]
+    fn write_lifetime_hint_is_copy_and_eq() {
+        let a = WriteLifetimeHint::Long;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(WriteLifetimeHint::Short, WriteLifetimeHint::Long);
     }
 }

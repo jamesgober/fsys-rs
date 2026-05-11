@@ -100,6 +100,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default — fsys never lies about an atomic-write guarantee
   it couldn't confirm.
 
+### Added — 0.9.4 (second pass — pre-publish addition)
+
+These items were originally queued for 0.9.5 in the first draft
+of this CHANGELOG, then pulled into 0.9.4 before publish on the
+basis that they have no architectural dependencies and the
+"defer to next patch" reasoning was scope convenience, not a
+real blocker.
+
+- **`JournalOptions::sync_mode(SyncMode)`** +
+  **`crate::SyncMode`** enum (`Full` / `Barrier`) — selects the
+  durability primitive used by every
+  [`crate::JournalHandle::sync_through`] call. **Default
+  `Full`** preserves pre-0.9.4 behaviour exactly (every
+  `sync_through` invokes the platform's full media-durability
+  sync). **`Barrier`** opts into the cheaper barrier-grade
+  primitive where one exists:
+  - **macOS**: `fcntl(F_BARRIERFSYNC)` — ordering guarantee
+    without forcing the drive's volatile write cache to flush
+    to media. **Dramatically cheaper than `F_FULLFSYNC`** on
+    Apple Silicon NVMe (typically 10–100× depending on dirty
+    page count).
+  - **Linux**: `fdatasync(2)` — already barrier-grade by
+    default; `Barrier` is observably identical to `Full` on
+    the Linux path here.
+  - **Windows**: no-op (`FILE_FLAG_WRITE_THROUGH` makes every
+    write durable on return; there's no separate barrier
+    primitive).
+  - **Other**: falls back to `sync_data`.
+  - **Crash-safety contract.** `Barrier` is correct **only**
+    on drives with PLP (see [`crate::Handle::is_plp_protected`])
+    OR under explicit eventual-`Full`-sync discipline at
+    commit boundaries. The library cannot enforce this — it's
+    a contract callers opt into by name. Documented in detail
+    on the `SyncMode::Barrier` doc comment.
+  - **Integration pattern for DBs**: `if h.is_plp_protected() {
+    opts.sync_mode(SyncMode::Barrier) } else { opts /* Full */ }`.
+    On macOS + PLP drive, this single line is the largest
+    sync-cost reduction the API exposes.
+- **`JournalOptions::write_lifetime_hint(Option<WriteLifetimeHint>)`**
+  + **`crate::WriteLifetimeHint`** enum
+  (`Short` / `Medium` / `Long` / `Extreme`) — applies an NVMe
+  write-lifetime hint to the journal file at open time via
+  `fcntl(F_SET_RW_HINT)` (Linux ≥ 4.13). Multi-stream NVMe
+  drives use the hint to cluster similar-lifetime data into
+  the same NAND erase blocks, reducing garbage-collection
+  write amplification on log-structured workloads.
+  - **Typical journal choice**: `Some(WriteLifetimeHint::Long)`
+    — WAL records live until checkpoint truncation; telling
+    the drive this lets it cluster journal data away from
+    short-lived page-cache writeback.
+  - **Default `None`** leaves the file's hint at the system
+    default (pre-0.9.4 behaviour).
+  - **Platforms**: Linux only does the work; macOS / Windows /
+    unknown silently ignore the call. The builder method is
+    universal so callers don't need to `cfg` around it.
+  - **Failure non-fatal**: older kernels (< 4.13), drives
+    without multi-stream support, and filesystems that
+    reject the fcntl all silently swallow the call —
+    consistent with the hint's advisory nature.
+- **`crate::platform::sync_barrier`** (new internal helper) +
+  **`crate::platform::macos::sync_barrier`** (Apple-specific
+  primitive) — backs `SyncMode::Barrier`. Cross-platform
+  dispatch in `platform::mod.rs` routes to the right primitive
+  per OS.
+- **`crate::platform::linux::fcntl_set_rw_hint`** (Linux
+  internal helper) — backs `WriteLifetimeHint`. Issues the
+  `F_SET_RW_HINT` fcntl via `libc`; non-fatal on failure.
+- **`JournalHandle::apply_write_lifetime_hint`** (Linux
+  conditional) — called from both `open_buffered` and
+  `open_direct` after the file is opened. No-op when
+  `WriteLifetimeHint` is `None` or on non-Linux platforms.
+
 ### Performance — 0.9.4
 
 The headline append/journal numbers are **unchanged** from
@@ -136,9 +208,17 @@ are workload-shape-dependent.
 
 ### Tests — 0.9.4
 
-- **+2 cross-platform lib tests** (409 → 411 on Windows): both
+- **+12 cross-platform lib tests** (409 → 421 on Windows): 2
   on `Handle::atomic_write_unit` (well-formed return value;
-  round-trip equivalence with `DriveInfo::nawupf_lba`).
+  round-trip equivalence with `DriveInfo::nawupf_lba`); 6 in
+  `JournalOptions` (default `SyncMode = Full`,
+  `sync_mode` round-trip, default
+  `write_lifetime_hint = None`, hint round-trip across all 4
+  variants, `Copy + Eq` semantics for both enums); 4 in
+  `journal::tests` (end-to-end open + append + sync with
+  `SyncMode::Full`, `SyncMode::Barrier`, all four
+  `WriteLifetimeHint` variants, and the two options composed
+  together).
 - **+7 Linux-cfg-gated tests** (415 → 422 on Linux): 3 in
   `iouring_features` (DEFER ⇒ SINGLE invariant, cache
   stability, builds-without-panic); 1 in `linux_iouring`
@@ -147,7 +227,7 @@ are workload-shape-dependent.
   `0xFFFF` sentinel → `None`, zero → `Some(0)` for 1-LBA
   guarantee).
 - All 0.9.3 tests pass unchanged.
-  `cargo test --all-features` on Windows: **647 passing**,
+  `cargo test --all-features` on Windows: **657 passing**,
   0 failed, 7 ignored (manual benches).
 - `cargo clippy --all-targets --all-features -- -D warnings`:
   clean.
@@ -158,9 +238,15 @@ are workload-shape-dependent.
   the existing `io-uring = "0.6"` crate; NVMe Identify
   Namespace uses the existing `libc` dependency.
 - **No breaking changes.** Every 0.9.3 caller compiles
-  unchanged. New public surface (`Handle::atomic_write_unit`,
-  `DriveInfo::nawun_lba`, `DriveInfo::nawupf_lba`) is
-  strictly additive.
+  unchanged. New public surface
+  (`Handle::atomic_write_unit`, `DriveInfo::nawun_lba`,
+  `DriveInfo::nawupf_lba`, `crate::SyncMode`,
+  `crate::WriteLifetimeHint`,
+  `JournalOptions::sync_mode`,
+  `JournalOptions::write_lifetime_hint`) is strictly additive.
+  Both new enums are `#[non_exhaustive]` so future variants
+  can land in patch releases without breaking exhaustive
+  matches.
 - **`DriveInfo` is `#[non_exhaustive]` via `pub use`** —
   callers constructing `DriveInfo` directly (rare; the
   intended path is the cached `hardware::drive()`) would
@@ -172,33 +258,54 @@ are workload-shape-dependent.
   unknown platforms see no compile-time or runtime change
   from 0.9.4.
 
-### Queued for 0.9.5 ("Direct-mode + register-tier + 1.0-RC prep")
+### Committed for 0.9.5 — load-bearing scope, not stretch goals
 
-The original 0.9.4 plan included `IORING_REGISTER_FILES` and
-`IORING_REGISTER_BUFFERS`. Both require architectural changes
-to the owner-thread design (current rings carry raw fds in
-each SQE; registered files need a per-handle fd table
-maintained on the owner thread). Deferred to 0.9.5 where the
-journal substrate's `native_ring` already owns a per-handle
-ring — the integration point is more contained there.
+Two items are committed for 0.9.5 with **legitimate
+architectural dependencies** — these are the only deferrals
+from 0.9.4 the maintainer accepted, and both ship as
+load-bearing features (no "maybe later," no scope churn):
 
-- **`IORING_REGISTER_FILES`** — fixed fd table. Saves
-  per-SQE fd validation cost on rings doing many ops per
-  second on a small set of fds (the journal hot path).
-- **`IORING_REGISTER_BUFFERS`** — zero-copy DMA from
-  registered buffer pool with `IORING_OP_WRITE_FIXED`.
-  Buffers must be pinned in memory; the existing aligned
-  buffer pool is the natural integration point.
-- **Double-buffered Direct-mode log buffer** (active +
-  flushing) — decouples journal-append latency from
-  flush latency in `JournalOptions::direct(true)`.
-- **macOS `F_BARRIERFSYNC`** — cheaper than `F_FULLFSYNC`
-  with the same atomicity guarantee.
-- **`F_SET_RW_HINT`** for journal append (Linux NVMe
-  write-lifetime hint).
-- **NVMe `WRITE ZEROES` / `DEALLOCATE`** for fast
-  truncate + hole-punch via device command.
-- **Final audit + polish + 1.0-RC stability commitment doc.**
+- **Double-buffered Direct-mode log buffer (active + flushing).**
+  **Dependency:** the current `Mutex<LogBuffer>` in
+  `JournalHandle` serializes appends against in-flight
+  flushes. Decoupling requires splitting the coordination
+  primitive — separate mutex for the active buffer slot,
+  separate tracking for the flushing slot, and backpressure
+  for when both slots fill faster than they drain. That
+  state-machine split doesn't exist yet; building it carefully
+  (without breaking the existing Direct-mode crash-safety
+  contract) is the 0.9.5 task. **Win when shipped:**
+  appends continue against the active buffer while the
+  dormant buffer is being written out, eliminating the
+  flush-blocks-appends serialization that the audit (J10)
+  identified.
+- **NVMe `WRITE ZEROES` / `DEALLOCATE`.** **Dependency:** no
+  file-extent-to-LBA-range mapping helper exists in fsys.
+  Building a `fiemap(2)` wrapper that correctly handles the
+  `FIEMAP_EXTENT_LAST` / `_UNKNOWN` / `_NOT_ALIGNED` flag
+  semantics, coalesces ranges into the NVMe DSM command
+  format (up to 256 ranges per command), and integrates with
+  a Direct-IO-aware `Handle::truncate` / `Handle::punch_hole`
+  is the gating work for 0.9.5. **Win when shipped:** fast
+  truncate / hole-punch via device command, important for
+  WAL workloads that pre-allocate then trim large segments.
+- **`IORING_REGISTER_FILES` + `IORING_REGISTER_BUFFERS`.**
+  **Dependency:** owner-thread architecture rework. The
+  current `IoUringRing` design carries raw fds in each SQE;
+  fixed-fd registration needs a per-handle fd table
+  maintained on the owner thread, and registered buffers
+  need pinned-memory lifetime management. The integration
+  point is more contained inside the journal substrate's
+  `native_ring` where the per-handle ring already exists.
+  **Win when shipped:** zero-copy DMA from registered
+  buffer pool via `IORING_OP_WRITE_FIXED`; fewer per-SQE fd
+  validation cycles.
+
+0.9.5 lands all three as load-bearing features. **0.9.6 is
+the final-polish + 1.0-RC-prep tag** — documentation
+refresh, codebase audit, canonical Linux benchmarks, updated
+examples, final review, 1.0 stability commitment doc.
+**No new features in 0.9.6.**
 
 ## [0.9.3] - 2026-05-11
 

@@ -269,7 +269,8 @@ pub use crate::builder::{Builder, Workload};
 pub use crate::error::{BatchError, Error, Result};
 pub use crate::handle::Handle;
 pub use crate::journal::{
-    JournalHandle, JournalOptions, JournalReader, JournalRecord, JournalTailState, Lsn,
+    JournalHandle, JournalOptions, JournalReader, JournalRecord, JournalTailState, Lsn, SyncMode,
+    WriteLifetimeHint,
 };
 pub use crate::meta::{DirEntry, FileMeta, Permissions};
 pub use crate::method::Method;

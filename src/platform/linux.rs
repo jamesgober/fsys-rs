@@ -326,6 +326,44 @@ pub(crate) fn sync_data(file: &File) -> Result<()> {
     }
 }
 
+/// 0.9.4 — Sets the per-file NVMe write-lifetime hint via
+/// `fcntl(F_SET_RW_HINT)` (kernel ≥ 4.13).
+///
+/// Linux exposes four predefined hint values; we accept a
+/// 0-based discriminant matching the order
+/// `Short / Medium / Long / Extreme` and convert to the kernel
+/// constants `RWH_WRITE_LIFE_{SHORT,MEDIUM,LONG,EXTREME}`
+/// (`1, 2, 3, 4`).
+///
+/// Failure is non-fatal — kernels older than 4.13, drives
+/// without multi-stream support, or filesystems that reject
+/// the fcntl will return an error which the journal-open path
+/// swallows. The hint is advisory; missing it costs at most
+/// some NAND-GC efficiency, never correctness.
+pub(crate) fn fcntl_set_rw_hint(file: &File, hint_ordinal: u8) -> Result<()> {
+    // kernel uapi:
+    //   #define F_SET_RW_HINT   1036
+    //   RWH_WRITE_LIFE_NOT_SET = 0
+    //   RWH_WRITE_LIFE_NONE    = 1
+    //   RWH_WRITE_LIFE_SHORT   = 2
+    //   RWH_WRITE_LIFE_MEDIUM  = 3
+    //   RWH_WRITE_LIFE_LONG    = 4
+    //   RWH_WRITE_LIFE_EXTREME = 5
+    // We re-order our enum so Short=0..Extreme=3 maps to kernel
+    // SHORT(2)..EXTREME(5) by adding 2.
+    const F_SET_RW_HINT: libc::c_int = 1036;
+    let kernel_hint: u64 = (hint_ordinal as u64).saturating_add(2);
+    let fd = file.as_raw_fd();
+    // SAFETY: fd is a valid open file descriptor; the third
+    // argument to F_SET_RW_HINT is a `u64 *` (per uapi headers).
+    let ret = unsafe { libc::fcntl(fd, F_SET_RW_HINT, &kernel_hint as *const u64) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::last_os_error()))
+    }
+}
+
 pub(crate) fn sync_full(file: &File) -> Result<()> {
     let fd = file.as_raw_fd();
     // SAFETY: fd is a valid open file descriptor.
