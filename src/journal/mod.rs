@@ -322,26 +322,23 @@ impl JournalHandle {
     /// last-clean LSN and rehydrates the partial trailing sector
     /// into the buffer.
     /// 0.9.4 — Applies the optional NVMe write-lifetime hint to
-    /// the journal file on Linux. No-op on other platforms (the
-    /// hint primitive is Linux-specific). No-op when `hint` is
-    /// `None`. Failure to set the hint (older kernel, FS
-    /// rejection, drive without multi-stream) is silently
-    /// ignored — the hint is advisory; missing it costs at most
-    /// some NAND garbage-collection efficiency, never
-    /// correctness.
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    /// the journal file. Delegates to
+    /// [`crate::platform::set_write_lifetime_hint`] which is a
+    /// real `fcntl(F_SET_RW_HINT)` on Linux and a no-op on every
+    /// other platform. No-op when `hint` is `None`. Failure to
+    /// set the hint (older kernel, FS rejection, drive without
+    /// multi-stream support) is silently ignored — the hint is
+    /// advisory; missing it costs at most some NAND
+    /// garbage-collection efficiency, never correctness.
     fn apply_write_lifetime_hint(file: &File, hint: Option<options::WriteLifetimeHint>) {
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(h) = hint {
-                let ordinal: u8 = match h {
-                    options::WriteLifetimeHint::Short => 0,
-                    options::WriteLifetimeHint::Medium => 1,
-                    options::WriteLifetimeHint::Long => 2,
-                    options::WriteLifetimeHint::Extreme => 3,
-                };
-                let _ = crate::platform::linux::fcntl_set_rw_hint(file, ordinal);
-            }
+        if let Some(h) = hint {
+            let ordinal: u8 = match h {
+                options::WriteLifetimeHint::Short => 0,
+                options::WriteLifetimeHint::Medium => 1,
+                options::WriteLifetimeHint::Long => 2,
+                options::WriteLifetimeHint::Extreme => 3,
+            };
+            let _ = crate::platform::set_write_lifetime_hint(file, ordinal);
         }
     }
 
