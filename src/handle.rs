@@ -1272,7 +1272,20 @@ impl Handle {
     /// `pub(crate)` — used by [`Batch::commit`] in `batch.rs` to avoid
     /// exposing the pipeline field directly to that module.
     pub(crate) fn submit_batch(&self, ops: Vec<BatchOp>) -> std::result::Result<(), BatchError> {
-        self.pipeline.submit(ops, self.snapshot())
+        self.pipeline.submit(ops, self.snapshot(), false)
+    }
+
+    /// 0.9.3: grouped-commit variant of [`Self::submit_batch`].
+    /// Routes the same op vector through the dispatcher with the
+    /// `grouped` flag set, so per-op `sync_parent_dir` calls are
+    /// skipped and replaced by one `sync_parent_dir` per unique
+    /// parent directory after the entire batch succeeds. Backs
+    /// [`crate::Batch::commit_grouped`].
+    pub(crate) fn submit_batch_grouped(
+        &self,
+        ops: Vec<BatchOp>,
+    ) -> std::result::Result<(), BatchError> {
+        self.pipeline.submit(ops, self.snapshot(), true)
     }
 
     /// Async equivalent of [`submit_batch`]. Routes through
@@ -1283,7 +1296,9 @@ impl Handle {
         &self,
         ops: Vec<BatchOp>,
     ) -> std::result::Result<(), BatchError> {
-        self.pipeline.submit_async(ops, self.snapshot()).await
+        self.pipeline
+            .submit_async(ops, self.snapshot(), false)
+            .await
     }
 }
 

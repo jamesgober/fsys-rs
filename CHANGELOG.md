@@ -5,6 +5,198 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] - 2026-05-11
+
+> **Pipeline throughput tier.** 0.9.3 lifts the one-core ceiling
+> from the group-lane dispatcher and adds a parent-dir-fsync
+> amortisation primitive — the two highest-value cross-platform
+> items from the 0.9.2 audit's "Queued for 0.10.x" list. Both are
+> internal architecture improvements behind additive public APIs:
+> a sharded dispatcher fleet (`Builder::dispatcher_shards(N)`) and
+> a grouped-commit batch primitive (`Batch::commit_grouped()`).
+> Every 0.9.2 caller compiles unchanged; defaults preserve
+> pre-0.9.3 behaviour bit-for-bit (single dispatcher, per-op
+> parent-dir fsync).
+
+### Added — 0.9.3
+
+- **`Builder::dispatcher_shards(N)`** + sharded
+  [`crate::pipeline::Pipeline`] internals — N independent
+  dispatcher threads per handle, each with its own bounded MPMC
+  queue. Batches are routed to a shard via stable hash of the
+  first op's primary path (FxHash via `DefaultHasher`); all ops
+  inside one `Batch::commit()` always land on the same shard so
+  the within-batch submission-order contract is preserved.
+  - **The lever this fixes.** Pre-0.9.3 every group-lane batch
+    from a shared handle funneled through one dispatcher
+    thread — a hard one-core ceiling for concurrent batch
+    submitters writing to different files (the canonical HiveDB
+    SST flush shape, for instance). With `N` shards, the
+    pipeline scales near-linearly with concurrent submitters
+    up to `min(N, num_cpus::get())`.
+  - **Cross-batch ordering.** Across shards, cross-batch
+    ordering is **not** guaranteed — but it was never
+    guaranteed at the pipeline level pre-0.9.3 either.
+    Within-batch order remains strict.
+  - **Aggregate queue depth scales with shard count.** With
+    `batch_queue_max(1024)` and `dispatcher_shards(8)`, the
+    pipeline holds 8 × 1024 = 8 K batches in flight.
+  - **Default `dispatcher_shards = 1`** — pre-0.9.3 behaviour
+    preserved exactly. Single dispatcher, single queue, single
+    thread. No observable change for callers who don't opt in.
+  - Clamped to `1..=64`. The `> 64` ceiling reflects that
+    pathological values offer no benefit on any realistic host;
+    `num_cpus::get()` is the natural target.
+  - **Shutdown** drains and joins every shard in parallel
+    under the same per-shard 5-second hard timeout used
+    pre-0.9.3. Drop completes deterministically.
+  - **Thread naming**: with `N = 1`, the dispatcher keeps the
+    original `fsys-dispatcher` name (observability tooling
+    pinned to it doesn't break); with `N > 1`, threads are
+    named `fsys-dispatcher-<idx>` for `<idx>` in `0..N`.
+  - **9 new tests** in `src/pipeline/mod.rs`: `pick_shard`
+    determinism, op-variant coverage, empty-batch handling,
+    single-shard parity, 4-shard multi-path execution,
+    8-thread × 16-batch concurrent stress, clean shutdown
+    drain.
+- **`Batch::commit_grouped()`** — parent-directory `fsync`
+  amortisation. Same path resolution + dispatch contract as
+  `Batch::commit()`; the dispatcher accumulates unique parent
+  directories of write/copy ops and issues exactly one
+  `sync_parent_dir` per unique parent after the entire batch
+  succeeds, instead of paying one per op.
+  - **The numbers.** A typical "flush 1024 SST files into one
+    directory" batch pays 1024 `sync_parent_dir` syscalls under
+    `commit()` and exactly **one** under `commit_grouped()`. On
+    Linux + ext4 each `sync_parent_dir` is a real `fsync(dirfd)`
+    on the directory file descriptor — microseconds to
+    milliseconds depending on dirty-page load. On Windows the
+    call is a no-op (directory durability is implicit under
+    `FILE_FLAG_WRITE_THROUGH`), so `commit_grouped()` is
+    observably equivalent to `commit()` on Windows.
+  - **Trade-off (documented).** Under `commit()`, every op is
+    individually durable on return (including its dirent
+    update). Under `commit_grouped()`, ops are durable *as a
+    set* on return — a crash mid-batch may leave a prefix of
+    the renames visible while the dirent updates have not yet
+    landed on the filesystem journal. The per-op DATA fsync
+    still runs, so every successfully-completed op's content
+    is on disk regardless. Callers that need per-op dirent
+    durability stay on `commit()`.
+  - **5 new tests** in `src/batch.rs`: in-order execution,
+    mixed ops into one directory, empty-batch handling,
+    failure-index reporting, path-resolution rejection.
+
+### Changed — 0.9.3
+
+- **`crate::pipeline::Pipeline::submit{_async}`** internal
+  signatures gained a `grouped: bool` parameter. Crate-internal
+  only — no public-API impact. Existing callers
+  (`Handle::submit_batch`, `Handle::submit_batch_async`) pass
+  `false`; the new `Handle::submit_batch_grouped` passes `true`.
+- **Group-dispatcher executor signature**
+  (`crate::pipeline::group::process_jobs_with`) now takes
+  `Fn(BatchOp, &HandleSnapshot, bool)` — third parameter is
+  the per-job `grouped` flag. The production executor
+  (`execute_op`) and its inner `execute_write` / `execute_copy`
+  consult the flag to skip per-op `sync_parent_dir`. Internal-
+  only refactor; test executors in
+  `src/pipeline/group.rs`'s panic-safety tests were updated to
+  the new signature.
+- **`PipelineConfig`** internally gained a
+  `dispatcher_shards: usize` field with default `1`. Exposed
+  via `Builder::dispatcher_shards(N)`; not part of the public
+  API (the struct is `pub(crate)`).
+
+### Performance — 0.9.3
+
+The headline append/journal numbers are **unchanged** from
+0.9.2 — 0.9.3 is pipeline-tier work, orthogonal to the journal
+hot paths.
+
+Expected wins on the canonical workloads:
+- **Sharded dispatcher, 8 concurrent submitters → 4 shards on a
+  4-core host:** ~3.5–3.8× aggregate batch throughput vs
+  `dispatcher_shards = 1`. Per-thread latency unchanged; ceiling
+  removed.
+- **`commit_grouped` on a 256-file SST flush into one directory:**
+  approximately one `sync_parent_dir` syscall instead of 256.
+  Linux: ~256× reduction in dirent fsync syscalls (per-syscall
+  cost is workload-dependent — ext4 with `data=ordered` typically
+  100 µs each, so ~25 ms saved per batch on a contended
+  filesystem). Windows: zero observable change (sync_parent_dir
+  is already a no-op).
+
+Capture canonical numbers on the bare-metal Linux NVMe reference
+box when a Linux runner becomes available — these projections
+are based on syscall accounting, not measured throughput.
+
+### Tests — 0.9.3
+
+- **+14 new lib tests** (395 → 409): 9 sharded dispatcher cases
+  (pick_shard determinism, empty-batch, N=1 parity, multi-path
+  execution, 8-thread × 16-batch concurrent stress, clean
+  shutdown), 5 commit_grouped cases (in-order, mixed-ops,
+  empty, failure-index, path-resolution).
+- All 0.9.2 tests pass unchanged.
+  `cargo test --all-features`: **645 passing**, 0 failed, 7
+  ignored (manual benches).
+- `cargo clippy --all-targets --all-features -- -D warnings`:
+  clean.
+
+### Notes — 0.9.3
+
+- **No new runtime dependencies.** Sharded dispatcher uses
+  `std::collections::hash_map::DefaultHasher` (already in std);
+  commit_grouped uses `std::collections::BTreeMap` (already in
+  std).
+- **No breaking changes.** Every 0.9.2 caller compiles
+  unchanged. The new `Builder::dispatcher_shards` method is
+  additive; the default value `1` preserves pre-0.9.3 behaviour
+  bit-for-bit. The new `Batch::commit_grouped()` method is
+  additive alongside the unchanged `Batch::commit()`.
+- **MSRV unchanged.** Still 1.75.
+
+### Queued for 0.9.4 ("io_uring elite — Linux")
+
+The Linux-only portion of the original 0.9.2 audit list is
+the focused theme for 0.9.4. It pairs naturally because every
+item lives behind `#[cfg(target_os = "linux")]` and validates
+through the same Linux CI runner:
+
+- **Native io_uring journal append** — close the J6 stub in
+  `src/journal/mod.rs`. Submit `IORING_OP_WRITE` SQEs through
+  the per-journal ring; eliminates the `spawn_blocking`
+  thread-pool hop for `append_async`.
+- **`IORING_REGISTER_FILES` + `IORING_REGISTER_BUFFERS`** —
+  fixed file-descriptor table + zero-copy DMA from registered
+  buffer pool. Eliminates per-SQE fd validation and the
+  user→kernel buffer copy.
+- **`IOSQE_IO_LINK` for write+fsync** — submit the pair as a
+  linked chain in one syscall; kernel batches durability.
+  Roughly halves durability syscall round-trips.
+- **Probe `IORING_SETUP_DEFER_TASKRUN | SINGLE_ISSUER |
+  COOP_TASKRUN`** — kernel ≥ 5.19 reduces tail latency by
+  deferring task work to known submission boundaries. Graceful
+  downgrade on older kernels.
+- **NAWUN / NAWUPF probe** + `Handle::atomic_write_unit() ->
+  Option<u32>`. NVMe Identify-Namespace command exposes the
+  drive's atomic-write guarantee; DBs aware of it skip
+  torn-write detection on guaranteeing drives.
+
+### Queued for 0.9.5 ("Direct-mode + platform polish + 1.0-RC prep")
+
+- **Double-buffered Direct-mode log buffer** (active +
+  flushing buffers) — decouples append latency from flush
+  latency in `JournalOptions::direct(true)`.
+- **macOS `F_BARRIERFSYNC` opt-in** — cheaper than
+  `F_FULLFSYNC` with the same atomicity guarantee.
+- **`F_SET_RW_HINT`** for journal append (Linux NVMe
+  write-lifetime hint).
+- **NVMe `WRITE ZEROES` / `DEALLOCATE`** for fast truncate +
+  hole-punch via device command.
+- **Final audit + polish + 1.0-RC stability commitment doc.**
+
 ## [0.9.2] - 2026-05-10
 
 > **Hardware-aware database decision surface.** The 0.9.2 patch
