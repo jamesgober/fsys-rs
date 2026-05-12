@@ -103,6 +103,30 @@ pub(crate) fn features() -> IoUringFeatures {
 /// first; strips on `EINVAL`. Always returns within microseconds
 /// (each `io_uring_setup` is a single syscall).
 fn probe() -> IoUringFeatures {
+    // 0.9.7 H-9 — test-hook env-var bypass.
+    //
+    // Audit H-9: the elite-flag fallback paths (kernel < 5.19 →
+    // no COOP_TASKRUN; kernel < 6.0 → no SINGLE_ISSUER; etc.)
+    // weren't explicitly tested in CI — only the happy path on
+    // whatever kernel the runner happened to provide. Adding
+    // mockable feature gates is the fix.
+    //
+    // `FSYS_TEST_FORCE_NO_IOURING_FEATURES=1` forces this probe
+    // to return [`IoUringFeatures::default`] (all-false) without
+    // touching the kernel, exercising the pre-0.9.4 baseline
+    // path in tests on any kernel.
+    //
+    // The env-var name is intentionally obscure to make
+    // accidental triggering in production environments
+    // vanishingly unlikely. The check runs once per process
+    // (this function is called from a `OnceLock::get_or_init`),
+    // so production cost is one [`env::var_os`] call ever ≈ 1 µs
+    // on the first ring construction. After that, the cached
+    // value is returned with zero cost.
+    if std::env::var_os("FSYS_TEST_FORCE_NO_IOURING_FEATURES").is_some() {
+        return IoUringFeatures::default();
+    }
+
     // Tier 1 — DEFER_TASKRUN (6.1+) requires SINGLE_ISSUER, and
     // pairs naturally with COOP_TASKRUN. `let _ = ` consumes the
     // chained `&mut Builder` return so the crate's `unused_results`
