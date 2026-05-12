@@ -161,23 +161,40 @@ where
 
 /// Ring usage mode — selects which elite flags are safe to apply.
 ///
-/// 0.9.6 fix: `DEFER_TASKRUN` was originally applied unconditionally
-/// in 0.9.4, but its kernel contract is that the application must
-/// drive completion processing via explicit
-/// `io_uring_enter(IORING_ENTER_GETEVENTS)` calls — the kernel
-/// will NOT process completions in background task work. The
-/// async substrate's eventfd-driven loop submits via `ring.submit()`
-/// (which only sets SUBMITS, not GETEVENTS) and then sleeps on
-/// `AsyncFd::readable()` waiting for eventfd signalling. Under
-/// `DEFER_TASKRUN`, the kernel never generates CQEs because the
-/// app never asks for them — eventfd never fires — the async loop
-/// hangs forever. The sync owner-thread ring is unaffected because
-/// it uses `submit_and_wait(n)` which IS
-/// `io_uring_enter(GETEVENTS=n)` and explicitly drives completions.
+/// The 0.9.4 elite-flag set (`COOP_TASKRUN` / `SINGLE_ISSUER` /
+/// `DEFER_TASKRUN`) was originally applied unconditionally, but
+/// **two** of them turned out to be incompatible with the async
+/// substrate's design:
 ///
-/// This bug existed since 0.9.4 but was undetected until the 0.9.6
-/// feature-matrix CI exercised the async tests on a kernel with
-/// `DEFER_TASKRUN` support (≥ 6.1).
+/// 1. **`DEFER_TASKRUN`** (kernel ≥ 6.1) requires the application
+///    to drive completion processing via explicit
+///    `io_uring_enter(IORING_ENTER_GETEVENTS)` calls — the kernel
+///    will NOT process completions in background task work. The
+///    async substrate submits via `ring.submit()` (no GETEVENTS)
+///    and sleeps on `AsyncFd::readable()` waiting for eventfd
+///    signalling. Under `DEFER_TASKRUN`, the kernel never posts
+///    CQEs, eventfd never fires, the async loop hangs forever.
+///
+/// 2. **`SINGLE_ISSUER`** (kernel ≥ 6.0) is kernel-enforced —
+///    only the task that owns the ring may submit. The kernel's
+///    notion of "task" is an OS-level thread (TID). Under tokio's
+///    `current_thread` runtime this is safe — the owner-task
+///    always runs on the same OS thread. Under tokio's
+///    `multi_thread` runtime, work-stealing migrates tasks
+///    between worker threads at every yield point. After
+///    migration, the owner task submits from a different TID
+///    than the one that called `io_uring_setup`, the kernel
+///    returns `-EEXIST`, the SQE is never processed, the CQE is
+///    never posted, and the async loop hangs.
+///
+/// The sync owner-thread ring (`linux_iouring.rs`) is unaffected
+/// by either: it uses `submit_and_wait(n)` (= `io_uring_enter(GETEVENTS=n)`)
+/// which drives completions explicitly, and runs on a dedicated
+/// `std::thread::spawn`-ed OS thread that never migrates.
+///
+/// Both bugs existed since 0.9.4 but were undetected until the
+/// 0.9.6 feature-matrix CI exercised the async tests on a kernel
+/// with the flags supported (≥ 6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Variant usage is feature-gated: Sync used by
                     // linux_iouring.rs (cfg target_os=linux); Async used by
@@ -186,13 +203,18 @@ where
                     // so dead_code would fire on Async without this allow.
 pub(crate) enum RingMode {
     /// Sync owner-thread ring (`linux_iouring.rs`). Uses
-    /// `submit_and_wait(n)` which drives the completion processing
-    /// explicitly — compatible with `DEFER_TASKRUN`.
+    /// `submit_and_wait(n)` (compatible with `DEFER_TASKRUN`) and
+    /// runs on a dedicated `std::thread::spawn`-ed OS thread that
+    /// never migrates (compatible with `SINGLE_ISSUER`). All elite
+    /// flags supported by the kernel are applied.
     Sync,
     /// Async substrate (`completion_driver.rs`). Uses eventfd
-    /// signalling for completion notification — INCOMPATIBLE with
-    /// `DEFER_TASKRUN` (kernel won't post CQEs without an explicit
-    /// `GETEVENTS` call, eventfd never fires).
+    /// signalling (INCOMPATIBLE with `DEFER_TASKRUN`) and is a
+    /// tokio task that work-stealing may migrate between worker
+    /// threads under the `multi_thread` runtime (INCOMPATIBLE
+    /// with `SINGLE_ISSUER`). Only `COOP_TASKRUN` is applied —
+    /// it's a pure performance hint with no enforcement
+    /// requirements.
     Async,
 }
 
@@ -214,23 +236,25 @@ pub(crate) enum RingMode {
 /// flag is set once at the bit level).
 pub(crate) fn apply(builder: &mut io_uring::Builder, mode: RingMode) {
     let f = features();
-    // Always set COOP_TASKRUN first if supported — it's the
-    // foundation flag (5.19+) and never requires the others.
-    // Safe on both sync and async ring modes.
+    // COOP_TASKRUN (5.19+) is a pure performance hint: it tells
+    // the kernel to defer completion task work until a convenient
+    // moment (typically the next user-space transition), reducing
+    // IPIs. It does NOT enforce any task-identity or completion-
+    // driving constraint, so it's safe for both Sync and Async
+    // ring modes.
     if f.coop_taskrun {
         let _ = builder.setup_coop_taskrun();
     }
-    // SINGLE_ISSUER (6.0+) is a hint that all submissions come
-    // from a single task. Safe for both modes since each ring has
-    // a dedicated owner thread/task.
-    if f.single_issuer {
+    // SINGLE_ISSUER (6.0+) is kernel-enforced — only the task
+    // that owns the ring may submit. Safe for Sync (dedicated OS
+    // thread); incompatible with Async (tokio task migrates
+    // under multi_thread runtime — see `RingMode::Async` doc).
+    if f.single_issuer && matches!(mode, RingMode::Sync) {
         let _ = builder.setup_single_issuer();
     }
     // DEFER_TASKRUN (6.1+) requires SINGLE_ISSUER (kernel-
     // enforced) AND explicit `io_uring_enter(GETEVENTS)` driving
-    // by the app. Only apply on the sync ring (which uses
-    // submit_and_wait); skip on the async substrate (which uses
-    // eventfd signalling — see `RingMode::Async` doc).
+    // by the app. Same Sync-only restriction as SINGLE_ISSUER.
     if f.defer_taskrun && f.single_issuer && matches!(mode, RingMode::Sync) {
         let _ = builder.setup_defer_taskrun();
     }
