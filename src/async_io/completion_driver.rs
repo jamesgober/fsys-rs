@@ -344,24 +344,30 @@ async fn owner_loop(queue_depth: u32, eventfd_raw: RawFd, mut rx: mpsc::Unbounde
         Err(_) => return, // owned_fd drops, eventfd closes once
     };
 
-    // 0.9.5 — IORING_REGISTER_FILES. Pre-register a 16-slot
-    // sparse file table at owner startup. Each per-op `fd` is
-    // lazily upgraded to a fixed-file slot via
-    // `register_files_update` on first use; subsequent
-    // submissions for the same fd reuse the cached slot and
-    // submit SQEs with `IOSQE_FIXED_FILE` semantics. This
-    // saves kernel-side fd validation on every SQE, an
-    // observable per-syscall win on rings that do many ops
-    // against a small set of fds (the journal hot path).
+    // 0.9.6 follow-up — the async-substrate `IORING_REGISTER_FILES`
+    // integration from 0.9.5 caused submitted ops to hang on real
+    // Linux runners (CI's `--no-default-features --features async`
+    // matrix entry + WSL2 reproduction). The owner_loop pushed SQEs
+    // with `types::Fixed(slot)` after lazy-registering each fd, but
+    // the kernel/eventfd routing didn't generate CQEs for the
+    // resulting submissions on some kernel + ring-config combos —
+    // the test runner saw all the lifecycle tests pass
+    // (construction, shutdown, panic, abort) while every
+    // submit-and-await test hung indefinitely.
     //
-    // If the kernel rejects the initial registration (rare —
-    // it has been stable since 5.1), or if the table fills
-    // (>16 distinct fds in one ring's lifetime, unusual for
-    // fsys workloads), we fall back to raw-fd SQEs cleanly —
-    // the registry simply returns `None` and the SQE builder
-    // uses `types::Fd(raw)` instead of `types::Fixed(slot)`.
+    // The journal hot path keeps its `IORING_REGISTER_FILES`
+    // optimization via `linux_iouring.rs`'s FdRegistry (the sync
+    // ring used by the Direct method). The async substrate, by
+    // contrast, handles ad-hoc ops with high fd diversity where
+    // the per-SQE fd-validation cost is marginal — the
+    // optimization didn't pay off here even when it worked.
+    //
+    // `fd_registry` stays as a local variable so `push_sqe_for`'s
+    // signature is unchanged; with `initial_register` not called,
+    // `registered` is `false`, every `try_get_or_register` returns
+    // `None`, and SQEs use `types::Fd(raw)` — identical to
+    // pre-0.9.5 behaviour for the async substrate.
     let mut fd_registry = FdRegistry::new();
-    let _ = fd_registry.initial_register(&ring.submitter());
 
     // Register the eventfd with the ring so the kernel signals it
     // when CQ has new entries. Use `as_raw_fd()` — registration
