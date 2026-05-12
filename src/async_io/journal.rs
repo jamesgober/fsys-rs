@@ -310,129 +310,160 @@ mod tests {
         }
     }
 
+    /// 0.9.6 hardening: wraps an async test body with a hard
+    /// 15-second timeout so a regression hangs in seconds, not
+    /// the GitHub Actions default 6-hour job timeout.
+    async fn with_timeout<F, T>(fut: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        const TIMEOUT_SECS: u64 = 15;
+        match tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_SECS), fut).await {
+            Ok(v) => v,
+            Err(_) => panic!(
+                "test exceeded {TIMEOUT_SECS}s timeout — likely a hang in the async journal path"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn append_async_returns_lsn_advanced_by_framed_len() {
-        // Each record is framed (12 bytes overhead). LSN
-        // advances by payload + 12.
-        let path = tmp_path("append_async");
-        let _g = Cleanup(path.clone());
-        let fs = builder().build().expect("handle");
-        let log = Arc::new(fs.journal(&path).expect("journal"));
+        with_timeout(async {
+            // Each record is framed (12 bytes overhead). LSN
+            // advances by payload + 12.
+            let path = tmp_path("append_async");
+            let _g = Cleanup(path.clone());
+            let fs = builder().build().expect("handle");
+            let log = Arc::new(fs.journal(&path).expect("journal"));
 
-        let lsn1 = log
-            .clone()
-            .append_async(b"hello".to_vec())
-            .await
-            .expect("a1");
-        assert_eq!(lsn1, Lsn::new(5 + 12));
+            let lsn1 = log
+                .clone()
+                .append_async(b"hello".to_vec())
+                .await
+                .expect("a1");
+            assert_eq!(lsn1, Lsn::new(5 + 12));
 
-        let lsn2 = log
-            .clone()
-            .append_async(b" world".to_vec())
-            .await
-            .expect("a2");
-        assert_eq!(lsn2, Lsn::new(17 + 6 + 12));
+            let lsn2 = log
+                .clone()
+                .append_async(b" world".to_vec())
+                .await
+                .expect("a2");
+            assert_eq!(lsn2, Lsn::new(17 + 6 + 12));
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn sync_through_async_advances_synced_lsn() {
-        let path = tmp_path("sync_through_async");
-        let _g = Cleanup(path.clone());
-        let fs = builder().build().expect("handle");
-        let log = Arc::new(fs.journal(&path).expect("journal"));
+        with_timeout(async {
+            let path = tmp_path("sync_through_async");
+            let _g = Cleanup(path.clone());
+            let fs = builder().build().expect("handle");
+            let log = Arc::new(fs.journal(&path).expect("journal"));
 
-        let lsn = log
-            .clone()
-            .append_async(b"durable".to_vec())
-            .await
-            .expect("append");
-        log.clone().sync_through_async(lsn).await.expect("sync");
-        assert!(log.synced_lsn() >= lsn);
+            let lsn = log
+                .clone()
+                .append_async(b"durable".to_vec())
+                .await
+                .expect("append");
+            log.clone().sync_through_async(lsn).await.expect("sync");
+            assert!(log.synced_lsn() >= lsn);
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_async_appends_all_succeed() {
-        let path = tmp_path("concurrent_async");
-        let _g = Cleanup(path.clone());
-        let fs = builder().build().expect("handle");
-        let log = Arc::new(fs.journal(&path).expect("journal"));
+        with_timeout(async {
+            let path = tmp_path("concurrent_async");
+            let _g = Cleanup(path.clone());
+            let fs = builder().build().expect("handle");
+            let log = Arc::new(fs.journal(&path).expect("journal"));
 
-        let mut joins = Vec::new();
-        for i in 0..32 {
-            let log = log.clone();
-            let payload = format!("rec {i:04}").into_bytes();
-            joins.push(tokio::spawn(async move { log.append_async(payload).await }));
-        }
-        let mut max_lsn = Lsn::ZERO;
-        for j in joins {
-            let lsn = j.await.expect("join").expect("append_async");
-            if lsn > max_lsn {
-                max_lsn = lsn;
+            let mut joins = Vec::new();
+            for i in 0..32 {
+                let log = log.clone();
+                let payload = format!("rec {i:04}").into_bytes();
+                joins.push(tokio::spawn(async move { log.append_async(payload).await }));
             }
-        }
-        log.clone()
-            .sync_through_async(max_lsn)
-            .await
-            .expect("final sync");
-        assert!(log.synced_lsn() >= max_lsn);
+            let mut max_lsn = Lsn::ZERO;
+            for j in joins {
+                let lsn = j.await.expect("join").expect("append_async");
+                if lsn > max_lsn {
+                    max_lsn = lsn;
+                }
+            }
+            log.clone()
+                .sync_through_async(max_lsn)
+                .await
+                .expect("final sync");
+            assert!(log.synced_lsn() >= max_lsn);
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn direct_mode_async_round_trip() {
-        let path = tmp_path("direct_async");
-        let _g = Cleanup(path.clone());
-        let fs = builder().build().expect("handle");
-        let log = Arc::new(
-            fs.journal_with(&path, crate::JournalOptions::new().direct(true))
-                .expect("direct journal"),
-        );
+        with_timeout(async {
+            let path = tmp_path("direct_async");
+            let _g = Cleanup(path.clone());
+            let fs = builder().build().expect("handle");
+            let log = Arc::new(
+                fs.journal_with(&path, crate::JournalOptions::new().direct(true))
+                    .expect("direct journal"),
+            );
 
-        // Async append then async sync — direct-mode journals
-        // route both through spawn_blocking so the buffer mutex
-        // is honoured.
-        let lsn = log
-            .clone()
-            .append_async(b"async direct payload".to_vec())
-            .await
-            .expect("append_async");
-        log.clone()
-            .sync_through_async(lsn)
-            .await
-            .expect("sync_through_async");
-        assert!(log.synced_lsn() >= lsn);
+            // Async append then async sync — direct-mode journals
+            // route both through spawn_blocking so the buffer mutex
+            // is honoured.
+            let lsn = log
+                .clone()
+                .append_async(b"async direct payload".to_vec())
+                .await
+                .expect("append_async");
+            log.clone()
+                .sync_through_async(lsn)
+                .await
+                .expect("sync_through_async");
+            assert!(log.synced_lsn() >= lsn);
 
-        // Native io_uring is NOT engaged for direct-mode journals
-        // (we fall back to spawn_blocking).
-        // On non-direct journals this would be `true`; here it
-        // must be `false` because we never construct the ring.
-        assert!(!log.native_iouring_active());
+            // Native io_uring is NOT engaged for direct-mode journals
+            // (we fall back to spawn_blocking).
+            // On non-direct journals this would be `true`; here it
+            // must be `false` because we never construct the ring.
+            assert!(!log.native_iouring_active());
+        })
+        .await;
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn native_iouring_engages_on_linux_when_available() {
-        let path = tmp_path("native_engage");
-        let _g = Cleanup(path.clone());
-        let fs = builder().build().expect("handle");
-        let log = Arc::new(fs.journal(&path).expect("journal"));
+        with_timeout(async {
+            let path = tmp_path("native_engage");
+            let _g = Cleanup(path.clone());
+            let fs = builder().build().expect("handle");
+            let log = Arc::new(fs.journal(&path).expect("journal"));
 
-        // Trigger lazy construction by doing one append.
-        let _ = log
-            .clone()
-            .append_async(b"trigger".to_vec())
-            .await
-            .expect("append");
+            // Trigger lazy construction by doing one append.
+            let _ = log
+                .clone()
+                .append_async(b"trigger".to_vec())
+                .await
+                .expect("append");
 
-        // On a Linux runner with io_uring available, native should
-        // engage. On a Linux runner WITHOUT io_uring (sandboxed CI,
-        // containers without the syscall), it stays inactive.
-        // Both are valid outcomes — the test pins that the field
-        // *transitions* to a defined state (Some(_), not None).
-        // We don't assert specifically true/false because the
-        // runtime environment varies.
-        let active = log.native_iouring_active();
-        // Just confirm the value is well-defined (either true or
-        // false). The OnceLock should have been populated.
-        assert!(active || !active);
+            // On a Linux runner with io_uring available, native should
+            // engage. On a Linux runner WITHOUT io_uring (sandboxed CI,
+            // containers without the syscall), it stays inactive.
+            // Both are valid outcomes — the test pins that the field
+            // *transitions* to a defined state (Some(_), not None).
+            // We don't assert specifically true/false because the
+            // runtime environment varies.
+            let active = log.native_iouring_active();
+            // Just confirm the value is well-defined (either true or
+            // false). The OnceLock should have been populated.
+            assert!(active || !active);
+        })
+        .await;
     }
 }

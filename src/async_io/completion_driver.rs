@@ -688,26 +688,55 @@ mod tests {
         AsyncIoUring::new(8).ok()
     }
 
+    /// 0.9.6 hardening: wraps an async test body with a hard
+    /// 15-second timeout so a regression hangs in seconds, not
+    /// the GitHub Actions default 6-hour job timeout. The pre-
+    /// existing tests that ALREADY do their own
+    /// `tokio::time::timeout` (e.g.
+    /// `fdatasync_against_invalid_fd_returns_error_not_hang`,
+    /// `aborted_owner_task_translates_to_clean_error`,
+    /// `concurrent_submits_resolve_cleanly_on_owner_abort`)
+    /// keep theirs because each picks a duration tuned to its
+    /// own expected behaviour.
+    async fn with_timeout<F, T>(fut: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        const TIMEOUT_SECS: u64 = 15;
+        match tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_SECS), fut).await {
+            Ok(v) => v,
+            Err(_) => panic!(
+                "test exceeded {TIMEOUT_SECS}s timeout — likely a hang in the completion driver"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn construction_returns_or_skips() {
-        let _ring = ring_or_skip();
-        // Either AsyncIoUring::new succeeded (CI runner has
-        // io_uring), or it failed and we skipped — the test passes
-        // either way; we're verifying that construction doesn't
-        // panic.
+        with_timeout(async {
+            let _ring = ring_or_skip();
+            // Either AsyncIoUring::new succeeded (CI runner has
+            // io_uring), or it failed and we skipped — the test passes
+            // either way; we're verifying that construction doesn't
+            // panic.
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn shutdown_is_clean() {
-        let Some(ring) = ring_or_skip() else { return };
-        ring.shutdown().await;
-        // Subsequent submit must return CompletionDriverDead since
-        // we dropped the sender during shutdown.
-        let (rt, rr) = oneshot::channel();
-        // Best-effort: call submit on the closed ring. We expect
-        // CompletionDriverDead, NOT a hang.
-        let result = ring.submit(Op::Fdatasync { fd: -1, reply: rt }, rr).await;
-        assert!(matches!(result, Err(Error::CompletionDriverDead)));
+        with_timeout(async {
+            let Some(ring) = ring_or_skip() else { return };
+            ring.shutdown().await;
+            // Subsequent submit must return CompletionDriverDead since
+            // we dropped the sender during shutdown.
+            let (rt, rr) = oneshot::channel();
+            // Best-effort: call submit on the closed ring. We expect
+            // CompletionDriverDead, NOT a hang.
+            let result = ring.submit(Op::Fdatasync { fd: -1, reply: rt }, rr).await;
+            assert!(matches!(result, Err(Error::CompletionDriverDead)));
+        })
+        .await;
     }
 
     /// Validates the **load-bearing invariant** from
@@ -723,12 +752,15 @@ mod tests {
     /// submit returns HandlePoisoned without hanging.
     #[tokio::test]
     async fn poisoned_flag_short_circuits_submit() {
-        let Some(ring) = ring_or_skip() else { return };
-        ring.poisoned.store(true, Ordering::Release);
+        with_timeout(async {
+            let Some(ring) = ring_or_skip() else { return };
+            ring.poisoned.store(true, Ordering::Release);
 
-        let (rt, rr) = oneshot::channel();
-        let result = ring.submit(Op::Fdatasync { fd: -1, reply: rt }, rr).await;
-        assert!(matches!(result, Err(Error::HandlePoisoned { .. })));
+            let (rt, rr) = oneshot::channel();
+            let result = ring.submit(Op::Fdatasync { fd: -1, reply: rt }, rr).await;
+            assert!(matches!(result, Err(Error::HandlePoisoned { .. })));
+        })
+        .await;
     }
 
     /// Validates that an in-flight submitter whose oneshot
@@ -736,24 +768,27 @@ mod tests {
     /// crash the driver.
     #[tokio::test]
     async fn dropped_receiver_is_handled_gracefully() {
-        let Some(ring) = ring_or_skip() else { return };
+        with_timeout(async {
+            let Some(ring) = ring_or_skip() else { return };
 
-        // We don't actually have a real fd to fdatasync against,
-        // so the kernel will return -EBADF. We just want to verify
-        // the path doesn't panic.
-        let (rt, rr) = oneshot::channel::<i32>();
-        // Drop rr before submission — submitter sends and
-        // immediately drops the receiver.
-        drop(rr);
+            // We don't actually have a real fd to fdatasync against,
+            // so the kernel will return -EBADF. We just want to verify
+            // the path doesn't panic.
+            let (rt, rr) = oneshot::channel::<i32>();
+            // Drop rr before submission — submitter sends and
+            // immediately drops the receiver.
+            drop(rr);
 
-        // Build a fresh oneshot for the submit path that the API
-        // expects.
-        let (rt2, rr2) = oneshot::channel::<i32>();
-        let _ = ring.submit(Op::Fdatasync { fd: -1, reply: rt2 }, rr2).await;
+            // Build a fresh oneshot for the submit path that the API
+            // expects.
+            let (rt2, rr2) = oneshot::channel::<i32>();
+            let _ = ring.submit(Op::Fdatasync { fd: -1, reply: rt2 }, rr2).await;
 
-        // Cleanup: shutdown should still be clean.
-        ring.shutdown().await;
-        let _ = (rt,); // tx kept for borrow rules
+            // Cleanup: shutdown should still be clean.
+            ring.shutdown().await;
+            let _ = (rt,); // tx kept for borrow rules
+        })
+        .await;
     }
 
     /// **Load-bearing test from `.dev/DECISIONS-0.7.0.md`.**

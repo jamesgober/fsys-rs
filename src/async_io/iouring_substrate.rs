@@ -118,114 +118,144 @@ mod tests {
         }
     }
 
+    /// 0.9.6 hardening: wraps an async test body with a hard
+    /// 15-second timeout. If the body hangs (e.g. an io_uring
+    /// CQE that never lands), the test panics with a clear
+    /// message instead of dragging CI for the GitHub Actions
+    /// default job timeout (~6 hours).
+    async fn with_timeout<F, T>(fut: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        const TIMEOUT_SECS: u64 = 15;
+        match tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_SECS), fut).await {
+            Ok(v) => v,
+            Err(_) => panic!(
+                "test exceeded {TIMEOUT_SECS}s timeout — likely a hang in the async substrate"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn write_at_native_round_trips() {
-        let Some(ring) = ring_or_skip() else { return };
-        let path = tmp_path("write");
-        let _g = Cleanup(path.clone());
+        with_timeout(async {
+            let Some(ring) = ring_or_skip() else { return };
+            let path = tmp_path("write");
+            let _g = Cleanup(path.clone());
 
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
 
-        let data = vec![0xA5u8; 4096];
-        let n = write_at_native(&ring, f.as_raw_fd(), &data, 0)
-            .await
-            .expect("write_at_native");
-        assert_eq!(n, data.len());
-        fdatasync_native(&ring, f.as_raw_fd())
-            .await
-            .expect("fdatasync_native");
+            let data = vec![0xA5u8; 4096];
+            let n = write_at_native(&ring, f.as_raw_fd(), &data, 0)
+                .await
+                .expect("write_at_native");
+            assert_eq!(n, data.len());
+            fdatasync_native(&ring, f.as_raw_fd())
+                .await
+                .expect("fdatasync_native");
 
-        drop(f);
-        let read_back = std::fs::read(&path).expect("read");
-        assert_eq!(read_back, data);
+            drop(f);
+            let read_back = std::fs::read(&path).expect("read");
+            assert_eq!(read_back, data);
 
-        ring.shutdown().await;
+            ring.shutdown().await;
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn read_at_native_round_trips() {
-        let Some(ring) = ring_or_skip() else { return };
-        let path = tmp_path("read");
-        let _g = Cleanup(path.clone());
-        let data = vec![0x5Au8; 4096];
-        std::fs::write(&path, &data).unwrap();
+        with_timeout(async {
+            let Some(ring) = ring_or_skip() else { return };
+            let path = tmp_path("read");
+            let _g = Cleanup(path.clone());
+            let data = vec![0x5Au8; 4096];
+            std::fs::write(&path, &data).unwrap();
 
-        let f = OpenOptions::new().read(true).open(&path).unwrap();
-        let mut buf = vec![0u8; 4096];
-        let n = read_at_native(&ring, f.as_raw_fd(), &mut buf, 0)
-            .await
-            .expect("read_at_native");
-        assert_eq!(n, data.len());
-        assert_eq!(buf, data);
+            let f = OpenOptions::new().read(true).open(&path).unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = read_at_native(&ring, f.as_raw_fd(), &mut buf, 0)
+                .await
+                .expect("read_at_native");
+            assert_eq!(n, data.len());
+            assert_eq!(buf, data);
 
-        ring.shutdown().await;
+            ring.shutdown().await;
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn write_at_invalid_fd_returns_io_error() {
-        let Some(ring) = ring_or_skip() else { return };
+        with_timeout(async {
+            let Some(ring) = ring_or_skip() else { return };
 
-        let data = vec![0u8; 64];
-        // fd -1 is invalid; kernel returns -EBADF (errno 9).
-        let result = write_at_native(&ring, -1, &data, 0).await;
-        assert!(matches!(result, Err(Error::Io(_))));
+            let data = vec![0u8; 64];
+            // fd -1 is invalid; kernel returns -EBADF (errno 9).
+            let result = write_at_native(&ring, -1, &data, 0).await;
+            assert!(matches!(result, Err(Error::Io(_))));
 
-        ring.shutdown().await;
+            ring.shutdown().await;
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn concurrent_writes_complete_independently() {
-        let Some(ring) = ring_or_skip() else { return };
-        let ring = std::sync::Arc::new(ring);
+        with_timeout(async {
+            let Some(ring) = ring_or_skip() else { return };
+            let ring = std::sync::Arc::new(ring);
 
-        let path = tmp_path("concurrent");
-        let _g = Cleanup(path.clone());
-        // Pre-size the file with 16 sectors of zeros.
-        std::fs::write(&path, vec![0u8; 16 * 4096]).unwrap();
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let fd = f.as_raw_fd();
+            let path = tmp_path("concurrent");
+            let _g = Cleanup(path.clone());
+            // Pre-size the file with 16 sectors of zeros.
+            std::fs::write(&path, vec![0u8; 16 * 4096]).unwrap();
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let fd = f.as_raw_fd();
 
-        let mut handles = Vec::new();
-        for i in 0..16usize {
-            let ring = ring.clone();
-            let payload = vec![i as u8; 4096];
-            handles.push(tokio::spawn(async move {
-                write_at_native(&ring, fd, &payload, (i * 4096) as u64)
-                    .await
-                    .expect("concurrent write")
-            }));
-        }
-        for h in handles {
-            assert_eq!(h.await.unwrap(), 4096);
-        }
-        fdatasync_native(&ring, fd).await.expect("fdatasync");
-        drop(f);
+            let mut handles = Vec::new();
+            for i in 0..16usize {
+                let ring = ring.clone();
+                let payload = vec![i as u8; 4096];
+                handles.push(tokio::spawn(async move {
+                    write_at_native(&ring, fd, &payload, (i * 4096) as u64)
+                        .await
+                        .expect("concurrent write")
+                }));
+            }
+            for h in handles {
+                assert_eq!(h.await.unwrap(), 4096);
+            }
+            fdatasync_native(&ring, fd).await.expect("fdatasync");
+            drop(f);
 
-        let bytes = std::fs::read(&path).unwrap();
-        for i in 0..16 {
-            let slice = &bytes[i * 4096..(i + 1) * 4096];
-            assert!(
-                slice.iter().all(|&b| b == i as u8),
-                "sector {i} content drift — concurrent submission broke ordering"
-            );
-        }
+            let bytes = std::fs::read(&path).unwrap();
+            for i in 0..16 {
+                let slice = &bytes[i * 4096..(i + 1) * 4096];
+                assert!(
+                    slice.iter().all(|&b| b == i as u8),
+                    "sector {i} content drift — concurrent submission broke ordering"
+                );
+            }
 
-        // Cleanup. The JoinHandles' inner Arc clones were freed
-        // when their tasks completed; only the outer `ring`
-        // binding holds a ref now. Use `Arc::into_inner` to
-        // recover the inner value for shutdown.
-        if let Some(r) = std::sync::Arc::into_inner(ring) {
-            r.shutdown().await;
-        }
+            // Cleanup. The JoinHandles' inner Arc clones were freed
+            // when their tasks completed; only the outer `ring`
+            // binding holds a ref now. Use `Arc::into_inner` to
+            // recover the inner value for shutdown.
+            if let Some(r) = std::sync::Arc::into_inner(ring) {
+                r.shutdown().await;
+            }
+        })
+        .await;
     }
 }
