@@ -814,4 +814,78 @@ mod tests {
         // Either way, we've validated no-hang.
         ring.shutdown().await;
     }
+
+    /// 0.9.6 audit H-10 — concurrent submits + owner abort race.
+    ///
+    /// Pre-0.9.6 we had `dropped_receiver_is_handled_gracefully`
+    /// (single submitter dropping receiver pre-submit) and
+    /// `aborted_owner_task_translates_to_clean_error` (single
+    /// submit after owner abort). Neither exercised the
+    /// interleaving of **many in-flight submits + concurrent owner
+    /// abort**, which is the race a real production panic would
+    /// surface.
+    ///
+    /// Setup: spawn N concurrent submit tasks against a single
+    /// ring. Mid-flight, abort the owner. Every submitter must
+    /// resolve to a defined error (`CompletionDriverDead` or
+    /// `HandlePoisoned`) within a 5-second timeout — never hang.
+    /// The 5-second budget is generous; the actual resolution
+    /// path is sub-millisecond (channel close propagates O(N)
+    /// pending receivers to error).
+    #[tokio::test]
+    async fn concurrent_submits_resolve_cleanly_on_owner_abort() {
+        let Some(ring) = ring_or_skip() else { return };
+        let ring = std::sync::Arc::new(ring);
+
+        const SUBMITTERS: usize = 16;
+
+        // Spawn N concurrent submitters. Each issues an Fdatasync
+        // against an invalid fd — the kernel will return -EBADF on
+        // any that actually run, but most will be in-flight when
+        // the owner aborts, so they'll see HandlePoisoned /
+        // CompletionDriverDead via the channel-closed path.
+        let mut handles = Vec::with_capacity(SUBMITTERS);
+        for _ in 0..SUBMITTERS {
+            let ring = std::sync::Arc::clone(&ring);
+            handles.push(tokio::spawn(async move {
+                let (rt, rr) = oneshot::channel::<i32>();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    ring.submit(Op::Fdatasync { fd: -1, reply: rt }, rr),
+                )
+                .await
+            }));
+        }
+
+        // Give the submitters a moment to enqueue their ops.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Abort the owner mid-batch — this drops the receiver and
+        // the pending HashMap.
+        {
+            let mut g = ring.join.lock().await;
+            if let Some(j) = g.take() {
+                j.abort();
+                let _ = j.await;
+            }
+        }
+
+        // Every submitter must resolve (never hang).
+        for h in handles {
+            let outer = h.await.expect("submitter task panicked");
+            let inner = outer.expect("submitter timeout — owner abort didn't propagate within 5s");
+            match inner {
+                // Submitted before the abort, kernel returned -EBADF.
+                Ok(rc) => {
+                    assert!(rc < 0, "expected -EBADF or error result, got rc={rc}");
+                }
+                // Submitted after the abort, channel send failed →
+                // CompletionDriverDead. Or the reply oneshot was
+                // dropped by the aborted owner → HandlePoisoned via
+                // submit's witness path.
+                Err(Error::CompletionDriverDead) | Err(Error::HandlePoisoned { .. }) => {}
+                other => panic!("unexpected submitter result: {other:?}"),
+            }
+        }
+    }
 }
