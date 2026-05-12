@@ -32,7 +32,8 @@ async fn main() -> fsys::Result<()> {
     if let Err(e) = fs.clone().write_batch_async(batch.clone()).await {
         eprintln!(
             "async batch failed at op {}, completed={}",
-            e.failed_at, e.completed
+            e.failed_at(),
+            e.completed()
         );
         return Err(*e.into_inner());
     }

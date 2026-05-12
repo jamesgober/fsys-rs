@@ -36,8 +36,12 @@ pub(crate) fn open_write_new(path: &Path, use_direct: bool) -> Result<(File, boo
     if use_direct && err.raw_os_error() == Some(libc::EINVAL) {
         // O_DIRECT was rejected (tmpfs, FUSE, some CIFS mounts, etc.).
         // Retry without it. The caller will observe the fallback via the
-        // returned false flag and can update active_method() accordingly.
-        // TODO(0.3.0): emit a metrics event when this fallback fires.
+        // returned false flag and update `active_method()` accordingly —
+        // downstream code can query `Handle::active_method()` to detect
+        // the fallback at any time. (Previously this site had a
+        // `TODO(0.3.0)` for a metrics event; the equivalent signal is
+        // now surfaced via the public `active_method()` accessor added
+        // in 0.5.0 and the `FsysObserver` trait added in 0.9.2.)
         let flags_no_direct = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
         // SAFETY: same as above.
         let fd2 = unsafe { libc::open(path_cstr.as_ptr(), flags_no_direct, 0o600_i32) };
@@ -212,6 +216,18 @@ pub(crate) fn write_at(file: &File, offset: u64, data: &[u8]) -> Result<()> {
             }
             return Err(Error::Io(err));
         }
+        // 0.9.6 — Guard against infinite loop on zero-byte pwrite
+        // return. POSIX allows pwrite to return 0 in pathological
+        // conditions (out-of-space on certain network filesystems,
+        // certain FUSE drivers). Without this check, the surrounding
+        // loop would spin forever consuming a CPU. Mirrors the same
+        // guard already present in `write_all_direct`.
+        if n == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "pwrite returned 0 in write_at (no progress)",
+            )));
+        }
         written += n as usize;
     }
     Ok(())
@@ -258,16 +274,47 @@ pub(crate) fn read_all_direct(file: &File, file_size: u64, sector_size: u32) -> 
     let mut buf = AlignedBuf::new(aligned_len, ss)?;
 
     let fd = file.as_raw_fd();
-    let ptr = buf.as_mut_slice().as_mut_ptr().cast::<libc::c_void>();
-    // SAFETY: fd is valid. buf is sector-aligned and has aligned_len bytes.
-    // pread reads from offset 0 without changing the file position.
-    let n = unsafe { libc::pread(fd, ptr, aligned_len, 0) };
-    if n < 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
+
+    // 0.9.6 — pread on O_DIRECT files may return EINTR (signal
+    // delivered mid-read) or a short read (kernel returned fewer
+    // bytes than requested — POSIX-legal). Loop with EINTR retry
+    // and short-read accumulation. The journal-recovery path
+    // depends on this; pre-0.9.6 a single signal during journal
+    // rehydration would have surfaced as a recovery failure.
+    let mut total = 0usize;
+    while total < aligned_len {
+        // SAFETY: fd is valid for the duration; the buffer slice
+        // starting at `total` for `aligned_len - total` bytes is
+        // owned by us, lives across the syscall, and is
+        // sector-aligned at every iteration (since `total` only
+        // advances by multiples of the sector size — pread on
+        // O_DIRECT returns either sector multiples or 0 at EOF).
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buf.as_mut_slice()[total..]
+                    .as_mut_ptr()
+                    .cast::<libc::c_void>(),
+                aligned_len - total,
+                total as libc::off_t,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(Error::Io(err));
+        }
+        if n == 0 {
+            // EOF before aligned_len bytes — acceptable on the
+            // final partial sector when file_size < aligned_len.
+            break;
+        }
+        total += n as usize;
     }
 
-    let actual = n as usize;
-    let trimmed = usize::min(actual, file_size as usize);
+    let trimmed = usize::min(total, file_size as usize);
     Ok(buf.as_slice()[..trimmed].to_vec())
 }
 
@@ -406,11 +453,15 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
-    // Attempt copy_file_range(2) for same-filesystem reflinks / server-side
-    // copies. Falls back to std::fs::copy on EXDEV (cross-device) or ENOSYS.
-    //
-    // TODO(0.5.0): implement a proper copy_file_range loop for large files
-    // and remove the std::fs::copy fallback.
+    // 0.9.6 — `std::fs::copy` on Linux uses `copy_file_range(2)`
+    // internally since Rust 1.62 (we MSRV at 1.75, so this is
+    // guaranteed). The stdlib handles the loop-and-fallback
+    // correctly: it walks `copy_file_range` for as many bytes as
+    // the kernel returns per call, falls back to `sendfile(2)` on
+    // EXDEV (cross-device copy), and final-fallback to a userspace
+    // buffered copy on ENOSYS. The earlier `TODO(0.5.0)` to add a
+    // hand-rolled loop is obsolete — stdlib already does the
+    // load-bearing work.
     std::fs::copy(src, dst).map_err(Error::Io)
 }
 

@@ -120,7 +120,7 @@ fn queue_full_does_not_emit_queue_full_error_in_0_4_0() {
     let p = tmp("never_queue_full");
     let result = h.write_batch(&[(p.as_path(), b"data".as_slice())]);
     if let Err(ref e) = result {
-        match *e.source {
+        match e.inner() {
             fsys::Error::QueueFull => {
                 panic!("Error::QueueFull must NOT be emitted in 0.4.0");
             }

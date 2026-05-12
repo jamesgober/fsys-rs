@@ -375,26 +375,13 @@ pub(crate) fn set_write_lifetime_hint(file: &std::fs::File, hint_ordinal: u8) ->
 /// unchanged on error.
 #[inline]
 pub(crate) fn punch_hole(file: &std::fs::File, offset: u64, len: u64) -> crate::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        imp::punch_hole(file, offset, len)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        imp::punch_hole(file, offset, len)
-    }
-    #[cfg(target_os = "windows")]
-    {
-        imp::punch_hole(file, offset, len)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        let _ = (file, offset, len);
-        Err(crate::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "punch_hole not supported on this platform",
-        )))
-    }
+    // 0.9.6 — every platform module (linux/macos/windows/unknown)
+    // exposes a `punch_hole` symbol. The unknown-platform impl
+    // returns `Err(Unsupported)` honestly rather than the dispatch
+    // hardcoding it (pre-0.9.6 had the branch here, with no
+    // corresponding `unknown::punch_hole`, making the module
+    // surface asymmetric).
+    imp::punch_hole(file, offset, len)
 }
 
 /// 0.9.5 — Zero-fills `file` at `[offset, offset + len)`.

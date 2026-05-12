@@ -101,3 +101,37 @@ jobs:
 
       - name: Build documentation
         run: cargo doc --no-deps --all-features
+
+  # 0.9.6 audit H-13 — feature-matrix coverage.
+  # The default + all-features paths are exercised by the `test` /
+  # `docs` jobs above; this matrix covers the in-between
+  # combinations so a regression in any optional-feature gate
+  # surfaces in CI rather than at user side.
+  feature-matrix:
+    name: Feature matrix (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features"
+          - "--no-default-features --features async"
+          - "--no-default-features --features tracing"
+          - "--no-default-features --features async,tracing"
+          - "--features stress"
+          - "--features fuzz"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --lib --tests ${{ matrix.features }}
+
+      - name: Test
+        run: cargo test --lib ${{ matrix.features }}

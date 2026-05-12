@@ -7,10 +7,15 @@
 //! but tmpfs and several network filesystems will reject the flag at
 //! open time.
 //!
-//! `0.0.2` returns a static, target-driven snapshot. Real runtime
-//! verification (probing for `io_uring_setup`, NVMe device-character
-//! files, etc.) is deferred to `0.0.5`. Each conservative field is
-//! marked with a `TODO(0.0.5)` comment in the internal probe routine.
+//! Runtime verification is now in place for the load-bearing fields:
+//! - `io_uring` is a real runtime probe (`io_uring_setup(2)`) on Linux
+//!   since 0.5.0.
+//! - `nvme_passthrough` is a real probe (NVMe character device + ioctl
+//!   capability) since 0.6.0.
+//! - `direct_io` / `iocp` / `kqueue` / `mmap` are target-driven (their
+//!   *syscall* availability is determined at compile time by the build
+//!   target; per-fd open-time rejection is signalled separately via
+//!   `Handle::active_method()`).
 
 /// Availability of kernel-level IO primitives.
 ///
@@ -19,10 +24,8 @@
 /// honest about which primitive they are checking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct IoPrimitives {
-    /// Linux `io_uring` interface (kernel 5.1+).
-    ///
-    /// `0.0.2` reports `false` unconditionally; runtime probing of
-    /// `io_uring_setup(2)` lands in `0.0.5`.
+    /// Linux `io_uring` interface (kernel 5.1+). Real runtime probe
+    /// since 0.5.0 (attempts a 1-entry submission ring).
     pub io_uring: bool,
     /// Windows I/O Completion Ports.
     ///
@@ -31,9 +34,11 @@ pub struct IoPrimitives {
     pub iocp: bool,
     /// BSD `kqueue` (macOS, FreeBSD, NetBSD, OpenBSD).
     pub kqueue: bool,
-    /// NVMe passthrough flush via `IORING_OP_URING_CMD` (Linux 5.19+)
-    /// or `IOCTL_STORAGE_PROTOCOL_COMMAND` (Windows). `0.0.2` reports
-    /// `false` until real device-class probing lands in `0.0.5`.
+    /// NVMe passthrough flush via `NVME_IOCTL_IO_CMD` (Linux) or
+    /// `IOCTL_STORAGE_PROTOCOL_COMMAND` (Windows).
+    ///
+    /// Real device-class + privilege probe since 0.6.0; lazily
+    /// computed on first hot-path query.
     pub nvme_passthrough: bool,
     /// Direct (page-cache-bypassing) IO. Available on Linux
     /// (`O_DIRECT`), macOS (`F_NOCACHE`), and Windows

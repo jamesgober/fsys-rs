@@ -159,7 +159,13 @@
 //! `fs.write_async()` outside a tokio runtime returns
 //! [`Error::AsyncRuntimeRequired`] rather than panicking.
 
-#![doc(html_root_url = "https://docs.rs/fsys/0.9.4")]
+// 0.9.6 audit H-12 — `html_root_url` was previously pinned to a
+// specific version string that drifted every release. docs.rs
+// handles per-version routing automatically; pinning it here
+// just creates a fix-at-version-bump chore that we'd inevitably
+// forget. Removed entirely. If a future release needs to
+// override docs.rs's default routing (rare), the attribute can
+// be re-added at that point with a clear reason.
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unused_must_use)]

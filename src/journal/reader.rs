@@ -182,14 +182,14 @@ impl JournalReader {
     /// surface as `BadMagic` or `ChecksumMismatch` on the next
     /// iteration.
     pub fn seek_to(&mut self, lsn: Lsn) {
-        self.cursor = lsn.0;
+        self.cursor = lsn.as_u64();
         self.last_state = JournalTailState::CleanEnd;
     }
 
     /// Returns the cursor's current byte offset.
     #[must_use]
     pub fn position(&self) -> Lsn {
-        Lsn(self.cursor)
+        Lsn::new(self.cursor)
     }
 
     /// Returns the journal file's size, captured at
@@ -265,12 +265,13 @@ impl JournalReader {
     ///   etc.).
     pub fn read_at_lsn(&mut self, lsn: Lsn) -> Result<JournalRecord> {
         // Read a header-sized chunk first to learn the length.
+        let lsn_off = lsn.as_u64();
         let mut header = [0u8; FRAME_OVERHEAD];
-        self.read_exact_at(lsn.0, &mut header[..8])?;
+        self.read_exact_at(lsn_off, &mut header[..8])?;
         let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
         // Read the full frame.
         let mut frame = vec![0u8; FRAME_OVERHEAD + length];
-        self.read_exact_at(lsn.0, &mut frame)?;
+        self.read_exact_at(lsn_off, &mut frame)?;
         // Decode + validate.
         match decode_frame(&frame) {
             FrameDecode::Ok {
@@ -504,7 +505,7 @@ impl<'a> Iterator for JournalIter<'a> {
                     payload_start,
                     payload_end,
                 } => {
-                    let lsn = Lsn(self.reader.cursor);
+                    let lsn = Lsn::new(self.reader.cursor);
                     let payload = view[payload_start..payload_end].to_vec();
                     self.reader.cursor += consumed as u64;
                     self.valid_start += consumed;
@@ -688,7 +689,7 @@ mod tests {
         writer.close().unwrap();
 
         let mut reader = JournalReader::open(&path).unwrap();
-        let r0 = reader.read_at_lsn(Lsn(0)).unwrap();
+        let r0 = reader.read_at_lsn(Lsn::ZERO).unwrap();
         assert_eq!(r0.payload, b"first");
         let r1 = reader.read_at_lsn(lsn_before_second).unwrap();
         assert_eq!(r1.payload, b"second");
@@ -762,7 +763,7 @@ mod tests {
         // payload starts at lsn_corrupt + 8 (after magic +
         // length).
         let mut bytes = std::fs::read(&path).unwrap();
-        let payload_offset = lsn_corrupt.0 as usize + 8;
+        let payload_offset = lsn_corrupt.as_u64() as usize + 8;
         bytes[payload_offset] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
 
@@ -784,6 +785,178 @@ mod tests {
         let next = reader.iter().next();
         assert!(next.is_none());
         assert_eq!(reader.tail_state(), JournalTailState::BadMagic);
+    }
+
+    /// 0.9.6 audit C-5 — torn-frame test sweep.
+    ///
+    /// For **every** byte position in a 3-frame journal, truncate
+    /// the file there and verify:
+    /// 1. `JournalReader::iter()` does not panic and does not hang.
+    /// 2. The records yielded before iteration ends are exactly
+    ///    the ones whose final byte landed at or before the
+    ///    truncation point.
+    /// 3. `tail_state()` after iteration is one of:
+    ///    - `CleanEnd` (truncation aligned at a frame boundary), OR
+    ///    - `TruncatedHeader` / `TruncatedPayload` / `ChecksumMismatch`
+    ///      (every torn position is detected, never silently accepted).
+    ///
+    /// This is the load-bearing recovery test for the journal —
+    /// pre-0.9.6 we had a single tear-position test per state
+    /// variant; the audit pointed out that single-position coverage
+    /// is insufficient. Now every byte position is verified.
+    #[test]
+    fn torn_frame_sweep_every_position_detected() {
+        let path = tmp_path("torn_sweep");
+        let _g = Cleanup(path.clone());
+
+        // Build a 3-frame journal. Each frame's payload is a
+        // distinct constant byte so a partial payload is visible
+        // in the recovered bytes.
+        let writer = JournalHandle::open(&path).unwrap();
+        let _ = writer.append(b"AAAA").unwrap();
+        let _ = writer.append(b"BBBB").unwrap();
+        let _ = writer.append(b"CCCC").unwrap();
+        writer.close().unwrap();
+
+        // Snapshot the full clean file so we can rebuild after each
+        // truncation iteration.
+        let full = std::fs::read(&path).unwrap();
+        assert!(!full.is_empty());
+
+        // Frame boundaries — 4-byte payload + FRAME_OVERHEAD (12) per
+        // frame = 16 bytes/frame. After frame 1: 16. After frame 2:
+        // 32. After frame 3: 48 (= full.len()).
+        let boundaries: std::collections::HashSet<usize> =
+            [16, 32, full.len()].iter().copied().collect();
+
+        // Sweep every byte position from 1 to full.len(). Position 0
+        // is an empty file — separate test path (`CleanEnd`, zero
+        // records), not relevant to the torn-frame sweep.
+        for trunc_to in 1..=full.len() {
+            std::fs::write(&path, &full[..trunc_to]).unwrap();
+
+            let mut reader = JournalReader::open(&path).unwrap();
+            let mut yielded = 0usize;
+            // Drain the iterator; collect record count.
+            for rec in reader.iter() {
+                let _ = rec.expect("iter yielded Err inside the sweep — should be None at tear");
+                yielded += 1;
+            }
+            let state = reader.tail_state();
+
+            // Records yielded must equal the number of frames whose
+            // tail byte (= frame_end_offset) is <= trunc_to.
+            let expected_records = match trunc_to {
+                n if n >= 48 => 3,
+                n if n >= 32 => 2,
+                n if n >= 16 => 1,
+                _ => 0,
+            };
+            assert_eq!(
+                yielded, expected_records,
+                "trunc_to={}: yielded={}, expected={}",
+                trunc_to, yielded, expected_records
+            );
+
+            // Tail state contract: aligned boundary → CleanEnd,
+            // otherwise one of the torn variants. Never silent
+            // success on a torn file.
+            if boundaries.contains(&trunc_to) {
+                assert_eq!(
+                    state,
+                    JournalTailState::CleanEnd,
+                    "trunc_to={} aligned at frame boundary — expected CleanEnd, got {:?}",
+                    trunc_to,
+                    state
+                );
+            } else {
+                assert!(
+                    matches!(
+                        state,
+                        JournalTailState::TruncatedHeader
+                            | JournalTailState::TruncatedPayload
+                            | JournalTailState::ChecksumMismatch
+                    ),
+                    "trunc_to={}: tail_state={:?} — torn file must report a torn state, never CleanEnd or BadMagic",
+                    trunc_to,
+                    state
+                );
+            }
+        }
+    }
+
+    /// 0.9.6 audit C-5 — single-byte-flip detection sweep.
+    ///
+    /// For every byte position in a single complete frame, flip the
+    /// byte and verify the reader detects the corruption (either
+    /// `ChecksumMismatch`, `BadMagic`, `LengthOverflow`,
+    /// `TruncatedHeader`, or `TruncatedPayload` — every variant
+    /// here is a "do not silently accept" signal).
+    ///
+    /// The point is that no single-byte corruption inside a
+    /// well-formed frame is ever silently accepted as valid.
+    /// The CRC-32C trailer is the load-bearing detector for the
+    /// payload bytes; the magic + length fields are detected via
+    /// `BadMagic` / `LengthOverflow`.
+    #[test]
+    fn single_byte_flip_sweep_every_position_detected() {
+        let path = tmp_path("flip_sweep");
+        let _g = Cleanup(path.clone());
+
+        let writer = JournalHandle::open(&path).unwrap();
+        let _ = writer.append(b"hello").unwrap(); // payload bytes = 5
+        writer.close().unwrap();
+
+        let full = std::fs::read(&path).unwrap();
+        // Frame layout: magic(4) + length(4) + payload(5) + crc(4) = 17 bytes.
+        assert_eq!(full.len(), 4 + 4 + 5 + 4);
+
+        for flip_idx in 0..full.len() {
+            let mut bytes = full.clone();
+            bytes[flip_idx] ^= 0xFF; // flip all 8 bits at this byte
+            std::fs::write(&path, &bytes).unwrap();
+
+            let mut reader = JournalReader::open(&path).unwrap();
+            // Iterating may yield no records (corruption blocks the
+            // single record) OR may yield the record + report
+            // corruption in the tail state (if the flip lands in
+            // the trailer in a way that doesn't break the CRC —
+            // theoretically impossible for a single byte flip
+            // since CRC-32C detects any single-byte change).
+            let mut yielded = 0usize;
+            for r in reader.iter() {
+                if r.is_err() {
+                    // Reader surfaces corruption mid-iteration —
+                    // also acceptable.
+                    break;
+                }
+                yielded += 1;
+            }
+            let state = reader.tail_state();
+
+            // A single-byte flip in a well-formed 17-byte frame
+            // must NEVER yield the record + CleanEnd. If yielded
+            // is 1 then state must be a corruption signal.
+            if yielded == 1 {
+                panic!(
+                    "flip_idx={}: reader yielded a record AND tail_state={:?} \
+                     — single-byte flip should always be detected",
+                    flip_idx, state
+                );
+            }
+            // yielded == 0 with any non-CleanEnd state is the
+            // expected outcome. We deliberately do NOT pin which
+            // specific variant — the format's detection layer
+            // (magic check / length validation / CRC) chooses
+            // based on where the flip landed, and any of the
+            // corruption variants is correct.
+            assert_ne!(
+                state,
+                JournalTailState::CleanEnd,
+                "flip_idx={}: a single-byte flip in a complete frame must not yield CleanEnd",
+                flip_idx
+            );
+        }
     }
 
     #[test]

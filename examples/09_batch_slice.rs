@@ -40,7 +40,8 @@ fn main() -> fsys::Result<()> {
         // BatchError carries a failed_at index + completed count.
         eprintln!(
             "batch failed at op {}, completed={}",
-            e.failed_at, e.completed
+            e.failed_at(),
+            e.completed()
         );
         return Err(*e.into_inner());
     }

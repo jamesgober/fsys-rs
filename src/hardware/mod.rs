@@ -9,12 +9,18 @@
 //!
 //! ## Status
 //!
-//! All probes in `0.0.2` return correctly-shaped data, but most fields
-//! carry conservative defaults. Real device interrogation —
-//! NVMe Identify, sector-size lookup, PLP detection, capacity probing,
-//! `sysinfo`/`GetSystemInfo` for memory — lands in `0.0.5`. Each
-//! deferred field is marked with a `TODO(0.0.5)` comment in the
-//! corresponding sub-module.
+//! Every load-bearing probe is now real:
+//! - **Drive identity** (NVMe model / firmware / serial / sector
+//!   sizes) — real probe via `NVME_IOCTL_ADMIN_CMD` since 0.6.0.
+//! - **Sector size** — real probe (`statfs`/`GetDiskFreeSpaceW`)
+//!   since 0.5.0.
+//! - **PLP detection** — real probe via SCSI Inquiry + NVMe
+//!   feature flags since 0.9.2.
+//! - **NAWUN / NAWUPF** (atomic-write unit) — real probe via NVMe
+//!   Identify Namespace since 0.9.4.
+//! - **CPU features** — true runtime detection (CPUID on x86,
+//!   HWCAP on aarch64) since 0.9.2.
+//! - **Memory** — `sysinfo`/`GetGlobalMemoryStatusEx` since 0.5.0.
 
 use std::sync::OnceLock;
 

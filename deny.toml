@@ -1,0 +1,50 @@
+# 0.9.6 — cargo-deny configuration. Wired into the `audit.yml` CI
+# workflow; runs on push, PR, daily schedule, and manual dispatch.
+#
+# This config errs on the strict side for foundation-tier hygiene
+# (deny unmaintained / unsound advisories, enforce dual MIT/Apache
+# license policy on all deps) while staying pragmatic about the
+# transitive bloat criterion pulls in for dev-only benchmarks.
+
+[advisories]
+# Default: warn on yanked crates, error on advisories.
+yanked = "warn"
+
+[licenses]
+# fsys-rs ships under Apache-2.0 OR MIT. Allow the canonical
+# permissive license set that's compatible with dual licensing.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "0BSD",
+]
+confidence-threshold = 0.93
+
+[bans]
+# Detect duplicate transitive dep versions (often a sign of a
+# Cargo.lock drift). Warn only — some duplicates are unavoidable
+# in healthy ecosystems (`syn` is the canonical example).
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+# Pre-approved version skews where the duplicate is well-known
+# and unavoidable. Keep this list short; every entry should have
+# a tracking note.
+skip = []
+
+[sources]
+# Require all deps to come from crates.io. Git deps and unknown
+# registries are denied — foundation-tier libraries should not
+# carry git-pinned deps.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

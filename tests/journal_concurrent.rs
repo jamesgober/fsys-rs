@@ -266,3 +266,105 @@ fn append_returns_lsn_equal_to_file_size_after_each_op() {
     }
     let _ = JournalHandle::close;
 }
+
+/// 0.9.6 audit H-8 — concurrent stress with a thread-count
+/// ladder.
+///
+/// Pre-0.9.6, concurrent-append tests ran at fixed thread counts
+/// (8 / 16). Race conditions, lock contention, and false-sharing
+/// effects are thread-count-dependent — a bug at N=32 might be
+/// invisible at N=8. This test sweeps the full ladder so a
+/// regression at any depth is caught in CI.
+///
+/// Verifies the same byte-corruption + LSN-monotonicity
+/// invariants as `concurrent_appends_produce_no_data_corruption`
+/// but at each of `[1, 2, 4, 8, 16, 32]` threads. The 1-thread
+/// case is the regression check for the lock-free single-writer
+/// path; the higher counts catch contention-related races.
+#[test]
+fn concurrent_appends_thread_count_ladder() {
+    const RECORDS_PER_THREAD: usize = 250;
+    const RECORD_SIZE: usize = 32;
+
+    for &thread_count in &[1usize, 2, 4, 8, 16, 32] {
+        let path = tmp_path(&format!("ladder_{thread_count}"));
+        let _g = Cleanup(path.clone());
+
+        let fs = builder().build().expect("handle");
+        let log = Arc::new(fs.journal(&path).expect("journal"));
+        let barrier = Arc::new(Barrier::new(thread_count));
+
+        let mut handles = Vec::with_capacity(thread_count);
+        for tid in 0..thread_count {
+            let log = Arc::clone(&log);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let payload = vec![tid as u8; RECORD_SIZE];
+                let _ = barrier.wait();
+                let mut last_lsn = Lsn::ZERO;
+                for _ in 0..RECORDS_PER_THREAD {
+                    last_lsn = log.append(&payload).expect("append");
+                }
+                last_lsn
+            }));
+        }
+
+        // Collect each thread's last LSN.
+        let mut last_lsns: Vec<Lsn> = Vec::with_capacity(thread_count);
+        for h in handles {
+            last_lsns.push(h.join().expect("thread join"));
+        }
+
+        // Final sync_through on the highest LSN observed by any
+        // thread.
+        let high = last_lsns.iter().copied().max().unwrap_or(Lsn::ZERO);
+        log.sync_through(high).expect("final sync");
+
+        // Verify invariants:
+        // 1. File size == high LSN (every byte accounted for).
+        let actual_size = std::fs::metadata(&path).expect("stat").len();
+        assert_eq!(
+            actual_size,
+            high.as_u64(),
+            "thread_count={thread_count}: file size should equal high LSN"
+        );
+
+        // 2. Reading every record back yields exactly
+        //    thread_count × RECORDS_PER_THREAD records, each
+        //    RECORD_SIZE bytes of one thread ID byte repeated.
+        let mut reader = JournalReader::open(&path).expect("reader open");
+        let mut record_count = 0usize;
+        let mut per_thread_count = vec![0usize; thread_count];
+        for rec in reader.iter() {
+            let r = rec.expect("read record");
+            assert_eq!(
+                r.payload.len(),
+                RECORD_SIZE,
+                "thread_count={thread_count}: every record should be RECORD_SIZE bytes"
+            );
+            let tid = r.payload[0] as usize;
+            assert!(
+                tid < thread_count,
+                "thread_count={thread_count}: record payload byte {tid} >= thread_count {thread_count}"
+            );
+            // All bytes in this record should be the same thread ID byte.
+            assert!(
+                r.payload.iter().all(|&b| b == tid as u8),
+                "thread_count={thread_count}: record payload not uniform (interleaving bug?)"
+            );
+            per_thread_count[tid] += 1;
+            record_count += 1;
+        }
+        assert_eq!(
+            record_count,
+            thread_count * RECORDS_PER_THREAD,
+            "thread_count={thread_count}: missing records"
+        );
+        for (tid, count) in per_thread_count.iter().enumerate() {
+            assert_eq!(
+                *count, RECORDS_PER_THREAD,
+                "thread_count={thread_count}, tid={tid}: per-thread record count mismatch"
+            );
+        }
+    }
+}

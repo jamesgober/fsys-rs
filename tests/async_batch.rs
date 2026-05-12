@@ -124,7 +124,7 @@ async fn batch_async_failure_reports_failed_at_correctly() {
         ])
         .await
         .expect_err("path escape must fail");
-    assert_eq!(err.failed_at, 1);
+    assert_eq!(err.failed_at(), 1);
 }
 
 fn scopeguard_remove_dir_all(p: PathBuf) -> impl Drop {
