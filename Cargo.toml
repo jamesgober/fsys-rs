@@ -106,6 +106,16 @@ fuzz = []
 # observability environments where `tracing` subscribers
 # (tokio-console, OpenTelemetry, etc.) are already wired.
 tracing = ["dep:tracing"]
+# 0.9.7 H-9 / H-7 — internal test-hooks feature. Replaces the
+# system global allocator with an OOM-injecting one that tests
+# can program (via thread-local size threshold) to fail allocs
+# above a target size. NEVER enable in production builds —
+# every allocation goes through an extra dispatch + threshold
+# check. The feature is here to make the integration test
+# `tests/oom_injection.rs` compileable; CI runs it as a separate
+# matrix entry with `--features oom_inject` and the production
+# matrix never sees it.
+oom_inject = []
 
 
 ###########################

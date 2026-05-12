@@ -207,6 +207,30 @@ pub mod substrate;
 #[cfg(feature = "async")]
 pub mod async_io;
 
+/// 0.9.7 H-7 — internal OOM-injection allocator hooks.
+///
+/// **NEVER enable the `oom_inject` feature in production.** Every
+/// allocation pays a thread-local lookup + comparison. The
+/// feature exists solely to make `tests/oom_injection.rs`
+/// compileable; the integration test is the regression guard for
+/// `AlignedBuf::new` / `read_all_direct` / other fallible-alloc
+/// paths.
+///
+/// When `oom_inject` is enabled, the global allocator is replaced
+/// with `OomInjectingAllocator` from `test_support`. The
+/// `OOM_THRESHOLD` thread-local controls injection: allocations
+/// of `>= threshold` bytes return `null` (OOM). Tests use the
+/// `OomThreshold` RAII guard to set + restore the threshold
+/// safely across scope exit (including panics).
+#[cfg(feature = "oom_inject")]
+#[doc(hidden)]
+pub mod test_support;
+
+#[cfg(feature = "oom_inject")]
+#[global_allocator]
+static FSYS_OOM_INJECTING_ALLOCATOR: test_support::OomInjectingAllocator =
+    test_support::OomInjectingAllocator;
+
 /// Internal fuzz-test surface. Wraps `pub(crate)` helpers under
 /// `cfg(feature = "fuzz")` so the cargo-fuzz workspace can reach
 /// them without making them part of the public 1.0 API surface.
