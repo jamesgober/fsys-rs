@@ -702,8 +702,17 @@ impl Handle {
 
     /// Updates the configured method for future IO operations.
     ///
-    /// Returns [`Error::UnsupportedMethod`] for reserved variants
-    /// ([`Method::Mmap`] and [`Method::Journal`]).
+    /// Resolves [`Method::Auto`] through the hardware-probe ladder
+    /// (same logic as [`Builder::build`](crate::Builder::build)) and
+    /// publishes both the configured + resolved values atomically.
+    /// Existing in-flight IO is unaffected; only subsequent calls
+    /// pick up the new method.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::UnsupportedMethod`] if `method` is a reserved
+    ///   variant ([`Method::Journal`] — see its docs for why it's
+    ///   reserved).
     pub fn set_method(&self, method: Method) -> Result<()> {
         if method.is_reserved() {
             return Err(Error::UnsupportedMethod {
@@ -718,14 +727,24 @@ impl Handle {
         Ok(())
     }
 
-    /// Returns the root directory scope, if one was configured.
+    /// Returns the root directory scope, if one was configured via
+    /// [`Builder::root`](crate::Builder::root).
+    ///
+    /// When set, every path passed to a `Handle::*` method is
+    /// resolved against this root, and absolute paths that escape it
+    /// are rejected with [`Error::InvalidPath`]. The returned path
+    /// is canonical (`build()` runs `std::fs::canonicalize` once).
     #[must_use]
     #[inline]
     pub fn root(&self) -> Option<&Path> {
         self.root.as_deref()
     }
 
-    /// Returns the operating mode.
+    /// Returns the resolved operating mode ([`Mode::Dev`] or
+    /// [`Mode::Prod`]; [`Mode::Auto`] is resolved at build time).
+    ///
+    /// Affects defaults for path selection inside [`fsys::path`](crate::path)
+    /// helpers.
     #[must_use]
     #[inline]
     pub fn mode(&self) -> Mode {
@@ -734,7 +753,15 @@ impl Handle {
 
     /// Returns the probed logical sector size in bytes.
     ///
-    /// Used to size aligned Direct IO buffers.
+    /// Captured once at handle construction via the platform's
+    /// sector-size probe (Linux `ioctl(BLKSSZGET)`, macOS
+    /// `IOServiceGetMatchingService`, Windows
+    /// `STORAGE_PROPERTY_QUERY`). Used to size aligned [`Method::Direct`]
+    /// IO buffers and to round up `buffer_pool_block_size` to a sector
+    /// multiple.
+    ///
+    /// Typical values are 512 (legacy disks, 512e SSDs) or 4096
+    /// (most modern NVMe / 4Kn drives).
     #[must_use]
     #[inline]
     pub fn sector_size(&self) -> u32 {
