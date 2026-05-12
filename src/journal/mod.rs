@@ -488,17 +488,50 @@ impl JournalHandle {
     /// Appends `record` to the journal and returns the LSN
     /// immediately after this record (i.e. the next-write position).
     ///
-    /// Does **not** fsync. Multiple threads may call `append`
-    /// concurrently — the LSN reservation is a single
+    /// Does **not** fsync. Call [`Self::sync_through`] explicitly when
+    /// durability is required. The journal's value proposition is
+    /// exactly this separation: many cheap appends amortised across one
+    /// fsync at a transaction boundary.
+    ///
+    /// # Concurrency
+    ///
+    /// Multiple threads may call `append` concurrently against the
+    /// same `Arc<JournalHandle>`. The LSN reservation is a single
     /// `AtomicU64::fetch_add` (no mutex on the hot path); the
     /// underlying `pwrite` calls are concurrent-safe per POSIX
     /// for typical record sizes. For sub-page records (≤ 4 KiB
     /// typically) `pwrite` is atomic per call; larger records
     /// are looped on partial writes inside the platform layer.
     ///
+    /// For bulk-load patterns (N records committed together), prefer
+    /// [`Self::append_batch`] — single LSN reservation, single syscall,
+    /// ~1.6× per-record reduction over `append`-in-loop.
+    ///
     /// # Errors
     ///
     /// - [`Error::Io`] on the underlying write failure.
+    /// - [`Error::Io`] with `InvalidInput` if the record exceeds
+    ///   `FRAME_MAX_PAYLOAD` (256 MiB).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use fsys::builder;
+    ///
+    /// # fn example() -> fsys::Result<()> {
+    /// let fs = builder().build()?;
+    /// let log = fs.journal("/var/lib/myapp/log.wal")?;
+    ///
+    /// // Append three records — no fsync, no syscall amplification.
+    /// let _ = log.append(b"txn 1: insert k=v")?;
+    /// let _ = log.append(b"txn 2: update k=v'")?;
+    /// let lsn = log.append(b"txn 3: commit")?;
+    ///
+    /// // One fsync covers every prior append.
+    /// log.sync_through(lsn)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn append(&self, record: &[u8]) -> Result<Lsn> {
         #[cfg(feature = "tracing")]
         let _span = tracing::trace_span!(
@@ -687,6 +720,28 @@ impl JournalHandle {
     ///   maximum payload size (256 MiB), if the total batch
     ///   size overflows `usize`, or if the underlying write
     ///   fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use fsys::builder;
+    ///
+    /// # fn example() -> fsys::Result<()> {
+    /// let fs = builder().build()?;
+    /// let log = fs.journal("/var/lib/myapp/log.wal")?;
+    ///
+    /// // 256 records committed as one syscall.
+    /// let records: Vec<Vec<u8>> = (0..256)
+    ///     .map(|i| format!("txn {i}: insert").into_bytes())
+    ///     .collect();
+    /// let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+    /// let lsn = log.append_batch(&refs)?;
+    ///
+    /// // One fsync, durable batch.
+    /// log.sync_through(lsn)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn append_batch(&self, records: &[&[u8]]) -> Result<Lsn> {
         #[cfg(feature = "tracing")]
         let _span = tracing::trace_span!(
@@ -843,21 +898,61 @@ impl JournalHandle {
 
     /// Forces all bytes up to `lsn` to stable storage.
     ///
-    /// Group-committed: concurrent calls coalesce into a single
-    /// `fsync` syscall. Callers waiting for an LSN ≤ the synced
-    /// frontier return immediately when the in-flight fsync
-    /// completes.
+    /// # Group-commit semantics
     ///
-    /// `sync_through(Lsn::ZERO)` is a no-op — nothing has been
-    /// appended below offset zero. `sync_through(lsn)` where
-    /// `lsn` exceeds the highest appended LSN syncs the
-    /// currently-appended frontier (whatever has been appended
-    /// up to "now").
+    /// Concurrent `sync_through` calls coalesce into a single `fsync`
+    /// syscall via a leader/follower coordinator. The first caller
+    /// in each round becomes the **leader** and runs the fsync;
+    /// subsequent callers waiting for an LSN ≤ the synced frontier
+    /// become **followers** and return as soon as the leader's
+    /// syscall completes. This is the architectural lever behind the
+    /// journal's 100-700× throughput advantage over per-write
+    /// atomic-replace (one syscall amortised across N callers).
+    ///
+    /// The 0.9.7 H-16 wake-path fix ensures followers exit via
+    /// atomic-only checks on `synced_lsn` rather than re-acquiring
+    /// the state mutex — a ~5× reduction in lock-hold time under
+    /// 100+ concurrent followers.
+    ///
+    /// # Edge cases
+    ///
+    /// - [`Lsn::ZERO`] is the start-of-journal sentinel;
+    ///   `sync_through(Lsn::ZERO)` is a guaranteed no-op.
+    /// - `sync_through(lsn)` where `lsn` exceeds the highest appended
+    ///   LSN syncs the currently-appended frontier (whatever
+    ///   `next_lsn` is at the moment the leader captures it). The
+    ///   "future" portion of `lsn` is not covered — that's the
+    ///   responsibility of a subsequent `sync_through` call.
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] if the underlying `fsync`/`fdatasync`
-    ///   fails.
+    /// - [`Error::Io`] if the underlying `fsync`/`fdatasync`/
+    ///   platform-equivalent syscall fails.
+    /// - [`Error::Io`] with the inner error reflecting any
+    ///   buffer-flush failure on Direct-IO journals.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use fsys::builder;
+    ///
+    /// # fn example() -> fsys::Result<()> {
+    /// let fs = builder().build()?;
+    /// let log = fs.journal("/var/lib/myapp/log.wal")?;
+    ///
+    /// // Many cheap appends, no per-call fsync.
+    /// for i in 0..1000 {
+    ///     log.append(format!("record {i}").as_bytes())?;
+    /// }
+    ///
+    /// // One group-commit fsync covers every prior append.
+    /// log.sync_through(log.next_lsn())?;
+    ///
+    /// // Verify the durable frontier moved.
+    /// assert!(log.synced_lsn() >= log.next_lsn());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn sync_through(&self, lsn: Lsn) -> Result<()> {
         #[cfg(feature = "tracing")]
         let _span = tracing::trace_span!(
