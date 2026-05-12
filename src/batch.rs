@@ -138,6 +138,15 @@ impl<'a> Batch<'a> {
     /// # Errors
     ///
     /// See [`Handle::write_batch`] for the full error contract.
+    ///
+    /// # Must use
+    ///
+    /// `commit` returns a `Result` reporting per-op failures —
+    /// discarding it would let a batch that failed at op N look
+    /// successful to the caller. `#[must_use]` makes that mistake
+    /// surface at compile time.
+    #[must_use = "Batch::commit returns a Result reporting per-op failures; \
+                  discarding it loses the failure-position information"]
     pub fn commit(self) -> std::result::Result<(), BatchError> {
         let Self { handle, ops } = self;
         let resolved = resolve_ops(handle, ops)?;
@@ -185,6 +194,8 @@ impl<'a> Batch<'a> {
     /// # Errors
     ///
     /// Same contract as [`Self::commit`].
+    #[must_use = "Batch::commit_grouped returns a Result reporting per-op failures; \
+                  discarding it loses the failure-position information"]
     pub fn commit_grouped(self) -> std::result::Result<(), BatchError> {
         let Self { handle, ops } = self;
         let resolved = resolve_ops(handle, ops)?;

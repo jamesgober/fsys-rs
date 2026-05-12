@@ -152,6 +152,20 @@ pub(crate) fn advise(_file: &File, _offset: u64, _len: u64, _advice: crate::Advi
     Ok(())
 }
 
+/// 0.9.6 — Hole punching is platform-specific (Linux `fallocate`, macOS
+/// `F_PUNCHHOLE`, Windows `FSCTL_SET_ZERO_DATA`) and there's no portable
+/// fallback that preserves the contract ("storage reclaimed, length
+/// unchanged, reads return zeros"). A buffered zero-fill would satisfy
+/// the read-back-zeros half but not the storage-reclamation half, so
+/// surfacing `ErrorKind::Unsupported` is the honest answer for the
+/// fallback platform.
+pub(crate) fn punch_hole(_file: &File, _offset: u64, _len: u64) -> Result<()> {
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "punch_hole not supported on this platform",
+    )))
+}
+
 pub(crate) fn probe_direct_io_available() -> bool {
     false
 }

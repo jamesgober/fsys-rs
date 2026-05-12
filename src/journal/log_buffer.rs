@@ -229,6 +229,73 @@ impl LogBuffer {
         self.state.lock().active_len
     }
 
+    /// 0.9.6 — Batched-append fast path. Audit finding H-15.
+    ///
+    /// When all `records` fit in the active slot's remaining
+    /// capacity, encode + memcpy every frame into the slot under a
+    /// **single** state-lock acquisition. Returns
+    /// `Ok(Some((start_lsn, end_lsn)))` with the byte-offset range
+    /// the batch occupies.
+    ///
+    /// Returns `Ok(None)` when the batch wouldn't fit in one shot
+    /// (would require rotation or an oversize record). The caller
+    /// falls back to the per-record [`Self::append_frame`] loop
+    /// which handles rotation, mid-flush waits, and the
+    /// oversize-standalone path.
+    ///
+    /// **Win vs per-record loop.** For an N-record batch, this
+    /// reduces lock acquisitions from N to 1. With `parking_lot`'s
+    /// uncontended-acquire cost ~50-100 ns and contended ~µs, the
+    /// per-record overhead saved is meaningful at large N — a
+    /// 1000-record batch on 8 threads saves ~50-800 µs of lock
+    /// overhead.
+    pub(crate) fn try_append_frames_batched(
+        &self,
+        records: &[&[u8]],
+        total_encoded_size: usize,
+    ) -> Result<Option<(u64, u64)>> {
+        if records.is_empty() {
+            return Ok(Some((0, 0)));
+        }
+        let mut state = self.state.lock();
+        let remaining = self.capacity.saturating_sub(state.active_len);
+        if total_encoded_size > remaining {
+            // Doesn't fit in one shot — let the caller fall back
+            // to the per-record path which handles rotation.
+            return Ok(None);
+        }
+        let active_idx = state.active_idx as usize;
+        let offset_start = state.active_len;
+        let start_lsn = state.active_flush_pos + offset_start as u64;
+        let mut cursor = offset_start;
+        // SAFETY: we hold the state lock; the active slot is
+        // exclusively ours for the duration of every encode below.
+        // No other thread can mutate `bufs[active_idx]` while we
+        // hold the lock; the state-machine invariant
+        // `active_idx != flushing.unwrap()` is maintained by
+        // [`Self::append_frame`]'s rotation path.
+        unsafe {
+            let slice = (*self.bufs[active_idx].get()).as_mut_slice();
+            for record in records {
+                let frame_size = record
+                    .len()
+                    .checked_add(format::FRAME_OVERHEAD)
+                    .ok_or_else(|| {
+                        Error::Io(std::io::Error::other("batched frame size overflow"))
+                    })?;
+                // `total_encoded_size` was computed by the caller
+                // and matches `sum(record.len + FRAME_OVERHEAD)`;
+                // since we verified `total_encoded_size <=
+                // remaining` above, this slice is in-bounds.
+                let _ = format::encode_frame_into(record, &mut slice[cursor..cursor + frame_size])?;
+                cursor += frame_size;
+            }
+        }
+        state.active_len = cursor;
+        let end_lsn = state.active_flush_pos + cursor as u64;
+        Ok(Some((start_lsn, end_lsn)))
+    }
+
     /// Encodes `payload` as a frame and appends to the active
     /// slot, rotating slots when the active fills and waiting
     /// for the dormant slot's flush to finish if both are busy.
@@ -320,11 +387,16 @@ impl LogBuffer {
                     let mut state = self.state.lock();
                     // SAFETY: state.flushing is still Some(old_idx);
                     // we are still the exclusive owner.
+                    //
+                    // 0.9.6 — `slice.fill(0)` lowers to `memset`
+                    // (vectorised) on every supported toolchain
+                    // since rustc 1.51. The pre-0.9.6 hand-rolled
+                    // `for b in slice.iter_mut() { *b = 0; }` was
+                    // not always vectorised on debug builds and
+                    // cost ~5-10 µs per rotation on a 64 KiB slot.
                     unsafe {
                         let slice = (*self.bufs[old_idx as usize].get()).as_mut_slice();
-                        for b in slice.iter_mut() {
-                            *b = 0;
-                        }
+                        slice.fill(0);
                     }
                     state.flushing = None;
                     let _ = self.flush_done.notify_all();

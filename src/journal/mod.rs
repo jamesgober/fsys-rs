@@ -96,20 +96,63 @@ const STACK_FRAME_THRESHOLD: usize = 2048;
 /// transparent ordering (`Lsn(100) < Lsn(200)` ⟺ the first
 /// record was appended before the second).
 ///
-/// `Lsn(0)` is the start-of-journal sentinel — equivalent to
+/// `Lsn::ZERO` is the start-of-journal sentinel — equivalent to
 /// "nothing has been appended yet."
+///
+/// # Construction
+///
+/// The inner byte offset is **private** to preserve the monotonic
+/// invariant (LSNs may only be minted by the journal; external
+/// mutation via `lsn.0 = ...` is intentionally forbidden). Construct
+/// from a raw `u64` via [`Lsn::new`] or [`From<u64>`] when forwarding
+/// a persisted offset back through [`JournalHandle::sync_through`]:
+///
+/// ```
+/// use fsys::Lsn;
+/// let lsn = Lsn::new(1100);
+/// let same: Lsn = 1100u64.into();
+/// assert_eq!(lsn, same);
+/// ```
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Lsn(pub u64);
+pub struct Lsn(u64);
 
 impl Lsn {
-    /// The start-of-journal sentinel. Equivalent to `Lsn(0)` and
+    /// The start-of-journal sentinel. Equivalent to `Lsn::new(0)` and
     /// `Lsn::default()`.
     pub const ZERO: Lsn = Lsn(0);
 
+    /// Constructs an `Lsn` from a raw byte offset.
+    ///
+    /// Typically only the journal mints LSNs; callers receive them
+    /// from [`JournalHandle::append`] and forward them back through
+    /// [`JournalHandle::sync_through`]. This constructor exists for
+    /// the round-trip case where the LSN was persisted externally
+    /// (e.g., in a downstream index) and needs to be reconstructed.
+    #[must_use]
+    #[inline]
+    pub const fn new(offset: u64) -> Self {
+        Self(offset)
+    }
+
     /// Returns the LSN's underlying byte offset.
     #[must_use]
-    pub fn as_u64(self) -> u64 {
+    #[inline]
+    pub const fn as_u64(self) -> u64 {
         self.0
+    }
+}
+
+impl From<u64> for Lsn {
+    #[inline]
+    fn from(offset: u64) -> Self {
+        Self(offset)
+    }
+}
+
+impl From<Lsn> for u64 {
+    #[inline]
+    fn from(lsn: Lsn) -> Self {
+        lsn.0
     }
 }
 
@@ -666,25 +709,38 @@ impl JournalHandle {
         }
 
         if let Some(log_buffer) = &self.log_buffer {
-            // Direct-IO log-buffer path. Each record funnels
-            // through `append_frame` so the buffer's partial-
-            // flush / oversize-record invariants stay intact.
-            // 0.9.5: the LogBuffer self-locks per call; we lose
-            // the "one mutex acquire per whole batch" of pre-
-            // 0.9.5 dual-mutex coordination, but gain
-            // concurrent flush/append from the dual-buffer design.
-            // The net win on multi-record batches comes from the
-            // dual-buffer letting rotation happen mid-batch
-            // without blocking subsequent records.
-            let mut last_end: u64 = self.next_lsn.load(Ordering::Acquire);
-            for record in records {
-                let (_start, end) = log_buffer.append_frame(&self.file, record)?;
-                last_end = end;
-            }
+            // Direct-IO log-buffer path.
+            //
+            // 0.9.6 — try the batched fast path first
+            // (`try_append_frames_batched`): when the entire batch
+            // fits in the active slot's remaining capacity, every
+            // record is encoded + memcopied under ONE state-lock
+            // acquisition. For an N-record batch on contended
+            // threads this saves N-1 lock acquire/release cycles
+            // (~50-100 ns each uncontended, µs each contended).
+            //
+            // The batched fast path returns `None` when the batch
+            // doesn't fit in one shot (would require rotation or
+            // includes an oversize record). In that case we fall
+            // back to the per-record loop which handles rotation,
+            // mid-flush waits, and the oversize-standalone path
+            // correctly. 0.9.5's concurrent-flush invariants are
+            // preserved on both paths.
+            let last_end = match log_buffer.try_append_frames_batched(records, total)? {
+                Some((_start, end)) => end,
+                None => {
+                    let mut last: u64 = self.next_lsn.load(Ordering::Acquire);
+                    for record in records {
+                        let (_start, end) = log_buffer.append_frame(&self.file, record)?;
+                        last = end;
+                    }
+                    last
+                }
+            };
             self.next_lsn.store(last_end, Ordering::Release);
             #[cfg(feature = "tracing")]
             tracing::trace!(end_lsn = last_end, "direct append_batch complete");
-            return Ok(Lsn(last_end));
+            return Ok(Lsn::new(last_end));
         }
 
         // Buffered-mode batch path: one LSN reservation, one

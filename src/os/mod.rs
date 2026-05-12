@@ -289,12 +289,46 @@ fn current_endianness() -> Endianness {
     }
 }
 
-const fn default_page_size() -> usize {
-    // Apple Silicon uses 16 KiB pages; nearly every other supported
-    // target uses 4 KiB. Real probing via `sysconf(_SC_PAGESIZE)` /
-    // `GetSystemInfo` is deferred to 0.0.5 so this layer stays
-    // dependency-free.
-    // TODO(0.0.5): replace with platform-specific probe.
+/// Probes the host page size at runtime.
+///
+/// 0.9.6 — replaces the pre-0.9.6 const-fallback (`16_384` on Apple
+/// Silicon, `4_096` elsewhere) with a real probe:
+/// - **Unix**: `sysconf(_SC_PAGESIZE)`.
+/// - **Windows**: `GetSystemInfo` via `windows-sys`.
+/// - **Other**: fall back to the architecture-aware default.
+///
+/// The probe runs once and is cached by the parent `OnceLock` —
+/// per-call cost is the OnceLock load, not the sysconf hit.
+fn default_page_size() -> usize {
+    #[cfg(unix)]
+    {
+        // SAFETY: `sysconf(2)` is a thread-safe syscall with no
+        // side effects beyond returning the configured value or
+        // `-1` on error. `_SC_PAGESIZE` is a well-known mandatory
+        // sysconf name on every Unix.
+        let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if v > 0 {
+            return v as usize;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+        // SAFETY: `info` is a stack-allocated SYSTEM_INFO; the
+        // all-zeros bit pattern is valid (POD struct). GetSystemInfo
+        // writes into the struct through the pointer.
+        let mut info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: pointer is valid for the call duration; the
+        // function has no failure return (writes the struct
+        // unconditionally).
+        unsafe { GetSystemInfo(&mut info) };
+        let p = info.dwPageSize as usize;
+        if p > 0 {
+            return p;
+        }
+    }
+    // Unknown / probe-failure fallback. Apple Silicon uses 16 KiB,
+    // everything else 4 KiB.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         16_384

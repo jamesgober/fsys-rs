@@ -34,8 +34,11 @@ pub(crate) fn open_write_new(path: &Path, use_direct: bool) -> Result<(File, boo
         if ret < 0 {
             // F_NOCACHE failure is rare (some HFS+ configurations). Proceed
             // without it but still use F_FULLFSYNC for durability. The caller
-            // will observe the fallback via the returned false flag.
-            // TODO(0.3.0): emit a metrics event for this fallback.
+            // observes the fallback via the returned false flag and updates
+            // `active_method()` accordingly — downstream code can query
+            // `Handle::active_method()` to detect the fallback. (Previously
+            // this site had a `TODO(0.3.0)` for a metrics event; that signal
+            // is now surfaced via the public `active_method()` accessor.)
             // SAFETY: fd is valid and owned.
             let file = unsafe { File::from_raw_fd(fd) };
             return Ok((file, false));
@@ -195,6 +198,16 @@ pub(crate) fn write_at(file: &File, offset: u64, data: &[u8]) -> Result<()> {
             }
             return Err(Error::Io(err));
         }
+        // 0.9.6 — Guard against infinite loop on zero-byte pwrite
+        // return. POSIX allows pwrite to return 0; on macOS this
+        // is most often a network-filesystem (AFP / SMB) edge case.
+        // Without this guard the loop spins forever consuming CPU.
+        if n == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "pwrite returned 0 in write_at (no progress)",
+            )));
+        }
         written += n as usize;
     }
     Ok(())
@@ -231,14 +244,41 @@ pub(crate) fn read_all_direct(file: &File, file_size: u64, sector_size: u32) -> 
     let mut buf = AlignedBuf::new(aligned_len, ss)?;
 
     let fd = file.as_raw_fd();
-    let ptr = buf.as_mut_slice().as_mut_ptr().cast::<libc::c_void>();
-    // SAFETY: fd is valid; buf is aligned and has aligned_len bytes; offset 0.
-    let n = unsafe { libc::pread(fd, ptr, aligned_len, 0) };
-    if n < 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
+
+    // 0.9.6 — pread on F_NOCACHE files may return EINTR (signal)
+    // or a short read (POSIX-legal). Loop with EINTR retry and
+    // short-read accumulation. Required for journal-recovery
+    // path resilience.
+    let mut total = 0usize;
+    while total < aligned_len {
+        // SAFETY: fd is valid for the duration; buffer slice
+        // from `total` onward is owned by us and lives across
+        // the syscall; aligned at every iteration (pread on
+        // F_NOCACHE returns sector multiples or 0 at EOF).
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buf.as_mut_slice()[total..]
+                    .as_mut_ptr()
+                    .cast::<libc::c_void>(),
+                aligned_len - total,
+                total as libc::off_t,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(Error::Io(err));
+        }
+        if n == 0 {
+            break;
+        }
+        total += n as usize;
     }
 
-    let trimmed = usize::min(n as usize, file_size as usize);
+    let trimmed = usize::min(total, file_size as usize);
     Ok(buf.as_slice()[..trimmed].to_vec())
 }
 
@@ -428,8 +468,37 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
-    // TODO(0.5.0): use clonefile(2) for instant, copy-on-write file cloning
-    // on APFS. Falls back to std::fs::copy for now.
+    // 0.9.6 — Try `clonefile(2)` for instant copy-on-write cloning
+    // on APFS. On non-APFS filesystems (HFS+, exFAT, SMB, NFS), or
+    // when the destination already exists, or on cross-device
+    // copies, the syscall returns an error and we fall back to
+    // `std::fs::copy` for full-byte-copy semantics.
+    //
+    // The win for HiveDB checkpoint flush workloads is significant:
+    // clonefile is O(metadata) — the data blocks are shared until
+    // first write (COW). For a 1 GiB checkpoint clone, this drops
+    // from seconds to microseconds on APFS.
+    //
+    // Important: clonefile **requires the destination not to exist**.
+    // We don't pre-unlink dst because that would be a TOCTOU race;
+    // instead the EEXIST error path falls through to std::fs::copy
+    // which overwrites correctly.
+    if let (Ok(src_cstr), Ok(dst_cstr)) = (path_to_cstr(src), path_to_cstr(dst)) {
+        // SAFETY: src_cstr and dst_cstr are valid NUL-terminated
+        // C strings owned by the local CString values for the
+        // duration of this call. clonefile reads both paths and
+        // returns 0 on success or -1 with errno on error.
+        let rc = unsafe { libc::clonefile(src_cstr.as_ptr(), dst_cstr.as_ptr(), 0) };
+        if rc == 0 {
+            // Success — return the source file's byte length, matching
+            // std::fs::copy's return value contract.
+            return std::fs::metadata(src).map(|m| m.len()).map_err(Error::Io);
+        }
+        // Fall through to std::fs::copy on any error (ENOTSUP for
+        // non-APFS, EEXIST for existing dst, EXDEV for cross-device,
+        // EACCES for permission issues). The fallback path covers
+        // every error case cleanly.
+    }
     std::fs::copy(src, dst).map_err(Error::Io)
 }
 

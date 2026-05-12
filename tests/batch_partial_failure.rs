@@ -1,7 +1,8 @@
 //! 0.4.0 integration: decision #5 — independent ops, not transactions.
 //!
 //! When a batch op fails (returned `Err`, not panic), the dispatcher
-//! reports `BatchError { failed_at, completed, source }` and stops.
+//! reports a `BatchError` (accessor methods `failed_at()` /
+//! `completed()` / `inner()`) and stops.
 //! - Ops that succeeded before the failure ARE durable.
 //! - The failing op is NOT durable.
 //! - Subsequent ops in the same batch are NOT attempted.
@@ -56,8 +57,8 @@ fn failure_reports_correct_failed_at_and_completed() {
     ]);
 
     let err = result.expect_err("expected failure");
-    assert_eq!(err.failed_at, 2, "third op (index 2) should fail");
-    assert_eq!(err.completed, 2, "first two ops should have succeeded");
+    assert_eq!(err.failed_at(), 2, "third op (index 2) should fail");
+    assert_eq!(err.completed(), 2, "first two ops should have succeeded");
 }
 
 #[test]

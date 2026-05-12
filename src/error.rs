@@ -561,23 +561,44 @@ impl From<std::io::Error> for Error {
 #[non_exhaustive]
 #[must_use = "errors should be inspected, propagated, or logged"]
 pub struct BatchError {
-    /// The zero-based index of the op that failed within its batch.
-    pub failed_at: usize,
-    /// The number of ops that completed successfully before the failure.
-    pub completed: usize,
+    /// 0.9.6 — fields are `pub(crate)`, not `pub`. The audit (H-4)
+    /// flagged the prior `pub` fields as a 1.0 lock-in concern:
+    /// downstream callers reading `err.failed_at` directly froze
+    /// the struct's internal representation. Use the accessor
+    /// methods [`Self::failed_at`], [`Self::completed`], and
+    /// [`Self::inner`] / [`Self::into_inner`] instead — they
+    /// remain stable across any future internal refactor.
+    pub(crate) failed_at: usize,
+    pub(crate) completed: usize,
     /// The underlying error.
     ///
     /// Boxed because `Error` is `non_exhaustive` and may grow large; the
     /// box keeps `BatchError` itself small even when the inner error
     /// carries large payloads (e.g. paths, detail strings, captured
     /// `std::io::Error`s).
-    pub source: Box<Error>,
+    pub(crate) source: Box<Error>,
 }
 
 impl BatchError {
+    /// Returns the zero-based index of the op that failed within
+    /// its batch. `0` means the first op failed; on a 100-op batch
+    /// where op 73 failed, this returns `73`.
+    #[must_use]
+    #[inline]
+    pub fn failed_at(&self) -> usize {
+        self.failed_at
+    }
+
+    /// Returns the number of ops that completed successfully before
+    /// the failure. Always `<= failed_at()`; equal when the prior
+    /// ops were all committed at the time of the failure.
+    #[must_use]
+    #[inline]
+    pub fn completed(&self) -> usize {
+        self.completed
+    }
+
     /// Returns the inner [`Error`] as a borrowed reference.
-    ///
-    /// Convenience wrapper over `&*self.source`.
     pub fn inner(&self) -> &Error {
         &self.source
     }

@@ -484,10 +484,177 @@ pub(crate) fn punch_hole(file: &File, offset: u64, len: u64) -> Result<()> {
 }
 
 pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
-    // std::fs::copy uses CopyFileExW internally.
-    // TODO(0.5.0): investigate FSCTL_DUPLICATE_EXTENTS_TO_FILE for
-    // ReFS reflink copies.
+    // 0.9.6 — Try `FSCTL_DUPLICATE_EXTENTS_TO_FILE` for instant
+    // copy-on-write reflinks on ReFS volumes. ReFS clones extents
+    // metadata-only — a multi-GiB checkpoint clone drops from
+    // seconds to microseconds.
+    //
+    // Hard requirements (kernel enforces; failure paths fall back):
+    // - Both files MUST be on the same ReFS volume. NTFS / FAT /
+    //   exFAT / network shares all return ERROR_INVALID_FUNCTION.
+    // - Destination must already exist and be at least as large as
+    //   the source range — we extend it via SetEndOfFile before
+    //   issuing the ioctl.
+    // - Both handles must be opened with `FILE_SHARE_DELETE`
+    //   (omission causes ERROR_INVALID_PARAMETER).
+    //
+    // On any failure we fall back to `std::fs::copy` (which wraps
+    // `CopyFileExW`) for full-byte-copy semantics. Correctness is
+    // guaranteed regardless of which path runs.
+    if let Ok(bytes) = try_reflink_refs(src, dst) {
+        return Ok(bytes);
+    }
     std::fs::copy(src, dst).map_err(Error::Io)
+}
+
+/// 0.9.6 — Attempts a ReFS `FSCTL_DUPLICATE_EXTENTS_TO_FILE` reflink
+/// of `src` to `dst`. Returns the byte count cloned on success.
+///
+/// Returns `Err` on any of: source open failure, source-size query
+/// failure, destination create/extend failure, FSCTL rejection
+/// (non-ReFS volume, cross-volume copy, ineligible source range).
+/// The caller falls back to a byte-copy on `Err`.
+fn try_reflink_refs(src: &Path, dst: &Path) -> Result<u64> {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileEndOfFileInfo, GetFileSizeEx, SetFileInformationByHandle, FILE_END_OF_FILE_INFO,
+        FILE_SHARE_DELETE,
+    };
+    use windows_sys::Win32::System::Ioctl::{
+        DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let src_wide = to_wide(src);
+    let dst_wide = to_wide(dst);
+
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+    // Open source for read.
+    // SAFETY: `src_wide` is a NUL-terminated UTF-16 path; flags are
+    // valid; the returned handle either is INVALID_HANDLE_VALUE
+    // (-1, error) or owned by us until we close it via
+    // `File::from_raw_handle` Drop.
+    let src_handle = unsafe {
+        CreateFileW(
+            src_wide.as_ptr(),
+            GENERIC_READ,
+            share,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut::<core::ffi::c_void>(),
+        )
+    };
+    if src_handle.is_null() || src_handle == INVALID_HANDLE_VALUE {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: src_handle is a valid open Windows file handle owned
+    // by us; wrapping in File so Drop closes it cleanly even on
+    // early return below.
+    let src_file = unsafe { File::from_raw_handle(src_handle as RawHandle) };
+
+    // Get source size.
+    let mut src_size: i64 = 0;
+    // SAFETY: src_handle is valid; GetFileSizeEx writes through the
+    // out-pointer and returns 0/nonzero for failure/success.
+    let ok: BOOL = unsafe { GetFileSizeEx(src_handle, &mut src_size) };
+    if ok == FALSE {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+
+    // Open destination for write — CREATE_NEW so we don't overwrite
+    // an existing file silently. If dst exists, this fails and we
+    // fall back cleanly (matching `std::fs::copy`'s overwrite
+    // semantics via the fallback path).
+    // SAFETY: dst_wide is NUL-term UTF-16; flags valid; handle
+    // either error or owned by us.
+    let dst_handle = unsafe {
+        CreateFileW(
+            dst_wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            share,
+            std::ptr::null(),
+            CREATE_NEW,
+            0,
+            std::ptr::null_mut::<core::ffi::c_void>(),
+        )
+    };
+    if dst_handle.is_null() || dst_handle == INVALID_HANDLE_VALUE {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: dst_handle is a valid open Windows file handle owned
+    // by us; wrap in File so Drop closes it cleanly.
+    let _dst_file = unsafe { File::from_raw_handle(dst_handle as RawHandle) };
+
+    // Extend dst to src_size so the duplicate-extents call can map
+    // into a valid dst range. FILE_END_OF_FILE_INFO uses an i64
+    // EndOfFile value.
+    let eof_info = FILE_END_OF_FILE_INFO {
+        EndOfFile: src_size,
+    };
+    // SAFETY: dst_handle valid; eof_info is a stack-allocated
+    // FILE_END_OF_FILE_INFO with a single i64 field; size argument
+    // matches the struct size; SetFileInformationByHandle reads
+    // through the pointer and returns 0/nonzero.
+    let ok: BOOL = unsafe {
+        SetFileInformationByHandle(
+            dst_handle,
+            FileEndOfFileInfo,
+            &eof_info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<FILE_END_OF_FILE_INFO>() as u32,
+        )
+    };
+    if ok == FALSE {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+
+    // Empty source — nothing to duplicate. Truncated dst is the
+    // correct result.
+    if src_size == 0 {
+        return Ok(0);
+    }
+
+    // Issue FSCTL_DUPLICATE_EXTENTS_TO_FILE. The src handle is
+    // passed via the DUPLICATE_EXTENTS_DATA struct; the dst handle
+    // is the DeviceIoControl target.
+    let mut params = DUPLICATE_EXTENTS_DATA {
+        FileHandle: src_handle as HANDLE,
+        SourceFileOffset: 0,
+        TargetFileOffset: 0,
+        ByteCount: src_size,
+    };
+    let mut bytes_returned: u32 = 0;
+    // SAFETY: dst_handle is the ioctl target (valid open handle);
+    // params is a stack DUPLICATE_EXTENTS_DATA pointing at the
+    // valid src_handle; sizes are accurate; the ioctl returns 0
+    // (error) or nonzero (success).
+    let ok: BOOL = unsafe {
+        DeviceIoControl(
+            dst_handle,
+            FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+            &mut params as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<DUPLICATE_EXTENTS_DATA>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut::<OVERLAPPED>(),
+        )
+    };
+    if ok == FALSE {
+        // Common failure codes the caller's fallback handles:
+        // - ERROR_INVALID_FUNCTION (1) — not ReFS, kernel doesn't
+        //   know this FSCTL.
+        // - ERROR_INVALID_PARAMETER (87) — cross-volume, unaligned
+        //   range, or other contract violation.
+        // - ERROR_ACCESS_DENIED (5) — privilege / sharing.
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+
+    // Suppress unused-variable lint on src_file — it exists only for
+    // its Drop to close the source handle.
+    let _ = &src_file;
+    Ok(src_size as u64)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -106,8 +106,9 @@ impl JournalHandle {
     /// - [`Error::Io`] on the underlying fsync failure.
     pub async fn sync_through_async(self: Arc<Self>, lsn: Lsn) -> Result<()> {
         super::require_runtime()?;
+        let lsn_off = lsn.as_u64();
         // Fast path: already synced.
-        if self.synced_lsn.load(Ordering::Acquire) >= lsn.0 {
+        if self.synced_lsn.load(Ordering::Acquire) >= lsn_off {
             return Ok(());
         }
         // Direct-IO journals: the sync path must flush the
@@ -193,7 +194,7 @@ impl JournalHandle {
                 "native io_uring write returned short count on journal append",
             )));
         }
-        Ok(Lsn(end))
+        Ok(Lsn::new(end))
     }
 
     /// Native group-commit fsync — submit `IORING_OP_FSYNC(DATASYNC)`
@@ -211,11 +212,12 @@ impl JournalHandle {
     async fn sync_through_native(self: Arc<Self>, ring: &AsyncIoUring, lsn: Lsn) -> Result<()> {
         use std::os::fd::AsRawFd;
 
+        let lsn_off = lsn.as_u64();
         loop {
             // Atomic-load fast path — cheaper than a lock
             // acquire when the durable frontier already covers
             // our target.
-            if self.synced_lsn.load(Ordering::Acquire) >= lsn.0 {
+            if self.synced_lsn.load(Ordering::Acquire) >= lsn_off {
                 return Ok(());
             }
             // Non-blocking try_lock so the tokio worker isn't
@@ -227,7 +229,7 @@ impl JournalHandle {
                     continue;
                 }
             };
-            if state.committed_lsn >= lsn.0 {
+            if state.committed_lsn >= lsn_off {
                 return Ok(());
             }
             if state.in_flight {
@@ -309,14 +311,14 @@ mod tests {
             .append_async(b"hello".to_vec())
             .await
             .expect("a1");
-        assert_eq!(lsn1, Lsn(5 + 12));
+        assert_eq!(lsn1, Lsn::new(5 + 12));
 
         let lsn2 = log
             .clone()
             .append_async(b" world".to_vec())
             .await
             .expect("a2");
-        assert_eq!(lsn2, Lsn(17 + 6 + 12));
+        assert_eq!(lsn2, Lsn::new(17 + 6 + 12));
     }
 
     #[tokio::test]
