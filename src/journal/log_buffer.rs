@@ -89,6 +89,25 @@ use std::fs::File;
 /// `Mutex<LogBuffer>` — that was the pre-0.9.5 pattern that
 /// served the single-buffer design.
 pub(crate) struct LogBuffer {
+    // 0.9.6 — iouring acceleration state. Declared BEFORE `bufs`
+    // so that Drop order (declaration order in Rust) is
+    // `iouring` → `bufs`: the ring un-registers and closes
+    // before the underlying AlignedBuf pages are freed. This is
+    // load-bearing for soundness — registered buffers pin
+    // kernel pages, so the pages must outlive the registration.
+    /// 0.9.6 — Linux-only IORING_REGISTER_BUFFERS +
+    /// IORING_OP_WRITE_FIXED acceleration. `Some` when:
+    /// 1. We're on Linux.
+    /// 2. `IoUringRing::new` succeeded at construction time.
+    /// 3. `register_buffers` succeeded for both slots.
+    ///
+    /// `None` (or on non-Linux platforms) means flushes route
+    /// through the cross-platform `write_at_direct` (`pwrite`)
+    /// fallback — same correctness, just no fixed-buffer fast
+    /// path. The decision is made once at construction; runtime
+    /// flush sites just check `is_some()`.
+    #[cfg(target_os = "linux")]
+    iouring: Option<IouringFlushState>,
     /// Two buffer slots. Each is `capacity` bytes, sector-aligned.
     /// Access is governed by the state machine: bytes inside
     /// slot `i` may be mutated only by the thread holding the
@@ -108,6 +127,22 @@ pub(crate) struct LogBuffer {
     /// (`active` is full AND `flushing.is_some()`). Notified
     /// after every flush completes.
     flush_done: Condvar,
+}
+
+/// 0.9.6 — Linux iouring flush state. The ring owns its owner
+/// thread + kernel resources; the two AlignedBuf slots of the
+/// enclosing LogBuffer are registered with this ring as buffer
+/// slots `0` and `1` (matching the LogBuffer's `bufs[0]` and
+/// `bufs[1]` respectively).
+///
+/// Soundness contract: the ring must drop **before** the
+/// AlignedBufs are freed (registered buffers pin kernel pages
+/// to the slot memory). Enforced by field declaration order on
+/// `LogBuffer` — `iouring` is declared before `bufs`, so it
+/// drops first.
+#[cfg(target_os = "linux")]
+struct IouringFlushState {
+    ring: crate::platform::linux_iouring::IoUringRing,
 }
 
 // SAFETY: `LogBuffer`'s interior mutability is governed by the
@@ -184,8 +219,20 @@ impl LogBuffer {
         let cap = round_up(capacity_per_slot as usize, ss).max(ss);
         let buf0 = AlignedBuf::new(cap, ss)?;
         let buf1 = AlignedBuf::new(cap, ss)?;
+        let bufs = [UnsafeCell::new(buf0), UnsafeCell::new(buf1)];
+
+        // 0.9.6 — try to construct an io_uring ring + register
+        // the two AlignedBuf slots. Failure is silent: kernel
+        // < 5.1, sandbox / SECCOMP / AppArmor block,
+        // register_buffers rejection, etc. — all fall back to
+        // the pwrite path with no observable behaviour change.
+        #[cfg(target_os = "linux")]
+        let iouring = Self::try_init_iouring(&bufs, cap);
+
         Ok(Self {
-            bufs: [UnsafeCell::new(buf0), UnsafeCell::new(buf1)],
+            #[cfg(target_os = "linux")]
+            iouring,
+            bufs,
             capacity: cap,
             sector_size: ss,
             state: Mutex::new(State {
@@ -196,6 +243,44 @@ impl LogBuffer {
             }),
             flush_done: Condvar::new(),
         })
+    }
+
+    /// 0.9.6 — Try to bring up an `IoUringRing` and register the
+    /// two AlignedBuf slots as fixed buffers. Returns `None` on
+    /// any failure; the pwrite path is the silent fallback.
+    ///
+    /// The ring's queue depth is small (8) because the journal's
+    /// flush submission rate is bounded by sector flushes —
+    /// thousands per second under sustained load is still far
+    /// below per-syscall granularity.
+    #[cfg(target_os = "linux")]
+    fn try_init_iouring(
+        bufs: &[UnsafeCell<AlignedBuf>; 2],
+        cap: usize,
+    ) -> Option<IouringFlushState> {
+        let ring = crate::platform::linux_iouring::IoUringRing::new(8).ok()?;
+        // Collect the (ptr, len) of each slot's underlying
+        // AlignedBuf. We're inside the constructor, so nothing
+        // else has access to the cells; reading the start
+        // pointer + length is sound. The kernel records these
+        // for the duration of the ring (until un-registered or
+        // ring is closed); the AlignedBufs outlive the ring per
+        // the Drop-order contract documented on `LogBuffer`.
+        let iovs: Vec<(usize, usize)> = bufs
+            .iter()
+            .map(|cell| {
+                // SAFETY: constructor-time exclusive access to
+                // `cell`; no other thread can observe the
+                // UnsafeCell yet. The AlignedBuf's pointer +
+                // length are stable for its lifetime (AlignedBuf
+                // never reallocates).
+                let buf = unsafe { (*cell.get()).as_slice() };
+                debug_assert_eq!(buf.len(), cap);
+                (buf.as_ptr() as usize, buf.len())
+            })
+            .collect();
+        ring.register_buffers(&iovs).ok()?;
+        Some(IouringFlushState { ring })
     }
 
     /// Returns the LSN that the next append would place its
@@ -376,9 +461,15 @@ impl LogBuffer {
                 // every other thread to leave `bufs[old_idx]`
                 // alone; we have exclusive read access for the
                 // syscall.
+                //
+                // 0.9.6 — when iouring is available, submit via
+                // `IORING_OP_WRITE_FIXED` against the
+                // pre-registered slot index (`old_idx`); the
+                // kernel skips per-SQE buffer page pinning.
+                // Otherwise fall back to the pwrite path.
                 let flush_result = unsafe {
                     let slice = (*self.bufs[old_idx as usize].get()).as_slice();
-                    crate::platform::write_at_direct(file, old_flush_pos, slice)
+                    self.flush_slot_to_disk(file, old_idx, slice, old_flush_pos)
                 };
 
                 // Re-acquire, zero the just-flushed slot, and
@@ -511,11 +602,62 @@ impl LogBuffer {
         // for the duration of this syscall. The
         // `[active_len..aligned]` tail is zero by induction (see
         // module-level invariants).
+        //
+        // 0.9.6 — partial flushes route through the
+        // iouring-aware helper (`flush_slot_to_disk`) which
+        // submits via `IORING_OP_WRITE_FIXED` when available.
         unsafe {
             let slice = (*self.bufs[active_idx].get()).as_slice();
-            crate::platform::write_at_direct(file, active_flush_pos, &slice[..aligned])?;
+            self.flush_slot_to_disk(file, active_idx as u8, &slice[..aligned], active_flush_pos)?;
         }
         Ok(())
+    }
+
+    /// 0.9.6 — Centralised flush dispatcher. Routes via
+    /// `IORING_OP_WRITE_FIXED` when iouring is available
+    /// (Linux + ring-construction succeeded + buffer
+    /// registration succeeded), falls back to
+    /// `crate::platform::write_at_direct` (`pwrite`) otherwise.
+    ///
+    /// `slot_idx` is `0` or `1` — the LogBuffer's internal slot
+    /// index. The iouring registration aligned slot 0 = buf
+    /// index 0 and slot 1 = buf index 1, so this passes
+    /// through unchanged as the `buf_idx` argument to
+    /// `write_at_fixed`.
+    ///
+    /// **Caller contract:** `slice` must be a sub-region of the
+    /// AlignedBuf at slot `slot_idx`. The kernel will validate
+    /// that the region fits within the registered buffer; an
+    /// invalid range surfaces as `EFAULT` / `EINVAL` from the
+    /// CQE which propagates as `Err(Error::Io)`.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    fn flush_slot_to_disk(
+        &self,
+        file: &File,
+        slot_idx: u8,
+        slice: &[u8],
+        offset: u64,
+    ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(iouring) = self.iouring.as_ref() {
+            use std::os::fd::AsRawFd;
+            let fd = file.as_raw_fd();
+            // Ensure slot_idx fits in u16 (our registration uses
+            // slots 0 and 1; debug_assert catches future bugs
+            // if more slots are ever added).
+            debug_assert!(slot_idx < 2);
+            let written = iouring
+                .ring
+                .write_at_fixed(fd, slot_idx as u16, slice, offset)?;
+            if written != slice.len() {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "iouring write_at_fixed returned short count",
+                )));
+            }
+            return Ok(());
+        }
+        crate::platform::write_at_direct(file, offset, slice)
     }
 
     /// Repositions the buffer for resume-after-crash. Called by

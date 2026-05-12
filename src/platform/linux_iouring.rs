@@ -114,6 +114,36 @@ enum Op {
         offset: u64,
         reply: Sender<Result<usize>>,
     },
+    /// 0.9.6: register a fixed set of buffers with the ring via
+    /// `IORING_REGISTER_BUFFERS`. The kernel pins the buffer
+    /// pages, hands back slot indices, and subsequent
+    /// `Op::WriteFixed` submissions reference the buffer by
+    /// slot index rather than re-mapping pages every SQE.
+    ///
+    /// The `iovs` carry (ptr_as_usize, len) tuples. The reply
+    /// is `Result<()>` — the kernel reports success/failure for
+    /// the whole batch, and the caller assumes registered-slot
+    /// indices `0..N-1` for the N iovs it passed.
+    RegisterBuffers {
+        iovs: Vec<(usize, usize)>,
+        reply: Sender<Result<()>>,
+    },
+    /// 0.9.6: `IORING_OP_WRITE_FIXED` submission. `buf_idx`
+    /// references a previously-registered buffer slot (via
+    /// `Op::RegisterBuffers`); `buf_ptr` + `buf_len` must
+    /// describe a sub-region within that registered buffer.
+    /// The kernel skips per-SQE buffer-page pinning and
+    /// page-table lookups — observable per-submission win for
+    /// the journal hot path that reuses the LogBuffer's two
+    /// AlignedBuf slots thousands of times.
+    WriteFixed {
+        fd: RawFd,
+        buf_idx: u16,
+        buf_ptr: usize,
+        buf_len: usize,
+        offset: u64,
+        reply: Sender<Result<usize>>,
+    },
 }
 
 impl IoUringRing {
@@ -239,6 +269,58 @@ impl IoUringRing {
         let buf_len = buf.len();
         self.send(Op::WriteLinkedFsync {
             fd,
+            buf_ptr,
+            buf_len,
+            offset,
+            reply: rt,
+        })?;
+        rr.recv().map_err(|_| owner_dead())?
+    }
+
+    /// 0.9.6 — Register a fixed set of buffers with the ring.
+    ///
+    /// Each `(ptr, len)` tuple in `iovs` becomes a registered
+    /// buffer slot at index `0..iovs.len()`. The caller is
+    /// responsible for keeping the underlying memory alive
+    /// (un-moved, not freed) for the lifetime of the ring —
+    /// io_uring pins the pages but doesn't take ownership.
+    ///
+    /// Slot indices `0..iovs.len()` are then usable as the
+    /// `buf_idx` argument to [`Self::write_at_fixed`].
+    ///
+    /// Returns `Err` on registration failure (kernel rejection,
+    /// privilege denial, out-of-resource). On error, no slots
+    /// are partially registered — the call is atomic.
+    pub(crate) fn register_buffers(&self, iovs: &[(usize, usize)]) -> Result<()> {
+        let (rt, rr) = bounded::<Result<()>>(1);
+        self.send(Op::RegisterBuffers {
+            iovs: iovs.to_vec(),
+            reply: rt,
+        })?;
+        rr.recv().map_err(|_| owner_dead())?
+    }
+
+    /// 0.9.6 — Submit an `IORING_OP_WRITE_FIXED` SQE.
+    ///
+    /// `buf_idx` references a slot previously registered via
+    /// [`Self::register_buffers`]. `buf_ptr` + `buf_len` describe
+    /// a sub-region within that registered buffer — the kernel
+    /// validates that the region fits within the registered
+    /// slot. Saves the per-SQE page-pinning cost of `Op::Write`
+    /// — the buffer pages were pinned once at registration time.
+    pub(crate) fn write_at_fixed(
+        &self,
+        fd: RawFd,
+        buf_idx: u16,
+        buf: &[u8],
+        offset: u64,
+    ) -> Result<usize> {
+        let (rt, rr) = bounded::<Result<usize>>(1);
+        let buf_ptr = buf.as_ptr() as usize;
+        let buf_len = buf.len();
+        self.send(Op::WriteFixed {
+            fd,
+            buf_idx,
             buf_ptr,
             buf_len,
             offset,
@@ -540,6 +622,87 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>) {
                             )),
                         }
                     }
+                    Err(e) => Err(Error::Io(e)),
+                };
+                let _ = reply.send(result);
+            }
+
+            Op::RegisterBuffers { iovs, reply } => {
+                // 0.9.6 — IORING_REGISTER_BUFFERS. Pin the
+                // caller's buffer ranges in the kernel's
+                // page-table so subsequent `WriteFixed` SQEs
+                // skip the per-submission page-pinning hop.
+                // SAFETY: the caller (via the public
+                // `register_buffers` method) is responsible for
+                // keeping the underlying memory alive for the
+                // lifetime of the ring. The kernel reads
+                // `iovs.len()` `iovec` structs, validates the
+                // ranges, and pins the pages. Our local `iovec`
+                // array lives across the syscall.
+                let iovec_array: Vec<libc::iovec> = iovs
+                    .iter()
+                    .map(|(p, l)| libc::iovec {
+                        iov_base: *p as *mut libc::c_void,
+                        iov_len: *l,
+                    })
+                    .collect();
+                let result =
+                    unsafe { ring.submitter().register_buffers(&iovec_array) }.map_err(Error::Io);
+                let _ = reply.send(result);
+            }
+
+            Op::WriteFixed {
+                fd,
+                buf_idx,
+                buf_ptr,
+                buf_len,
+                offset,
+                reply,
+            } => {
+                // 0.9.6 — IORING_OP_WRITE_FIXED. Uses a
+                // previously-registered buffer slot; the kernel
+                // skips per-SQE page pinning. Tries the
+                // fixed-file slot for `fd` too — if the
+                // FdRegistry has a slot, double-Fixed win.
+                let entry =
+                    if let Some(slot) = fd_registry.try_get_or_register(&ring.submitter(), fd) {
+                        io_uring::opcode::WriteFixed::new(
+                            io_uring::types::Fixed(slot),
+                            buf_ptr as *const u8,
+                            buf_len as u32,
+                            buf_idx,
+                        )
+                        .offset(offset)
+                        .build()
+                    } else {
+                        io_uring::opcode::WriteFixed::new(
+                            io_uring::types::Fd(fd),
+                            buf_ptr as *const u8,
+                            buf_len as u32,
+                            buf_idx,
+                        )
+                        .offset(offset)
+                        .build()
+                    };
+                // SAFETY: the registered buffer is owned + kept
+                // alive by the caller (LogBuffer holds the
+                // AlignedBuf for its entire lifetime, longer
+                // than this ring). `buf_ptr` + `buf_len`
+                // describe a sub-region of the registered slot
+                // at `buf_idx`; the kernel validates the range.
+                let push = unsafe { ring.submission().push(&entry) };
+                if push.is_err() {
+                    let _ = reply.send(Err(io_err("io_uring submission queue full (WriteFixed)")));
+                    continue;
+                }
+                let result = match ring.submit_and_wait(1) {
+                    Ok(_) => match ring.completion().next() {
+                        Some(c) if c.result() < 0 => {
+                            Err(Error::Io(std::io::Error::from_raw_os_error(-c.result())))
+                        }
+                        Some(c) => Ok(c.result() as usize),
+                        None => Err(io_err("io_uring completion queue empty (WriteFixed)")),
+                    },
                     Err(e) => Err(Error::Io(e)),
                 };
                 let _ = reply.send(result);
