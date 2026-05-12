@@ -187,7 +187,7 @@ impl IoUringRing {
         let mut probe_builder = io_uring::IoUring::builder();
         super::iouring_features::apply(&mut probe_builder, super::iouring_features::RingMode::Sync);
         if let Some(idle_ms) = sqpoll_idle_ms {
-            probe_builder.setup_sqpoll(idle_ms);
+            let _ = probe_builder.setup_sqpoll(idle_ms);
         }
         match probe_builder.build(queue_depth) {
             Ok(_probe) => {}
@@ -384,7 +384,7 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>, sqpoll_idle_ms: Option<u32>) {
     let mut builder = io_uring::IoUring::builder();
     super::iouring_features::apply(&mut builder, super::iouring_features::RingMode::Sync);
     if let Some(idle_ms) = sqpoll_idle_ms {
-        builder.setup_sqpoll(idle_ms);
+        let _ = builder.setup_sqpoll(idle_ms);
     }
     let mut ring = match builder.build(queue_depth) {
         Ok(r) => r,
