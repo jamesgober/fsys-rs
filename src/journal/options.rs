@@ -232,11 +232,17 @@ impl Default for JournalOptions {
 
 impl JournalOptions {
     /// Returns a fresh `JournalOptions` with library-default values:
-    /// `direct = false`, `log_buffer_kib = 64`,
-    /// `group_commit_window = Some(500 µs)`,
-    /// `group_commit_max_batch = 8`,
-    /// `sync_mode = SyncMode::Full`. Equivalent to
-    /// [`Default::default`].
+    ///
+    /// | Knob | Default |
+    /// |---|---|
+    /// | `direct` | `false` (buffered / lock-free mode) |
+    /// | `log_buffer_kib` | `64` (per-slot; dual-buffer total = 128 KiB) |
+    /// | `group_commit_window` | `Some(500 µs)` |
+    /// | `group_commit_max_batch` | `8` |
+    /// | `sync_mode` | [`SyncMode::Full`] |
+    /// | `write_lifetime_hint` | `None` |
+    ///
+    /// Equivalent to [`Default::default`].
     pub fn new() -> Self {
         Self {
             direct: false,
