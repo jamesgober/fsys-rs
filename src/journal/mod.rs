@@ -1124,18 +1124,21 @@ impl Drop for JournalHandle {
 /// a [`parking_lot::Mutex`]; never held across the actual fsync
 /// syscall.
 pub(crate) struct GroupCommitState {
+    // 0.9.6 audit fix: all fields `pub(crate)` — accessed by
+    // `src/async_io/journal.rs::sync_through_native` which is a
+    // separate module from where `GroupCommitState` is defined.
     /// `true` while a leader has taken the gate and is in the
     /// process of running an fsync on behalf of itself plus any
     /// followers waiting on `cv_followers`.
-    in_flight: bool,
+    pub(crate) in_flight: bool,
     /// Highest LSN known durable on disk after the most recent
     /// completed fsync. Followers that arrive with a target LSN
     /// `≤ committed_lsn` return immediately without waiting.
-    committed_lsn: u64,
+    pub(crate) committed_lsn: u64,
     /// Number of follower threads currently parked on
     /// `cv_followers`. Read by the leader as the early-exit hint
     /// against [`GroupCommit::max_batch`].
-    pending_followers: u32,
+    pub(crate) pending_followers: u32,
 }
 
 /// 0.9.1 leader/follower group-commit coordinator. See
@@ -1157,8 +1160,14 @@ pub(crate) struct GroupCommitState {
 ///   joins (so the leader can re-check the `max_batch` early-exit
 ///   condition during its `window` wait).
 pub(crate) struct GroupCommit {
-    state: PlMutex<GroupCommitState>,
-    cv_followers: Condvar,
+    // 0.9.6 audit fix: state + cv_followers are `pub(crate)` (not
+    // private) because `src/async_io/journal.rs::sync_through_native`
+    // is a separate module that needs to participate in the
+    // leader/follower protocol. The pre-0.9.6 fully-private fields
+    // built only when `async` feature was off — the new
+    // feature-matrix CI surfaced the breakage.
+    pub(crate) state: PlMutex<GroupCommitState>,
+    pub(crate) cv_followers: Condvar,
     cv_leader: Condvar,
     window: Option<Duration>,
     max_batch: u32,

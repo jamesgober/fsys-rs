@@ -765,8 +765,15 @@ mod tests {
 
         // Take and abort the JoinHandle — same drop signature as a
         // panic inside the loop.
+        //
+        // 0.9.6 audit fix: `ring.join` is a `std::sync::Mutex`
+        // (synchronous) — `lock()` returns `LockResult<MutexGuard>`,
+        // not a future. The pre-0.9.6 `.await` here was a copy-paste
+        // typo that only ever surfaced when the `async` feature
+        // was enabled WITHOUT `--all-targets` muting the test on
+        // Windows (the new feature-matrix CI caught it).
         {
-            let mut g = ring.join.lock().await;
+            let mut g = ring.join.lock().expect("ring.join mutex poisoned");
             if let Some(j) = g.take() {
                 j.abort();
                 let _ = j.await; // join the aborted task
@@ -861,9 +868,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         // Abort the owner mid-batch — this drops the receiver and
-        // the pending HashMap.
+        // the pending HashMap. `ring.join` is `std::sync::Mutex`
+        // (sync) so `lock()` is sync, returns `LockResult`.
         {
-            let mut g = ring.join.lock().await;
+            let mut g = ring.join.lock().expect("ring.join mutex poisoned");
             if let Some(j) = g.take() {
                 j.abort();
                 let _ = j.await;

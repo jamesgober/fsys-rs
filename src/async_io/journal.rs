@@ -174,7 +174,17 @@ impl JournalHandle {
 
     /// Native append — encode the framed record and submit
     /// `IORING_OP_WRITE` SQE at the reserved offset.
-    async fn append_native(self: Arc<Self>, ring: &AsyncIoUring, record: Vec<u8>) -> Result<Lsn> {
+    ///
+    /// 0.9.6 audit fix: takes `&self` rather than `self: Arc<Self>`.
+    /// The caller holds a `&self` borrow via `self.native_ring()`
+    /// which returns `Option<&AsyncIoUring>` tied to that borrow;
+    /// the pre-0.9.6 `Arc<Self>` signature forced the caller to
+    /// move `self` while `ring` was still borrowed, surfacing as
+    /// `error[E0505]: cannot move out of self because it is
+    /// borrowed` on the `--no-default-features --features async`
+    /// build (caught by the new feature-matrix CI job, not the
+    /// default-features Linux test).
+    async fn append_native(&self, ring: &AsyncIoUring, record: Vec<u8>) -> Result<Lsn> {
         use std::os::fd::AsRawFd;
 
         // Encode the frame on the calling task's stack/heap. The
@@ -209,7 +219,10 @@ impl JournalHandle {
     /// callers naturally arrive on a different timescale than
     /// sync callers, and the io_uring fsync is itself zero-
     /// syscall-cost on the submitter side.
-    async fn sync_through_native(self: Arc<Self>, ring: &AsyncIoUring, lsn: Lsn) -> Result<()> {
+    // 0.9.6 audit fix: takes `&self` rather than `self: Arc<Self>`
+    // (same E0505 borrow conflict as `append_native` — see its doc
+    // comment for the explanation).
+    async fn sync_through_native(&self, ring: &AsyncIoUring, lsn: Lsn) -> Result<()> {
         use std::os::fd::AsRawFd;
 
         let lsn_off = lsn.as_u64();
