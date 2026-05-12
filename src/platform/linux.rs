@@ -488,25 +488,43 @@ pub(crate) fn preallocate(file: &File, offset: u64, len: u64) -> Result<()> {
         return Ok(());
     }
     let fd = file.as_raw_fd();
-    // Try `fallocate` first — fastest path, doesn't write zeros.
-    // FALLOC_FL_KEEP_SIZE = 0x01.
-    const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
     let off = offset as libc::off_t;
     let len_off = len as libc::off_t;
-    // SAFETY: fd is a valid file descriptor owned by `file`;
-    // off/len are u64 → off_t conversions bounded below i64::MAX
-    // by the caller's responsibility (file sizes don't exceed
-    // exabyte ranges in any realistic workload).
-    let ret = unsafe { libc::fallocate(fd, FALLOC_FL_KEEP_SIZE, off, len_off) };
-    if ret == 0 {
-        return Ok(());
-    }
-    let err = std::io::Error::last_os_error();
-    let raw = err.raw_os_error().unwrap_or(0);
-    // EOPNOTSUPP (95) on filesystems without fallocate (e.g. FUSE
-    // without the right hooks); ENOSYS (38) on very old kernels.
-    if raw != 95 && raw != 38 {
-        return Err(Error::Io(err));
+
+    // 0.9.7 H-9 — test-hook env-var bypass.
+    //
+    // Audit H-9: the `fallocate` → `posix_fallocate` fallback
+    // path (for old kernels / filesystems lacking fallocate)
+    // wasn't explicitly tested in CI — only the happy path on
+    // whatever filesystem the runner used.
+    //
+    // `FSYS_TEST_FORCE_POSIX_FALLOCATE=1` skips the `fallocate`
+    // attempt and goes straight to `posix_fallocate`,
+    // exercising the fallback path in tests on any
+    // filesystem. The env-var name is intentionally obscure;
+    // accidental triggering in production is implausible.
+    //
+    // The check runs per call — one `env::var_os` lookup ≈
+    // sub-µs, dwarfed by the syscall itself.
+    if std::env::var_os("FSYS_TEST_FORCE_POSIX_FALLOCATE").is_none() {
+        // Try `fallocate` first — fastest path, doesn't write zeros.
+        // FALLOC_FL_KEEP_SIZE = 0x01.
+        const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+        // SAFETY: fd is a valid file descriptor owned by `file`;
+        // off/len are u64 → off_t conversions bounded below i64::MAX
+        // by the caller's responsibility (file sizes don't exceed
+        // exabyte ranges in any realistic workload).
+        let ret = unsafe { libc::fallocate(fd, FALLOC_FL_KEEP_SIZE, off, len_off) };
+        if ret == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        let raw = err.raw_os_error().unwrap_or(0);
+        // EOPNOTSUPP (95) on filesystems without fallocate (e.g. FUSE
+        // without the right hooks); ENOSYS (38) on very old kernels.
+        if raw != 95 && raw != 38 {
+            return Err(Error::Io(err));
+        }
     }
     // Fallback: posix_fallocate (writes zeros).
     // SAFETY: fd is valid; off/len are bounded as above.
