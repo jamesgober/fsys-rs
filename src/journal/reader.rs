@@ -158,8 +158,35 @@ pub struct JournalReader {
 impl JournalReader {
     /// Opens a journal at `path` for read-only iteration.
     ///
-    /// Returns an error if the file doesn't exist or can't be
-    /// opened. The reader's cursor starts at LSN 0.
+    /// The reader's cursor starts at LSN 0 (the beginning of the
+    /// file). Call [`Self::iter`] to forward-stream the records;
+    /// each yield is a [`JournalRecord`] with the LSN + payload.
+    /// On any decode error the iterator stops; inspect
+    /// [`Self::tail_state`] to learn why.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if the file does not exist, cannot be
+    ///   opened for reading, or cannot be stat'd for its initial
+    ///   size.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use fsys::{JournalReader, JournalTailState};
+    ///
+    /// # fn example() -> fsys::Result<()> {
+    /// let mut reader = JournalReader::open("/var/lib/myapp/log.wal".as_ref())?;
+    /// let mut count = 0;
+    /// for record in reader.iter() {
+    ///     let _ = record?;
+    ///     count += 1;
+    /// }
+    /// assert_eq!(reader.tail_state(), JournalTailState::CleanEnd);
+    /// println!("replayed {count} records");
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn open(path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
