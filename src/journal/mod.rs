@@ -582,9 +582,28 @@ impl JournalHandle {
         // framed; readers using `JournalReader` walk the
         // frames forward and yield payloads.
         //
-        // fetch_add is `AcqRel` so concurrent appenders see
-        // consistent reservation order.
-        let start = self.next_lsn.fetch_add(frame_len, Ordering::AcqRel);
+        // fetch_add is `Release` (0.9.7 M-2 — was `AcqRel`).
+        //
+        // The reservation step does not read any non-atomic
+        // memory protected by another thread's prior Release —
+        // the appender does not consult shared state set up by
+        // another appender's pwrite. So the `Acquire` half of
+        // the previous `AcqRel` was defensive overhead.
+        //
+        // `Release` IS load-bearing: the syncer's
+        // `self.next_lsn.load(Ordering::Acquire)` in
+        // `sync_through` synchronises-with this Release, so the
+        // syncer observes the latest reserved frontier (i.e.
+        // every appender's `end` value publishes through this
+        // Release into the syncer's Acquire view).
+        //
+        // Net cost on aarch64: `fetch_add(Release)` lowers to
+        // `LDADDL` (load-acquire/store-release variant LDADDL
+        // emits only the store-release barrier), whereas
+        // `AcqRel` emits `LDADDAL` with the additional
+        // load-acquire fence. ~0.2-0.5 µs/op saved on tight
+        // appender loops.
+        let start = self.next_lsn.fetch_add(frame_len, Ordering::Release);
         let end = start + frame_len;
 
         // 0.9.1 stack-allocated frame fast path: for typical
@@ -769,7 +788,13 @@ impl JournalHandle {
         // across N records instead of paying N independent
         // syscalls + N independent LSN-reservation atomics.
         let frame_total = total as u64;
-        let start = self.next_lsn.fetch_add(frame_total, Ordering::AcqRel);
+        // `Release` (0.9.7 M-2 — was `AcqRel`). Same reasoning
+        // as the single-record path at line ~604: the
+        // reservation does not consult shared state set up by
+        // a peer appender, so the `Acquire` half is defensive
+        // overhead. The syncer's `Acquire`-load on `next_lsn`
+        // synchronises-with this `Release`.
+        let start = self.next_lsn.fetch_add(frame_total, Ordering::Release);
         let end = start + frame_total;
 
         // Allocate without zeroing — `encode_frame_into` writes
