@@ -1,19 +1,53 @@
 //! # fsys
 //!
-//! Adaptive file and directory IO for Rust — fast, hardware-aware,
-//! multi-strategy.
+//! Foundation-tier filesystem IO for Rust storage engines: journal
+//! substrate, io_uring, NVMe passthrough, atomic writes, cross-platform
+//! durability.
 //!
-//! `fsys` is a low-level filesystem abstraction designed for storage
-//! engines, databases, and any application that needs predictable,
-//! high-performance file IO with explicit control over durability
-//! strategy.
+//! `fsys` sits one layer below your data structures and one layer above
+//! [`std::fs`]. It pairs an explicit durability model (you choose a
+//! [`Method`], you get the platform's best matching primitive, you
+//! observe any fallback via [`Handle::active_durability_primitive`])
+//! with a journal substrate built for write-ahead-log workloads.
+//!
+//! ## Quickstart
+//!
+//! Append-only journal — the canonical WAL pattern:
+//!
+//! ```no_run
+//! # fn example() -> fsys::Result<()> {
+//! use std::sync::Arc;
+//!
+//! let fs = Arc::new(fsys::builder().build()?);
+//! let log = fs.journal("/var/lib/myapp/log.wal")?;
+//!
+//! let _ = log.append(b"txn 1: insert")?;
+//! let _ = log.append(b"txn 2: update")?;
+//! let lsn = log.append(b"txn 3: commit")?;
+//!
+//! // One fsync covers every prior append — group-commit.
+//! log.sync_through(lsn)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! One-shot durable file write, no handle required:
+//!
+//! ```no_run
+//! # fn example() -> fsys::Result<()> {
+//! fsys::quick::write("/etc/myapp/config.toml", b"value = 42")?;
+//! let data = fsys::quick::read("/etc/myapp/config.toml")?;
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! ## Three tiers of API
 //!
 //! ### Tier 1 — one-shot helpers
 //!
-//! The simplest path. Uses a lazily-initialised default [`Handle`]
-//! configured with [`Method::Auto`].
+//! For programs that issue one IO op and don't need a long-lived handle.
+//! Backed by a lazily-initialised default [`Handle`] with
+//! [`Method::Auto`].
 //!
 //! ```no_run
 //! # fn example() -> fsys::Result<()> {
@@ -26,9 +60,9 @@
 //!
 //! ### Tier 2 — handle-based
 //!
-//! The primary API for everything beyond one-shot use. Construct a
-//! [`Handle`] with [`new()`] (default `Method::Auto`) or
-//! [`with(method)`](with).
+//! The primary API for everything beyond one-shot use. Build a [`Handle`]
+//! with [`new()`] (default [`Method::Auto`]) or [`with(method)`](with);
+//! share across threads via [`Arc`](std::sync::Arc).
 //!
 //! ```no_run
 //! # fn example() -> fsys::Result<()> {
@@ -42,8 +76,9 @@
 //!
 //! ### Tier 3 — full builder
 //!
-//! For advanced configuration: custom root, dev/prod mode,
-//! per-handle batch knobs, io_uring queue depth, buffer pool size.
+//! For advanced configuration: custom root, dev/prod mode, per-handle
+//! batch knobs, io_uring queue depth, buffer pool size, observer hook,
+//! workload presets.
 //!
 //! ```no_run
 //! # fn example() -> fsys::Result<()> {
@@ -51,73 +86,11 @@
 //!     .method(fsys::Method::Direct)
 //!     .root("/var/lib/myapp")
 //!     .mode(fsys::Mode::Prod)
+//!     .tune_for(fsys::Workload::Database)
 //!     .build()?;
 //! # Ok(())
 //! # }
 //! ```
-//!
-//! ## What's in 0.9.0 (release candidate for 1.0)
-//!
-//! 0.9.0 is the **release candidate for 1.0**. Real-world testing
-//! begins from this tag. The public API documented in
-//! [`docs/API.md`](https://github.com/jamesgober/fsys-rs/blob/main/docs/API.md)
-//! is the 1.0 target shape.
-//!
-//! - **Journal substrate** — open-once append-only log for WAL-style
-//!   workloads. [`JournalHandle::append`](crate::JournalHandle::append)
-//!   is the high-throughput durable-write primitive that databases /
-//!   queues / ledgers should use; [`Handle::write`] is the
-//!   atomic-replace primitive for individual files. Three throughput
-//!   tiers ship: cross-platform sync, lock-free concurrent append,
-//!   and native io_uring async on Linux.
-//! - **Direct-IO journal opt-in** —
-//!   [`JournalOptions::direct(true)`](crate::JournalOptions::direct)
-//!   routes appends through a sector-aligned in-memory log buffer
-//!   (the InnoDB / WiredTiger pattern), bypassing the kernel page
-//!   cache for zero-copy DMA on NVMe.
-//! - **Production-grade frame format** — every record wrapped in
-//!   a 12-byte frame with CRC-32C (Castagnoli, RFC 3720 KAT-verified).
-//!   Tail-truncation detection via [`JournalTailState`].
-//! - **Crash-safety integration tests** — process-kill harness
-//!   validates durability claims under real crashes.
-//! - **Optional `tracing` feature** for production observability.
-//!
-//! ## What shipped in 0.6.0–0.7.0
-//!
-//! 0.6.0 finished the public API and 0.7.0 (the optimization
-//! phase) tuned it. Every method that will ship at 1.0 is
-//! present from 0.7.0 onward.
-//!
-//! - **Async layer** (gated behind the `async` Cargo feature). Every
-//!   sync method gets an `_async` sibling backed by
-//!   `tokio::task::spawn_blocking`; async batch ops route through the
-//!   per-handle dispatcher via `tokio::sync::oneshot`.
-//! - **NVMe passthrough flush** on Linux (`NVME_IOCTL_IO_CMD`) and
-//!   Windows (`IOCTL_STORAGE_PROTOCOL_COMMAND`). Capability detection
-//!   at first Direct op; transparent fallback to `fdatasync` /
-//!   `WRITE_THROUGH` on incapable hardware. macOS uses
-//!   `F_NOCACHE + F_FULLFSYNC` (Apple does not expose NVMe
-//!   passthrough).
-//! - **Completion CRUD:** [`Handle::write_copy`] (atomic-swap with
-//!   metadata preservation), [`Handle::scan`], [`Handle::find`]
-//!   (glob), [`Handle::count`], [`Handle::truncate`],
-//!   [`Handle::rename`].
-//! - **`Handle::active_durability_primitive()`** + [`mod@primitive`]
-//!   constants — the canonical name of the durability primitive
-//!   currently in effect.
-//!
-//! ## What shipped earlier
-//!
-//! - **0.5.x:** real hardware probe, `Method::Mmap`, `Method::Direct`
-//!   with io_uring on Linux, per-method crash tests, per-handle
-//!   aligned buffer pool. 0.5.1 unstubbed the real io_uring path.
-//! - **0.4.0:** dual-pipeline model. Solo lane (single writes via
-//!   the calling thread) + group lane (batch ops via a per-handle
-//!   dispatcher).
-//! - **0.3.0:** [`Handle`], [`Builder`], full file/dir CRUD,
-//!   cross-platform Direct IO with observable fallback.
-//! - **0.2.0:** [`Error`] / [`Result`], hardware probe stubs, OS
-//!   detection, path resolution.
 //!
 //! ## Choosing a method
 //!
@@ -130,15 +103,18 @@
 //! | Need < 100 µs single-write latency on NVMe | [`Method::Direct`] |
 //!
 //! See [`docs/METHODS.md`](https://github.com/jamesgober/fsys-rs/blob/main/docs/METHODS.md)
-//! for the full per-platform matrix and the `Auto` decision ladder.
+//! for the full per-platform matrix and the [`Method::Auto`] decision ladder.
 //!
 //! ## Crash safety
 //!
 //! Every write API (`write`, `write_copy`, `write_batch`,
-//! `Batch::commit`) uses an atomic temp-file + rename pattern. The
-//! target file is either entirely the old payload (kill before
-//! rename) or entirely the new payload (kill after rename). Never
-//! torn. See [`docs/CRASH-SAFETY.md`](https://github.com/jamesgober/fsys-rs/blob/main/docs/CRASH-SAFETY.md)
+//! `Batch::commit`) uses an atomic temp-file + rename pattern. The target
+//! file is either entirely the old payload (kill before rename) or
+//! entirely the new payload (kill after rename) — never torn.
+//! The [`journal`] substrate adds explicit durability via
+//! [`JournalHandle::sync_through`]; group-commit amortises the fsync
+//! cost across many appends. See
+//! [`docs/CRASH-SAFETY.md`](https://github.com/jamesgober/fsys-rs/blob/main/docs/CRASH-SAFETY.md)
 //! for the full per-method contract.
 //!
 //! ## Async (feature `async`)
@@ -154,10 +130,47 @@
 //! # }
 //! ```
 //!
+//! On Linux + [`Method::Direct`], async ops submit directly to the
+//! per-handle io_uring ring — the *native substrate*, observable via
+//! [`Handle::async_substrate`] returning [`AsyncSubstrate::NativeIoUring`].
+//! Everywhere else, async ops route through `tokio::task::spawn_blocking`
+//! ([`AsyncSubstrate::SpawnBlocking`]).
+//!
 //! Calling sync `fs.write()` from inside a tokio runtime is supported
-//! (it just blocks the calling thread). Calling async
-//! `fs.write_async()` outside a tokio runtime returns
-//! [`Error::AsyncRuntimeRequired`] rather than panicking.
+//! (it just blocks the calling thread). Calling async `fs.write_async()`
+//! outside a tokio runtime returns [`Error::AsyncRuntimeRequired`]
+//! rather than panicking.
+//!
+//! ## Cargo features
+//!
+//! | Feature | Default | Purpose |
+//! |---|---|---|
+//! | `async` | off | `_async` siblings for every sync method; pulls in `tokio` |
+//! | `tracing` | off | Structured spans + events on the write / read / journal hot paths |
+//! | `stress` | off | Run `tests/stress.rs` for the full 1-hour soak (CI-nightly only) |
+//! | `fuzz` | off | Compile-only flag for fuzz-target wiring; targets live in `fuzz/` |
+//!
+//! ## Concept reference
+//!
+//! | Concept | Type / module | Reach for it when... |
+//! |---|---|---|
+//! | Handle to filesystem | [`Handle`] | Any non-one-shot IO. The primary type. |
+//! | Configure handle | [`Builder`] | Custom root, method, tuning, observer. |
+//! | Durability strategy | [`Method`] | Five variants: `Sync`, `Data`, `Mmap`, `Direct`, `Auto`. |
+//! | Append-only WAL | [`JournalHandle`] | High-throughput durable writes (WAL / ledger / queue). |
+//! | Multi-op transaction | [`Batch`] | Group N writes / deletes / copies under one durability barrier. |
+//! | One-shot helpers | [`mod@quick`] | Single-call file IO without holding a handle. |
+//! | Async layer | [`mod@async_io`] (feature `async`) | Tokio integration; `_async` siblings for every sync method. |
+//! | Telemetry hook | [`observer::FsysObserver`] | Per-op events (append / sync / write / read). |
+//! | Hardware introspection | [`mod@hardware`] | Probe PLP status, atomic-write unit, sector size. |
+//! | Errors | [`Error`] / [`Result`] | 21 variants with stable `FS-XXXXX` codes. |
+//!
+//! ## Version history
+//!
+//! Per-version deltas live in
+//! [`CHANGELOG.md`](https://github.com/jamesgober/fsys-rs/blob/main/CHANGELOG.md).
+//! 0.9.x is the release-candidate series for 1.0; the public API is the
+//! 1.0 target shape with additive enhancements between minor versions.
 
 // 0.9.6 audit H-12 — `html_root_url` was previously pinned to a
 // specific version string that drifted every release. docs.rs
