@@ -39,7 +39,8 @@ use crate::pipeline::BatchOp;
 /// Group-lane batch builder bound to a [`crate::Handle`].
 ///
 /// Created via [`Handle::batch`]. Accumulates ops in submission order
-/// and submits them all when [`Batch::commit`] is called.
+/// and submits them all on [`Batch::commit`] (best-effort) or
+/// [`Batch::commit_grouped`] (atomic-batch fsync, 0.9.3).
 ///
 /// # Borrow / lifetime
 ///
@@ -58,6 +59,27 @@ use crate::pipeline::BatchOp;
 /// intentional (decision R-15) — a 10K-op batch pays 10K small
 /// allocations spread across the build loop, not one big burst at
 /// commit.
+///
+/// # Examples
+///
+/// ```no_run
+/// use fsys::builder;
+///
+/// # fn example() -> std::result::Result<(), fsys::BatchError> {
+/// let fs = builder().build().expect("handle");
+/// let mut batch = fs.batch();
+/// batch
+///     .write("/data/a", b"alpha")
+///     .write("/data/b", b"beta")
+///     .delete("/data/stale");
+///
+/// // commit() is the best-effort variant; commit_grouped() amortises
+/// // the parent-directory fsync across the entire batch (bulk-load
+/// // / SST-flush / checkpoint workloads).
+/// batch.commit_grouped()?;
+/// # Ok(())
+/// # }
+/// ```
 #[must_use = "a Batch does nothing until committed; call .commit() or drop it explicitly"]
 pub struct Batch<'a> {
     handle: &'a Handle,
