@@ -77,8 +77,11 @@ impl Builder {
 
     /// Sets the durability method.
     ///
-    /// Returns an error at [`build`](Builder::build) time if a reserved
-    /// variant ([`Method::Mmap`] or [`Method::Journal`]) is supplied.
+    /// Accepts every [`Method`] variant; [`Method::Auto`] (the default)
+    /// resolves at [`build`](Builder::build) time via the hardware-probe
+    /// ladder. [`Method::Journal`] is reserved (see the type's docs) and
+    /// returns [`Error::UnsupportedMethod`] from `build`. Calling this
+    /// multiple times overrides any prior setting.
     #[must_use]
     pub fn method(mut self, method: Method) -> Self {
         self.method = method;
@@ -405,12 +408,18 @@ impl Builder {
     ///
     /// Resolves `Method::Auto` using the hardware-detection ladder,
     /// probes the sector size for the root (or current directory), and
-    /// validates that no reserved method was requested.
+    /// validates that no reserved method was requested. The dispatcher
+    /// thread, io_uring ring, buffer pool, and NVMe-passthrough slot
+    /// are all constructed lazily on first use — idle handles cost zero
+    /// threads and zero ring memory.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::UnsupportedMethod`] if a reserved method variant
-    /// was supplied.
+    /// - [`Error::UnsupportedMethod`] if a reserved method variant
+    ///   ([`Method::Journal`]) was supplied via [`Self::method`].
+    /// - [`Error::InvalidPath`] if [`Self::root`] was set and the path
+    ///   canonicalisation fails (the path must exist and be a directory
+    ///   — `Builder::root` does not `mkdir`).
     pub fn build(self) -> Result<Handle> {
         if self.method.is_reserved() {
             return Err(Error::UnsupportedMethod {
