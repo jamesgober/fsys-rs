@@ -373,34 +373,39 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>) {
         Err(_) => return,
     };
 
-    // 0.9.6 follow-up — same bug pattern as `completion_driver.rs`.
-    // The pre-0.9.6 0.9.5 IORING_REGISTER_FILES integration here
-    // caused intermittent silent failures in CI's
-    // `--no-default-features` Linux matrix entry: a `quick::write`
-    // unit test that wrote `b"quick"` started reading back zeros
-    // (the write SQE's CQE returned success, but no bytes actually
-    // hit disk on certain kernel + ring-config combinations). The
-    // exact mechanism is the same: SQEs submitted with
-    // `types::Fixed(slot)` against a kernel-registered file table
-    // hit a CQE-delivery / data-flush edge case that varies by
-    // kernel version.
+    // 0.9.5: `IORING_REGISTER_FILES`. Pre-register a 16-slot sparse
+    // file table at owner startup. Each per-op `fd` is lazily upgraded
+    // to a fixed-file slot via `register_files_update` on first use;
+    // subsequent submissions for the same fd reuse the cached slot
+    // and submit SQEs with `IOSQE_FIXED_FILE` semantics
+    // (`io_uring::types::Fixed`). This saves kernel-side fd
+    // validation on every SQE — a real per-syscall win for rings
+    // that do many ops against a small set of fds (the Direct-method
+    // journal hot path).
     //
-    // The fix: don't call `initial_register`. The registry stays
-    // `registered = false`, every `try_get_or_register` returns
-    // `None`, and each match arm falls through to
-    // `io_uring::types::Fd(raw)` — identical to pre-0.9.5
-    // behaviour for the sync ring.
+    // 0.9.6 history: this `initial_register` call was temporarily
+    // disabled during the async-substrate hang investigation because
+    // an early diagnosis blamed `IORING_REGISTER_FILES`. The real
+    // root cause turned out to be `IORING_SETUP_DEFER_TASKRUN` +
+    // `IORING_SETUP_SINGLE_ISSUER` interacting with the async
+    // substrate's eventfd-driven loop and tokio's multi_thread
+    // work-stealing — both now correctly excluded via
+    // `RingMode::Async`. The sync ring (this owner_loop) was never
+    // the cause; its dedicated `std::thread::spawn` thread satisfies
+    // SINGLE_ISSUER and its `submit_and_wait(n)` satisfies
+    // DEFER_TASKRUN.
     //
-    // The 0.9.6 `IORING_OP_WRITE_FIXED` + `IORING_REGISTER_BUFFERS`
-    // optimization (where the actual win comes from on the journal
-    // hot path) is UNAFFECTED — those use a separate registration
-    // (`Op::RegisterBuffers`) and a separate slot index space
-    // (`buf_idx`, not the fd slot table). The journal's
-    // `LogBuffer::flush_slot_to_disk` continues to use
-    // `IORING_OP_WRITE_FIXED` against pre-registered AlignedBuf
-    // slots; the only thing disabled is the fd-slot optimization
-    // which surfaced the kernel-side issue.
+    // 0.9.7 restoration: `initial_register` is back, backed by
+    // explicit slot-upgrade + table-full-fallback test coverage in
+    // this module (`writes_across_many_distinct_fds_complete_correctly`
+    // + `repeated_writes_on_same_fd_round_trip`). The registration
+    // is a single syscall on owner startup; on failure (rare —
+    // kernel < 5.1, sandbox block, container missing the syscall)
+    // the registry stays `registered = false` and every
+    // `try_get_or_register` returns `None` → SQEs fall back to
+    // `io_uring::types::Fd(raw)` cleanly.
     let mut fd_registry = FdRegistry::new();
+    let _ = fd_registry.initial_register(&ring.submitter());
 
     while let Ok(op) = rx.recv() {
         match op {

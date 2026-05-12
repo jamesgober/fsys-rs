@@ -358,30 +358,39 @@ async fn owner_loop(queue_depth: u32, eventfd_raw: RawFd, mut rx: mpsc::Unbounde
         Err(_) => return, // owned_fd drops, eventfd closes once
     };
 
-    // 0.9.6 follow-up — the async-substrate `IORING_REGISTER_FILES`
-    // integration from 0.9.5 caused submitted ops to hang on real
-    // Linux runners (CI's `--no-default-features --features async`
-    // matrix entry + WSL2 reproduction). The owner_loop pushed SQEs
-    // with `types::Fixed(slot)` after lazy-registering each fd, but
-    // the kernel/eventfd routing didn't generate CQEs for the
-    // resulting submissions on some kernel + ring-config combos —
-    // the test runner saw all the lifecycle tests pass
-    // (construction, shutdown, panic, abort) while every
-    // submit-and-await test hung indefinitely.
+    // 0.9.5: `IORING_REGISTER_FILES`. Pre-register a 16-slot sparse
+    // file table at owner startup. Each per-op `fd` is lazily upgraded
+    // to a fixed-file slot via `register_files_update` on first use;
+    // subsequent submissions for the same fd reuse the cached slot
+    // and submit SQEs with `IOSQE_FIXED_FILE` semantics. This saves
+    // kernel-side fd validation on every SQE.
     //
-    // The journal hot path keeps its `IORING_REGISTER_FILES`
-    // optimization via `linux_iouring.rs`'s FdRegistry (the sync
-    // ring used by the Direct method). The async substrate, by
-    // contrast, handles ad-hoc ops with high fd diversity where
-    // the per-SQE fd-validation cost is marginal — the
-    // optimization didn't pay off here even when it worked.
+    // 0.9.6 history: this `initial_register` call was temporarily
+    // disabled during the async hang investigation. The actual root
+    // cause was `IORING_SETUP_DEFER_TASKRUN` + `IORING_SETUP_SINGLE_ISSUER`
+    // applied to this ring — DEFER_TASKRUN requires explicit
+    // `io_uring_enter(GETEVENTS)` driving (which the eventfd loop
+    // doesn't do), and SINGLE_ISSUER requires same-TID submission
+    // (which tokio's multi_thread work-stealing violates). Both
+    // flags are now correctly excluded via `RingMode::Async` in
+    // `iouring_features::apply`. The fd-registry is innocent.
     //
-    // `fd_registry` stays as a local variable so `push_sqe_for`'s
-    // signature is unchanged; with `initial_register` not called,
-    // `registered` is `false`, every `try_get_or_register` returns
-    // `None`, and SQEs use `types::Fd(raw)` — identical to
-    // pre-0.9.5 behaviour for the async substrate.
+    // 0.9.7 restoration: `initial_register` is back, backed by
+    // explicit slot-upgrade + table-full-fallback test coverage in
+    // `async_io::iouring_substrate::tests` (the two new tests:
+    // `writes_across_many_distinct_fds_complete_correctly` and
+    // `repeated_writes_on_same_fd_round_trip`). Registration is a
+    // single syscall on owner startup; on failure the registry
+    // stays `registered = false`, `try_get_or_register` returns
+    // `None`, SQEs fall back to `types::Fd(raw)`.
+    //
+    // For high-fd-diversity async workloads (the ad-hoc path
+    // covering arbitrary fds from many submitters), the
+    // optimization rarely fires — but when the same fd is hit
+    // repeatedly (the common case for a long-lived async handle),
+    // it saves a per-SQE syscall hop just like on the sync ring.
     let mut fd_registry = FdRegistry::new();
+    let _ = fd_registry.initial_register(&ring.submitter());
 
     // Register the eventfd with the ring so the kernel signals it
     // when CQ has new entries. Use `as_raw_fd()` — registration
