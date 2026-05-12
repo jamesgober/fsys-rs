@@ -24,16 +24,43 @@ impl Handle {
 
     /// Atomically writes `data` to `path`, replacing any existing file.
     ///
-    /// The write is flushed at the durability level configured on this
-    /// handle before the atomic rename. If the active method falls back to
-    /// a less-capable strategy (e.g. `O_DIRECT` rejected), the handle's
-    /// active method is updated automatically.
+    /// The write follows the temp-file + atomic-rename pattern: a new
+    /// file is created at `<path>.fsys-tmp-<n>`, `data` is written and
+    /// flushed at the handle's durability level, then a single
+    /// `rename(2)` / `MoveFileExW` swaps it into place. After this
+    /// method returns successfully, the target file is durably on
+    /// stable storage and a concurrent reader sees either the entire
+    /// new payload or the previous file content — never a partial
+    /// write.
+    ///
+    /// If the active method falls back to a less-capable strategy
+    /// (e.g. `O_DIRECT` rejected by tmpfs, `Mmap` rejected by sub-page
+    /// payload), the handle's active method is updated automatically
+    /// and observable via [`Handle::active_method`].
     ///
     /// # Errors
     ///
     /// - [`Error::InvalidPath`] if `path` escapes the handle root.
-    /// - [`Error::AtomicReplaceFailed`] if any step in the atomic sequence
-    ///   fails.
+    /// - [`Error::AtomicReplaceFailed`] if any step in the atomic
+    ///   sequence (open / write / flush / rename / sync_parent) fails.
+    ///   The error's `step` field identifies which step failed; the
+    ///   original target file is unmodified for any failure before
+    ///   `rename`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use fsys::builder;
+    ///
+    /// # fn example() -> fsys::Result<()> {
+    /// let fs = builder().build()?;
+    /// fs.write("/etc/myapp/config.toml", b"key = \"value\"\n")?;
+    /// // Target file is now durably "key = \"value\"\n", or still
+    /// // the old content (if a crash happened mid-call) — never
+    /// // a torn mix.
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn write(&self, path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
         #[cfg(feature = "tracing")]
         let _span = tracing::trace_span!(
