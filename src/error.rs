@@ -33,6 +33,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// where it failed, and what the caller can do next. Display output never
 /// includes raw buffer contents; file paths are considered safe to surface
 /// because callers already supplied them.
+///
+/// The enum is `#[non_exhaustive]` so the library can add new variants in
+/// patch releases without breaking external `match` arms (callers must
+/// include a `_` fallback). Error codes (`FS-XXXXX`) are assigned per
+/// variant and are part of the public contract — they do not change once
+/// assigned. Match on [`Error::code`] for log-grep-stable string contracts
+/// rather than on the Display format, which may be refined for clarity.
 #[derive(Debug)]
 #[non_exhaustive]
 #[must_use = "errors should be inspected, propagated, or logged"]
@@ -63,8 +70,13 @@ pub enum Error {
     ///
     /// **Code:** `FS-00003`. Caller action: treat as advisory. The crate
     /// continues to operate with conservative defaults (queue depth 1,
-    /// drive kind unknown, no PLP); only call sites that need real
-    /// hardware information should treat this as fatal.
+    /// drive kind unknown). The 0.9.2+ accessor
+    /// [`Handle::is_plp_protected`](crate::Handle::is_plp_protected) /
+    /// [`plp_status`](crate::Handle::plp_status) reports
+    /// `PlpStatus::Unknown` rather than panicking when probes fail; only
+    /// call sites that REQUIRE real hardware information (e.g. databases
+    /// deciding whether to skip per-commit fsync on confirmed PLP) should
+    /// treat this as fatal.
     HardwareProbeFailed {
         /// Detail string describing which probe failed and why.
         detail: String,
@@ -81,13 +93,16 @@ pub enum Error {
         detail: String,
     },
 
-    /// The requested durability method is not implemented in this release.
+    /// The requested durability method is reserved and cannot be selected.
     ///
     /// **Code:** `FS-00005`. Caller action: select an available method
     /// ([`crate::Method::Sync`], [`crate::Method::Data`],
     /// [`crate::Method::Mmap`], [`crate::Method::Direct`], or
-    /// [`crate::Method::Auto`]). `Method::Journal` is the only
-    /// remaining reserved variant in `0.6.x`; planned for `0.7.0`.
+    /// [`crate::Method::Auto`]). [`crate::Method::Journal`] is the only
+    /// reserved variant; for append-only / WAL workloads, use the
+    /// [`JournalHandle`](crate::JournalHandle) substrate (independent of
+    /// the `Method` enum) rather than waiting on `Method::Journal` to
+    /// ship.
     UnsupportedMethod {
         /// The name of the method that was requested.
         method: &'static str,
@@ -146,12 +161,13 @@ pub enum Error {
     /// The group-lane queue is full and a non-blocking submission was
     /// rejected.
     ///
-    /// **Code:** `FS-00010`. **Reserved variant — never emitted in
-    /// `0.4.0`.** The default backpressure mode in `0.4.0` is blocking
+    /// **Code:** `FS-00010`. **Reserved variant — never emitted as of
+    /// the current release.** The default backpressure mode is blocking
     /// submission (callers wait when the queue is full); this variant
-    /// is reserved for a future opt-in error-mode (`Builder::backpressure
-    /// (BackpressureMode::Error)`) that has not landed yet. Match it to
-    /// satisfy exhaustiveness even though it cannot occur today.
+    /// is reserved for a future opt-in error-mode (e.g.
+    /// `Builder::backpressure(BackpressureMode::Error)`) that has not
+    /// landed yet. Match it via the enum's `_` fallback arm (the enum
+    /// is `#[non_exhaustive]`) — it cannot occur today.
     QueueFull,
 
     /// `io_uring_setup(2)` failed when constructing a per-handle ring.
