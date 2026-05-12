@@ -36,22 +36,37 @@ include = [
 # `[package.metadata]`). The fuzz crate is published separately if
 # at all and should not be packaged into the main library crate.
 # DESCRIPTION
-description  = "Adaptive file and directory IO for Rust — fast, hardware-aware, multi-strategy."
+# Storage-foundation framing — leads with the target audience (Rust
+# storage engines), names five concrete capabilities (journal, io_uring,
+# NVMe passthrough, atomic writes, cross-platform durability). 127 chars,
+# under the 140-char crates.io card limit. No filler adjectives.
+description = "Filesystem IO for Rust storage engines: journal substrate, io_uring, NVMe passthrough, atomic writes, cross-platform durability."
 
-# KEYWORDS
+# KEYWORDS (max 5 per crates.io)
+# Tuned for storage-engine search intent. "journal" replaces the
+# prior "io" (too broad to be useful for discovery; "io" is the most
+# common keyword on crates.io and produces 1000+ results). "journal"
+# is our headline differentiator and matches WAL-related search.
 keywords = [
-    "io", 
-    "filesystem", 
-    "storage", 
-    "durability", 
-    "nvme"
+    "journal",
+    "filesystem",
+    "storage",
+    "durability",
+    "nvme",
 ]
 
-# CATEGORIES
+# CATEGORIES (max 5)
+# Primary: filesystem (the obvious one). Hardware-support: NVMe
+# passthrough, io_uring, PLP detection. OS: cross-platform abstraction
+# over Linux / macOS / Windows. Concurrency: lock-free journal appends,
+# group-commit coordinator, multi-shard batch dispatcher — adding it
+# surfaces fsys in concurrency-tagged searches by storage-engine
+# authors looking for foundation libraries.
 categories = [
-    "filesystem", 
-    "hardware-support", 
-    "os"
+    "filesystem",
+    "hardware-support",
+    "os",
+    "concurrency",
 ]
 
 # AUTHORS
