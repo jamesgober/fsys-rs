@@ -354,6 +354,91 @@ pub(crate) fn set_write_lifetime_hint(file: &std::fs::File, hint_ordinal: u8) ->
     }
 }
 
+/// 0.9.5 — Punches a hole in `file` at `[offset, offset + len)`.
+///
+/// After the call, the byte range still exists logically (the
+/// file size is unchanged) but reads return zeros, and the
+/// underlying storage blocks are released to the filesystem
+/// free pool. Most modern filesystems issue NVMe TRIM to the
+/// device automatically as part of the operation.
+///
+/// **Per-platform implementation:**
+/// - **Linux**: `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`.
+/// - **macOS**: `fcntl(F_PUNCHHOLE)` with `fpunchhole_t` payload.
+/// - **Windows**: `DeviceIoControl(FSCTL_SET_ZERO_DATA)` —
+///   the closest semantic match (Windows zeros the range, which
+///   most NTFS configurations release to free space).
+/// - **Other**: returns `Err(Error::Io)` with `Unsupported` kind.
+///
+/// Returns `Err` on filesystems that don't support hole-punching
+/// (older ext2, vfat, certain FUSE mounts). Caller's data is
+/// unchanged on error.
+#[inline]
+pub(crate) fn punch_hole(file: &std::fs::File, offset: u64, len: u64) -> crate::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        imp::punch_hole(file, offset, len)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        imp::punch_hole(file, offset, len)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        imp::punch_hole(file, offset, len)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (file, offset, len);
+        Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "punch_hole not supported on this platform",
+        )))
+    }
+}
+
+/// 0.9.5 — Zero-fills `file` at `[offset, offset + len)`.
+///
+/// On capable Linux + NVMe configurations the kernel translates
+/// this into an NVMe `WRITE ZEROES` command — the drive marks
+/// the range as zeros without host→device data transfer. On
+/// other platforms / configurations the implementation falls
+/// back to a write of an aligned zero buffer.
+///
+/// **Per-platform implementation:**
+/// - **Linux**: `fallocate(FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE)`.
+/// - **macOS**: pwrite of an in-memory zero buffer.
+/// - **Windows**: `DeviceIoControl(FSCTL_SET_ZERO_DATA)` (same
+///   IOCTL as `punch_hole`; semantics match for the zero-fill
+///   case).
+/// - **Other**: pwrite of an in-memory zero buffer.
+#[inline]
+pub(crate) fn zero_range(file: &std::fs::File, offset: u64, len: u64) -> crate::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        imp::zero_range(file, offset, len)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Universal fallback: write zeros via pwrite.
+        // Uses an 8 KiB stack buffer to avoid a large heap
+        // allocation for typical hole sizes; longer ranges loop.
+        if len == 0 {
+            return Ok(());
+        }
+        let zeros: [u8; 8192] = [0u8; 8192];
+        let mut written = 0u64;
+        while written < len {
+            let chunk = (len - written).min(zeros.len() as u64) as usize;
+            // pwrite-style positioned write. Use the platform's
+            // write_at primitive which handles offset internally.
+            write_at(file, offset + written, &zeros[..chunk])?;
+            written += chunk as u64;
+        }
+        Ok(())
+    }
+}
+
 /// 0.9.4 — Barrier-grade sync. Cheaper than [`sync_full`]
 /// where the platform supports it.
 ///

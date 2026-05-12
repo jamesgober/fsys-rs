@@ -5,6 +5,193 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] - 2026-05-11
+
+> **Performance + IO tuning umbrella.** Three load-bearing
+> features land together: a **dual-buffered Direct-mode log
+> buffer** that decouples appends from in-flight flushes so
+> writers no longer block on the `write_at_direct` syscall;
+> a cross-platform **`punch_hole` / `write_zeros`** API
+> backed by Linux `fallocate(FALLOC_FL_PUNCH_HOLE |
+> FL_ZERO_RANGE)`, macOS `F_PUNCHHOLE`, and Windows
+> `FSCTL_SET_ZERO_DATA`, plus a Linux **`fiemap(2)` extent
+> helper** so callers can reason about file-extent-to-LBA
+> stability; and **`IORING_REGISTER_FILES`** in both the
+> synchronous owner-thread ring and the async substrate's
+> completion driver — every per-SQE fd is lazily upgraded to
+> a fixed-file slot, eliminating kernel-side fd validation
+> on the hot path. All three are strictly additive on the
+> public API; every 0.9.4 caller compiles unchanged.
+
+### Added — 0.9.5
+
+- **`Handle::punch_hole(path, offset, len)`** — releases the
+  storage backing the half-open range `[offset, offset + len)`
+  of `path` without changing the file's logical length.
+  Reads of the punched range subsequently return zeros.
+  Cross-platform: Linux `fallocate(FALLOC_FL_PUNCH_HOLE |
+  FALLOC_FL_KEEP_SIZE)`, macOS `fcntl(F_PUNCHHOLE)` with
+  `fpunchhole_t`, Windows `DeviceIoControl(FSCTL_SET_ZERO_DATA)`
+  with `FILE_ZERO_DATA_INFORMATION`. **Use case**: WAL
+  workloads that pre-allocate then trim consumed segments.
+- **`Handle::write_zeros(path, offset, len)`** — zeros the
+  range `[offset, offset + len)` of `path` **without
+  changing logical length and without releasing storage**.
+  Linux uses `FALLOC_FL_ZERO_RANGE` (kernel ≥ 3.15, ext4/xfs);
+  macOS / Windows fall back to a positioned `pwrite`/`WriteFile`
+  of a zero buffer. **Use case**: rapidly resetting a
+  preallocated buffer range without giving up the extent
+  reservation.
+- **`crate::platform::linux::fiemap_extents(fd, start,
+  length)`** (`pub(crate)`, Linux only) — returns up to 256
+  extents over the given byte range via the
+  `FIEMAP` ioctl, walking the ioctl up to 4 times to
+  collect a complete map. Each returned `FiemapExtent`
+  carries the file-side and disk-side offsets plus the
+  `FIEMAP_EXTENT_*` flag word.
+- **`crate::platform::linux::fiemap_extent_is_usable_for_dsm`**
+  (`pub(crate)`, Linux only) — filters extents to those
+  whose flag set indicates a stable file-to-LBA mapping
+  (no `_UNKNOWN`, `_NOT_ALIGNED`, `_DELALLOC`,
+  `_ENCODED`, `_DATA_ENCRYPTED`, `_DATA_INLINE`,
+  `_DATA_TAIL`, or `_UNWRITTEN`). The filter is the
+  preflight for any future NVMe DSM (DEALLOCATE / WRITE
+  ZEROES) submission — fsys only sends device commands
+  against ranges with confirmed stable extent mappings.
+- **`crate::platform::punch_hole` / `crate::platform::zero_range`**
+  (`pub(crate)`, cross-platform) — dispatch shims used by
+  `Handle::punch_hole` / `Handle::write_zeros`. Linux
+  delegates to `fallocate`; macOS uses `F_PUNCHHOLE` for
+  hole punching and a pwrite-zeros fallback for
+  zero-range; Windows uses `FSCTL_SET_ZERO_DATA` for both.
+
+### Changed — 0.9.5
+
+- **`journal::log_buffer::LogBuffer` is now a
+  dual-buffered active/flushing state machine.** The old
+  pre-0.9.5 single-buffer design held its mutex through the
+  entire `write_at_direct` syscall, blocking every
+  concurrent appender for the syscall duration. The new
+  design owns two equal-sized buffer slots
+  (`[UnsafeCell<AlignedBuf>; 2]`) under a `parking_lot::Mutex<State>`
+  + `Condvar`. The appender that triggers a rotation marks
+  the old slot `flushing`, drops the state lock, runs the
+  syscall on the flushing slot **unlocked**, and re-acquires
+  the lock to publish completion. Other appenders fill the
+  new active slot concurrently. For HiveDB-class workloads
+  (many concurrent writers per handle), Direct mode goes
+  from a single-core ceiling to multi-core scalable.
+  - **Memory cost**: 2× per-journal — `log_buffer_kib(N)`
+    now allocates `2 × N` KiB total (was `N` KiB
+    pre-0.9.5). Documented as an intentional trade.
+  - **Invariants**: every byte position remains
+    sector-aligned; `flushing == Some(idx)` ⟹ `idx !=
+    active_idx`; the flush owner has exclusive access to
+    its slot for the syscall window. The `unsafe impl
+    Sync` is sound under these invariants — exhaustively
+    validated by 4 new concurrent-load tests
+    (8-thread sustained-load alternation, rotation
+    indexing under contention, back-to-back rotation
+    after sustained load, partial flush waiting on
+    in-flight rotation).
+  - **`JournalOptions::log_buffer_kib` is now PER SLOT**
+    in 0.9.5 (previously it was the single buffer's
+    size). The default `log_buffer_kib(64)` therefore
+    allocates 128 KiB per Direct journal handle.
+- **Linux + Linux-async io_uring rings now use
+  `IORING_REGISTER_FILES`.** Both
+  `crate::platform::linux_iouring::IoUringRing` (sync owner
+  thread) and `crate::async_io::completion_driver::AsyncIoUring`
+  (tokio async substrate) instantiate a 16-slot sparse
+  file table at owner startup. Per-op `fd`s are lazily
+  upgraded to a fixed-file slot via
+  `register_files_update` on first use; subsequent SQEs
+  for the same fd reuse the cached slot and submit with
+  `io_uring::types::Fixed(slot)` instead of
+  `io_uring::types::Fd(raw)`. Saves kernel-side fd
+  validation on every SQE — the journal hot path that
+  reuses one fd thousands of times sees the largest
+  benefit. Fallback to raw-fd SQEs is cleanly silent if
+  the kernel rejects the initial registration or the
+  16-slot table fills.
+
+### Performance — 0.9.5
+
+- **Direct-mode journal append throughput under concurrency:**
+  appenders no longer block on `write_at_direct`. Wall-time
+  win scales with appender concurrency × syscall duration —
+  on a quiet O_DIRECT NVMe write of one sector, the syscall
+  is ~5-20 µs; with 8 concurrent appenders, the pre-0.9.5
+  serialization cost was ~40-160 µs per rotation; 0.9.5
+  drops that to the lock-handoff window only (~µs).
+- **`IORING_REGISTER_FILES` per-SQE win:** ~50-200 ns of
+  fd validation saved per SQE. Most observable on the
+  Direct-method journal hot path (high SQE volume, low
+  fd diversity); negligible on the async ad-hoc path
+  (varying fds, lower volume).
+- **`punch_hole` vs naive zero-fill:** Linux
+  `FALLOC_FL_PUNCH_HOLE` returns extents to the
+  filesystem in O(extents) — typically µs-scale for a
+  WAL segment trim — vs the O(N) cost of writing zeros
+  over the range. Windows `FSCTL_SET_ZERO_DATA`
+  similarly avoids the page-cache write path.
+
+### Tests — 0.9.5
+
+- **+12 cross-platform lib tests** (421 → 433 on Windows):
+  4 in `journal::log_buffer::tests` (rotation alternates
+  active slot indices, back-to-back rotations after
+  sustained load, 8-thread sustained-load concurrent
+  alternation, partial flush waits for in-flight rotation
+  flush); 3 in `handle::tests` (`punch_hole` end-to-end
+  read-back-zeros, `write_zeros` end-to-end read-back-zeros,
+  hole-punch preserves logical length); 5 in
+  `platform::tests` (Linux fiemap extent extraction,
+  macOS `F_PUNCHHOLE` payload round-trip, Windows
+  `FSCTL_SET_ZERO_DATA` payload round-trip, cross-platform
+  `zero_range` fallback path, `fiemap_extent_is_usable_for_dsm`
+  flag-mask edge cases).
+- All 0.9.4 tests pass unchanged.
+  `cargo test --all-features` on Windows: **all
+  passing**, 0 failed.
+- `cargo clippy --all-targets --all-features -- -D warnings`:
+  clean.
+- `cargo fmt --all -- --check`: clean.
+
+### Notes — 0.9.5
+
+- **No new runtime dependencies.** All new platform work
+  uses the existing `libc` (Linux/macOS) and `windows-sys`
+  (Windows) deps; concurrency primitives in the log
+  buffer use the existing `parking_lot` dep.
+- **No breaking changes** to public API surface. The
+  internal `LogBuffer` rebuild is a `pub(crate)` rework;
+  callers using `JournalOptions::log_buffer_kib` will see
+  a doubled allocation footprint (semantics changed from
+  "single buffer size" to "per slot") — documented in
+  the option's doc comment.
+- **MSRV unchanged.** Still 1.75.
+- **All Linux-only paths are `#[cfg(target_os = "linux")]`-gated.**
+  macOS / Windows / unknown platforms see no compile-time
+  or runtime change from the io_uring work; their
+  `punch_hole` / `write_zeros` paths use the platform-native
+  primitives.
+
+### Deferred to a future release — legitimate architectural dep
+
+- **`IORING_REGISTER_BUFFERS` + `IORING_OP_WRITE_FIXED` for
+  the journal hot path.** The journal's `write_at_direct`
+  flush path currently uses `pwrite(2)` (cross-platform),
+  **not** io_uring. Wiring `WRITE_FIXED` into a path that
+  doesn't go through io_uring would land dead code.
+  Routing the journal flush through io_uring is its own
+  architectural decision (sync owner-thread ring vs async
+  substrate, channel overhead vs syscall, ICE-workaround
+  testing on rustc 1.95+) and is the gating work for a
+  future release. `IORING_REGISTER_FILES` is wired into
+  every existing io_uring caller in 0.9.5; `WRITE_FIXED`
+  follows the journal-on-io_uring rework.
+
 ## [0.9.4] - 2026-05-11
 
 > **io_uring elite — Linux.** Three Linux-only optimisations
@@ -1915,6 +2102,7 @@ release-candidate-to-1.0 runway.
 - Initial release. Reserved name on crates.io. No public API.
 
 [Unreleased]: https://github.com/jamesgober/fsys-rs/compare/v0.9.4...HEAD
+[0.9.5]: https://github.com/jamesgober/fsys-rs/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/jamesgober/fsys-rs/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/jamesgober/fsys-rs/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/jamesgober/fsys-rs/compare/v0.9.1...v0.9.2

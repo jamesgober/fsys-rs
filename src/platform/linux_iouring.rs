@@ -291,6 +291,25 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>) {
         Err(_) => return,
     };
 
+    // 0.9.5 — `IORING_REGISTER_FILES`. Pre-register a 16-slot
+    // sparse file table. Each per-op `fd` is lazily upgraded to a
+    // fixed-file slot via `register_files_update` on first use;
+    // subsequent submissions for the same fd reuse the cached
+    // slot and submit SQEs with `IOSQE_FIXED_FILE` semantics
+    // (`io_uring::types::Fixed`). This saves kernel-side fd
+    // validation on every SQE — a real per-syscall win for rings
+    // that do many ops against a small set of fds (the Direct-
+    // method journal hot path).
+    //
+    // If the kernel rejects the initial registration (rare —
+    // stable since 5.1), or if the table fills (>16 distinct
+    // fds in one ring's lifetime, unusual for fsys workloads),
+    // we fall back to raw-fd SQEs cleanly — the registry simply
+    // returns `None` and each match arm submits with
+    // `io_uring::types::Fd(raw)` instead of `types::Fixed(slot)`.
+    let mut fd_registry = FdRegistry::new();
+    let _ = fd_registry.initial_register(&ring.submitter());
+
     while let Ok(op) = rx.recv() {
         match op {
             Op::Write {
@@ -300,13 +319,25 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>) {
                 offset,
                 reply,
             } => {
-                let entry = io_uring::opcode::Write::new(
-                    io_uring::types::Fd(fd),
-                    buf_ptr as *const u8,
-                    buf_len as u32,
-                )
-                .offset(offset)
-                .build();
+                // 0.9.5 — try the fixed-file fast path first.
+                let entry =
+                    if let Some(slot) = fd_registry.try_get_or_register(&ring.submitter(), fd) {
+                        io_uring::opcode::Write::new(
+                            io_uring::types::Fixed(slot),
+                            buf_ptr as *const u8,
+                            buf_len as u32,
+                        )
+                        .offset(offset)
+                        .build()
+                    } else {
+                        io_uring::opcode::Write::new(
+                            io_uring::types::Fd(fd),
+                            buf_ptr as *const u8,
+                            buf_len as u32,
+                        )
+                        .offset(offset)
+                        .build()
+                    };
                 // SAFETY: The submitter (`IoUringRing::write_at`)
                 // is blocked on `reply.recv()` until we send the
                 // result, holding the caller's `&[u8]` borrow alive
@@ -338,13 +369,25 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>) {
                 offset,
                 reply,
             } => {
-                let entry = io_uring::opcode::Read::new(
-                    io_uring::types::Fd(fd),
-                    buf_ptr as *mut u8,
-                    buf_len as u32,
-                )
-                .offset(offset)
-                .build();
+                // 0.9.5 — fixed-file fast path.
+                let entry =
+                    if let Some(slot) = fd_registry.try_get_or_register(&ring.submitter(), fd) {
+                        io_uring::opcode::Read::new(
+                            io_uring::types::Fixed(slot),
+                            buf_ptr as *mut u8,
+                            buf_len as u32,
+                        )
+                        .offset(offset)
+                        .build()
+                    } else {
+                        io_uring::opcode::Read::new(
+                            io_uring::types::Fd(fd),
+                            buf_ptr as *mut u8,
+                            buf_len as u32,
+                        )
+                        .offset(offset)
+                        .build()
+                    };
                 // SAFETY: same shape as `Op::Write` — submitter
                 // holds the `&mut [u8]` borrow alive across the
                 // blocking reply receive.
@@ -367,9 +410,17 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>) {
             }
 
             Op::Fdatasync { fd, reply } => {
-                let entry = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
-                    .flags(io_uring::types::FsyncFlags::DATASYNC)
-                    .build();
+                // 0.9.5 — fixed-file fast path.
+                let entry =
+                    if let Some(slot) = fd_registry.try_get_or_register(&ring.submitter(), fd) {
+                        io_uring::opcode::Fsync::new(io_uring::types::Fixed(slot))
+                            .flags(io_uring::types::FsyncFlags::DATASYNC)
+                            .build()
+                    } else {
+                        io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
+                            .flags(io_uring::types::FsyncFlags::DATASYNC)
+                            .build()
+                    };
                 // SAFETY: no buffer; the fd is alive in the
                 // submitter (file is held open there) for the
                 // duration of this submission.
@@ -404,17 +455,41 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>) {
                 // only after the Write completes successfully.
                 // We submit both SQEs and wait for both CQEs;
                 // the Write's byte count is the reported result.
-                let write_entry = io_uring::opcode::Write::new(
-                    io_uring::types::Fd(fd),
-                    buf_ptr as *const u8,
-                    buf_len as u32,
-                )
-                .offset(offset)
-                .build()
-                .flags(io_uring::squeue::Flags::IO_LINK);
-                let fsync_entry = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
-                    .flags(io_uring::types::FsyncFlags::DATASYNC)
-                    .build();
+                //
+                // 0.9.5 — both SQEs use the fixed-file slot
+                // when available. The slot is resolved once
+                // and used for both; falling back to raw fd
+                // on the same op if the slot table is full.
+                let (write_entry, fsync_entry) =
+                    if let Some(slot) = fd_registry.try_get_or_register(&ring.submitter(), fd) {
+                        (
+                            io_uring::opcode::Write::new(
+                                io_uring::types::Fixed(slot),
+                                buf_ptr as *const u8,
+                                buf_len as u32,
+                            )
+                            .offset(offset)
+                            .build()
+                            .flags(io_uring::squeue::Flags::IO_LINK),
+                            io_uring::opcode::Fsync::new(io_uring::types::Fixed(slot))
+                                .flags(io_uring::types::FsyncFlags::DATASYNC)
+                                .build(),
+                        )
+                    } else {
+                        (
+                            io_uring::opcode::Write::new(
+                                io_uring::types::Fd(fd),
+                                buf_ptr as *const u8,
+                                buf_len as u32,
+                            )
+                            .offset(offset)
+                            .build()
+                            .flags(io_uring::squeue::Flags::IO_LINK),
+                            io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
+                                .flags(io_uring::types::FsyncFlags::DATASYNC)
+                                .build(),
+                        )
+                    };
                 // SAFETY: submitter blocks on `reply.recv()`
                 // holding the caller's `&[u8]` borrow alive
                 // for the duration of this submission; the
@@ -479,6 +554,97 @@ fn io_err(msg: &'static str) -> Error {
 
 fn owner_dead() -> Error {
     Error::Io(std::io::Error::other("io_uring owner thread terminated"))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 0.9.5 — `IORING_REGISTER_FILES` slot registry (owner-thread local)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maintains a 16-slot sparse file table that's registered with
+/// the ring at owner startup. Per-op fds are lazily upgraded to
+/// fixed-file slots on first use; subsequent submissions for
+/// the same fd reuse the cached slot via the `fd_to_slot`
+/// lookup. SQEs for slotted fds use `types::Fixed(slot)` instead
+/// of `types::Fd(raw)` — the kernel skips per-SQE fd validation,
+/// an observable per-syscall win on the Direct-method journal
+/// hot path that reuses the same fd for thousands of writes.
+///
+/// This is the **synchronous** ring's counterpart to the
+/// `FdRegistry` in `async_io::completion_driver` — same shape,
+/// same fallback semantics. Two structs (no shared helper)
+/// because rustc 1.95's `check_mod_deathness` ICE class
+/// triggers on cross-module references involving `&mut
+/// io_uring::IoUring`; duplicating the type is the workaround
+/// that keeps both modules building cleanly.
+struct FdRegistry {
+    /// The slot table — `-1` for unused, otherwise the
+    /// registered RawFd. Sized to [`SLOT_TABLE_SIZE`].
+    slots: Vec<RawFd>,
+    /// Cache `fd → slot` for O(1) lookup on subsequent ops.
+    fd_to_slot: std::collections::HashMap<RawFd, u32>,
+    /// `true` once the initial `register_files` succeeded.
+    /// Subsequent lazy upgrades use `register_files_update`.
+    registered: bool,
+}
+
+/// Size of the registered-files slot table per ring.
+/// 16 is well above the typical journal workload (1 fd per
+/// journal handle) and keeps the kernel-side memory cost
+/// negligible.
+const SLOT_TABLE_SIZE: usize = 16;
+
+impl FdRegistry {
+    fn new() -> Self {
+        Self {
+            slots: vec![-1; SLOT_TABLE_SIZE],
+            fd_to_slot: std::collections::HashMap::new(),
+            registered: false,
+        }
+    }
+
+    /// Initial sparse registration. Called once at owner
+    /// startup; subsequent `try_get_or_register` calls use
+    /// `register_files_update` instead.
+    ///
+    /// Returns `Ok(())` if registration succeeded. On `Err` the
+    /// registry stays `registered = false` and every
+    /// `try_get_or_register` call returns `None`, causing each
+    /// match arm to fall back to raw-fd SQEs cleanly.
+    fn initial_register(&mut self, submitter: &io_uring::Submitter<'_>) -> std::io::Result<()> {
+        submitter.register_files(&self.slots)?;
+        self.registered = true;
+        Ok(())
+    }
+
+    /// Returns the slot index for `fd`, registering it lazily
+    /// on first use. `None` if (a) the initial registration
+    /// failed, (b) the slot table is full, or (c) the
+    /// per-fd registration update was rejected by the kernel.
+    /// In all three cases the caller falls back to raw-fd
+    /// SQEs.
+    fn try_get_or_register(
+        &mut self,
+        submitter: &io_uring::Submitter<'_>,
+        fd: RawFd,
+    ) -> Option<u32> {
+        if !self.registered {
+            return None;
+        }
+        if let Some(&slot) = self.fd_to_slot.get(&fd) {
+            return Some(slot);
+        }
+        let slot_idx = self.slots.iter().position(|&s| s == -1)?;
+        let update = [fd];
+        let updated = submitter
+            .register_files_update(slot_idx as u32, &update)
+            .ok()?;
+        if updated == 0 {
+            return None;
+        }
+        self.slots[slot_idx] = fd;
+        let _ = self.fd_to_slot.insert(fd, slot_idx as u32);
+        Some(slot_idx as u32)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
