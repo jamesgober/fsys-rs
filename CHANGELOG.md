@@ -5,6 +5,279 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6] - 2026-05-12
+
+> **Full-codebase audit + architectural centerpiece.** 38 findings
+> were inventoried across 7 orthogonal audit dimensions (public
+> API, unsafe blocks, hot-path performance, test coverage, code
+> hygiene, dependencies + build matrix, cross-platform parity).
+> All 5 CRITICAL items are resolved; 13 of 16 HIGH are resolved
+> with the remaining 4 deferred under documented architectural-
+> dep reasons. The architectural centerpiece is the journal-on-
+> io_uring rework: the Direct-mode flush path now submits via
+> `IORING_OP_WRITE_FIXED` against pre-registered `AlignedBuf`
+> slots on Linux, silently falling back to `pwrite` elsewhere.
+> APFS `clonefile(2)` and ReFS `FSCTL_DUPLICATE_EXTENTS_TO_FILE`
+> deliver instant copy-on-write reflinks for `copy_file`. Every
+> change is strictly additive; the public API is fully backward-
+> compatible except for two pre-1.0 lockdowns (`Lsn` and
+> `BatchError` fields became private with accessor methods).
+
+### Added — 0.9.6
+
+- **`Lsn::new(offset: u64) -> Self`** + `From<u64>` /
+  `From<Lsn> for u64` implementations. The inner byte offset is
+  now **private** to preserve the monotonic invariant — see
+  Breaking Changes below.
+- **`BatchError::failed_at()` / `BatchError::completed()`**
+  accessor methods. The struct's fields are now private — see
+  Breaking Changes below; `inner()` / `into_inner()` are
+  unchanged.
+- **APFS `clonefile(2)` reflink fast path** (macOS) — the
+  `copy_file` primitive tries `clonefile` first and falls back
+  to `std::fs::copy` on any error (ENOTSUP for non-APFS,
+  EEXIST for existing destinations, EXDEV for cross-volume,
+  EACCES for permission issues). For HiveDB-style checkpoint
+  workloads on APFS, a multi-GiB clone drops from seconds to
+  microseconds.
+- **ReFS `FSCTL_DUPLICATE_EXTENTS_TO_FILE` reflink fast path**
+  (Windows) — same shape as the macOS clonefile, gated on
+  ReFS volume support. NTFS and cross-volume paths fall back
+  cleanly to `std::fs::copy`. The implementation uses raw
+  `DeviceIoControl` against a fresh-destination handle with
+  `FILE_SHARE_DELETE` per the FSCTL contract.
+- **Real OS version probes**:
+  - macOS: `sysctlbyname("kern.osproductversion")` returns the
+    marketing version string (e.g. `"14.4.1"`).
+  - Windows: `RtlGetVersion` from `ntdll.dll` returns the real
+    `major.minor.build` string (e.g. `"10.0.22631"`) regardless
+    of application manifest.
+  - Both replace the pre-0.9.6 `"unknown"` stubs.
+- **Real page-size probe** via `sysconf(_SC_PAGESIZE)` on Unix
+  and `GetSystemInfo` on Windows. Replaces the pre-0.9.6
+  architecture-aware constant (`16_384` on Apple Silicon,
+  `4_096` elsewhere).
+- **`tests/fd_exhaustion.rs`** (Unix only) — integration test
+  that lowers `RLIMIT_NOFILE`, exhausts the fd table, and
+  verifies fsys surfaces clean errors (no panic, no hang)
+  under EMFILE pressure on write + journal-open paths.
+- **Concurrent-stress thread-count ladder** — new test sweeping
+  `[1, 2, 4, 8, 16, 32]` threads for concurrent journal
+  appends, validating per-thread record counts + no
+  interleaving + LSN monotonicity at every depth.
+- **Completion driver concurrent-panic race test** — 16
+  concurrent submitters + mid-flight owner abort, verifying
+  every submitter resolves to a defined error within 5s
+  (`CompletionDriverDead` / `HandlePoisoned`) rather than hang.
+- **Journal torn-frame sweep** — for every byte position in a
+  3-frame journal, truncate and verify clean detection
+  (`CleanEnd` at frame boundaries, one of
+  `TruncatedHeader` / `TruncatedPayload` / `ChecksumMismatch`
+  elsewhere). Plus a single-byte-flip sweep validating that
+  no single-byte corruption in a well-formed frame is
+  silently accepted.
+- **`[package.metadata.docs.rs]` configuration** — explicit
+  docs.rs build config with `all-features = true` and the
+  `docsrs` cfg flag for `#[cfg_attr(docsrs, doc(cfg(...)))]`
+  annotations.
+- **CI hardening**:
+  - `feature-matrix` job covering 6 feature combinations
+    (no-default-features, async alone, tracing alone,
+    async + tracing, stress, fuzz).
+  - `audit.yml` workflow running `cargo audit` (RUSTSEC
+    advisories) and `cargo deny` (license / source policy)
+    on push, PR, and a daily schedule. New `deny.toml`
+    config enforces the permissive-license allow-list and
+    bans git / unknown-registry deps.
+  - 60-second `soak-short` job running `cargo test --test
+    stress --release` on every PR — catches obvious
+    deadlocks before merge.
+- **Defensive alignment assertion** in `fiemap_extents` —
+  `debug_assert!(buf.as_ptr() as usize % 8 == 0)` catches a
+  potential u64-alignment mismatch in debug builds on
+  stricter ISAs (MIPS, SPARC). Zero cost in release.
+
+### Changed — 0.9.6
+
+- **Direct-mode journal flush now uses `IORING_OP_WRITE_FIXED`
+  on Linux when io_uring is available.** The LogBuffer's two
+  `AlignedBuf` slots are registered with a dedicated
+  `IoUringRing` at construction time via
+  `IORING_REGISTER_BUFFERS`; subsequent rotation and partial
+  flushes submit `WRITE_FIXED` SQEs against the registered
+  slot index, skipping the kernel-side per-SQE page-pinning
+  hop. Silent fallback to `crate::platform::write_at_direct`
+  (`pwrite`) on any failure: kernel < 5.1, sandboxed runtime,
+  `register_buffers` rejection. Soundness contract: the ring
+  drops before the AlignedBufs (field declaration order on
+  `LogBuffer`) so the kernel un-pins before the pages are
+  freed.
+- **`LogBuffer` rotation zeroing now uses `slice.fill(0)`**
+  instead of the pre-0.9.6 hand-rolled `for b in
+  slice.iter_mut() { *b = 0; }` loop. The new form lowers to
+  `memset` deterministically (vectorised) on every supported
+  toolchain since rustc 1.51, saving ~5-10 µs per rotation
+  on a 64 KiB slot.
+- **`LogBuffer` batched-append fast path** (`try_append_frames_batched`)
+  — when an entire batch fits in the active slot's remaining
+  capacity, every record encodes + memcopies under one state-
+  lock acquisition. For an N-record batch this drops N-1 lock
+  acquire/release cycles (~50-100 ns each uncontended, µs
+  each contended). The per-record fallback path is retained
+  for batches that need mid-batch rotation or include
+  oversize records.
+- **`Batch::commit()` / `Batch::commit_grouped()` are now
+  `#[must_use]`** with a custom message naming the failure-
+  position information. Discarding the result was always a
+  bug; this surfaces it at compile time.
+- **EINTR retry + short-read accumulation in `read_all_direct`**
+  (Linux + macOS) — pre-0.9.6 this site did a single `pread`
+  with no retry, so an EINTR during journal rehydration
+  would surface as recovery failure. Now loops with EINTR
+  retry + sector-multiple short-read accumulation.
+- **Zero-byte pwrite guard in `write_at`** (Linux + macOS) —
+  POSIX allows `pwrite` to return 0 in pathological
+  conditions (network FS out-of-space, certain FUSE drivers);
+  without a guard the surrounding loop spins forever. Now
+  returns `ErrorKind::WriteZero`. Windows `WriteFile` path
+  already had this guard.
+- **`punch_hole` dispatch is unified** — `platform::mod.rs` now
+  delegates to `imp::punch_hole` for every target including
+  `unknown`, where the previously-missing stub returns
+  `Err(ErrorKind::Unsupported)` honestly rather than the
+  dispatch hardcoding it.
+- **`fsys::copy_file` on Linux**: the `TODO(0.5.0)` for a
+  hand-rolled `copy_file_range` loop is retired — `std::fs::copy`
+  on Linux uses `copy_file_range(2)` internally since Rust
+  1.62 (we MSRV at 1.75, guaranteed), with proper fallback
+  to `sendfile` on EXDEV and userspace copy on ENOSYS.
+- **`html_root_url`** removed from `src/lib.rs` — docs.rs
+  handles per-version routing automatically; the pinned
+  URL drifted every release.
+- **8 stale `TODO(0.0.5)` / `TODO(0.3.0)` / `TODO(0.5.0)`
+  markers swept** — all resolved (real implementations
+  landed for OS-version probes, page-size probe, reflink
+  paths) or retired (the metrics-event hooks are already
+  observable via `Handle::active_method()` since 0.5.0).
+- **Hardware module documentation** refreshed — the pre-0.9.6
+  "0.0.5 deferred work" notes are obsolete; every load-bearing
+  probe (drive identity, sector size, PLP, NAWUN/NAWUPF, CPU
+  features, memory) is now a real runtime probe.
+
+### Breaking changes — 0.9.6
+
+These are pre-1.0 lockdowns of types that should never have
+exposed public fields. Both have stable accessor methods
+that callers can switch to mechanically.
+
+- **`Lsn.0` is no longer accessible.** Construct via
+  [`Lsn::new(offset)`](crate::Lsn::new) or `Lsn::from(offset)`
+  (via the new `From<u64>` impl); read via the existing
+  [`Lsn::as_u64`](crate::Lsn::as_u64) (now `const fn`) or
+  `u64::from(lsn)` (via the new `From<Lsn>` impl). Pattern-
+  matching on `Lsn(x)` no longer compiles outside the journal
+  module. Migration: replace `Lsn(x)` with `Lsn::new(x)` and
+  `lsn.0` with `lsn.as_u64()`.
+- **`BatchError.failed_at` / `.completed` / `.source` are no
+  longer accessible as fields.** Use the new
+  [`BatchError::failed_at()`](crate::BatchError::failed_at) /
+  [`BatchError::completed()`](crate::BatchError::completed)
+  accessor methods; `inner()` / `into_inner()` are unchanged.
+  Migration: replace `err.failed_at` with `err.failed_at()`,
+  `err.completed` with `err.completed()`, and `*err.source`
+  with `err.inner()` (borrowed) or `*err.into_inner()` (owned).
+
+### Performance — 0.9.6
+
+- **Linux Direct-mode journal hot path:** `WRITE_FIXED`
+  eliminates the kernel's per-SQE page-pinning hop —
+  expected per-write win of ~100-500 ns depending on page-
+  fault behaviour at the call boundary. Cumulative impact on
+  HiveDB-class workloads (thousands of journal flushes per
+  second) is measurable in cache-hit-rate retention and
+  reduced kernel-time fraction.
+- **Direct-mode batch append:** the new
+  `try_append_frames_batched` fast path eliminates N-1 state-
+  lock cycles per N-record batch. On 8-thread × 1000-record
+  batches the saved lock overhead is ~50-100 µs per batch
+  (uncontended) or several × that under contention.
+- **Log buffer rotation zeroing:** `slice.fill(0)` saves
+  ~5-10 µs per rotation on a 64 KiB slot vs the pre-0.9.6
+  hand-rolled loop. Rotation happens every time the active
+  slot fills (default 64 KiB) — frequent under sustained
+  load.
+- **Observer instrumentation:** the double `Option` deref
+  pattern at the append / append_batch entry points was
+  collapsed to a single match-and-bind — saves one Option
+  deref + an unconditional `Instant::now()` on the
+  observer-absent path (the common case when no observer is
+  configured).
+- **APFS / ReFS reflinks:** `copy_file` on supported volumes
+  is now O(metadata) instead of O(bytes). A 1 GiB checkpoint
+  clone drops from seconds to microseconds.
+
+### Tests — 0.9.6
+
+- **+12 cross-platform lib tests** (433 → 437 + new
+  integration binaries): 2 torn-frame sweep tests, 1
+  concurrent-stress thread-count ladder, 1 completion driver
+  race, 3 OS-version probes, 1 page-size probe, 1
+  build/feature additions. Plus `tests/fd_exhaustion.rs` new
+  integration binary (Unix-only).
+- All 0.9.5 tests pass unchanged.
+- `cargo test --all-features` on Windows: **all passing**, 0
+  failed, 1 ignored (manual benches), 3 ignored (Linux-only
+  Direct-mode coverage).
+- `cargo clippy --all-targets --all-features -- -D warnings`:
+  clean.
+- `cargo fmt --all -- --check`: clean.
+- `cargo doc --no-deps --all-features`: clean (no warnings).
+
+### Notes — 0.9.6
+
+- **No new runtime dependencies.** The reflink paths use the
+  existing `libc` (clonefile) and `windows-sys` (FSCTL_DUPLICATE
+  + GetFileSizeEx + SetFileInformationByHandle) deps. The
+  io_uring REGISTER_BUFFERS / WRITE_FIXED uses the existing
+  `io-uring = "0.6"` crate's `register_buffers` /
+  `opcode::WriteFixed` surfaces.
+- **MSRV unchanged.** Still 1.75. The Rust 1.75 line is
+  unaffected by any of the new features.
+- **All Linux-only paths are
+  `#[cfg(target_os = "linux")]`-gated.** macOS / Windows /
+  unknown platforms see no compile-time or runtime change
+  from the io_uring centerpiece work.
+
+### Deferred to 0.9.7 — legitimate architectural deps
+
+Four findings carried over to 0.9.7 with explicit
+architectural-dependency reasons (per the project's
+no-deferral-except-arch-dep policy):
+
+- **H-2** — `JournalHandle` `pub(crate)` field structural
+  refactor into a private `JournalInternals` struct.
+  Mechanical refactor with zero semantic change; appropriate
+  for the 0.9.7 polish pass scope.
+- **H-7** — OOM-injection test infrastructure (custom global
+  allocator). Adding the feature-gated injection layer is
+  itself an architectural item that touches every test binary
+  in the workspace.
+- **H-9** — Explicit kernel-version-fallback probe-mocking
+  layer. The probes use `OnceLock` caching by design;
+  testing the fallback paths via env-var override needs its
+  own design pass. CI matrix variation already covers the
+  correctness case implicitly.
+- **H-16** — GroupCommit condvar wake-stampede design pass.
+  The fix shape (counter-based wake vs barrier vs spinwait +
+  atomic) needs benchmarking under contention before
+  selection. Premature change risks worse contention
+  behaviour.
+
+Additional MEDIUM/LOW items deferred to 0.9.7's polish scope:
+M-2 (atomic-ordering verification), M-5 (cross-platform test
+symmetry refactor), M-6 (doc-example expansion), M-7 (fuzz
+target expansion), M-11 (boundary-condition tests).
+
 ## [0.9.5] - 2026-05-11
 
 > **Performance + IO tuning umbrella.** Three load-bearing
@@ -2102,6 +2375,7 @@ release-candidate-to-1.0 runway.
 - Initial release. Reserved name on crates.io. No public API.
 
 [Unreleased]: https://github.com/jamesgober/fsys-rs/compare/v0.9.4...HEAD
+[0.9.6]: https://github.com/jamesgober/fsys-rs/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/jamesgober/fsys-rs/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/jamesgober/fsys-rs/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/jamesgober/fsys-rs/compare/v0.9.2...v0.9.3

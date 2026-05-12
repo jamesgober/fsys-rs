@@ -301,10 +301,18 @@ impl JournalOptions {
         self
     }
 
-    /// Sets the in-memory log buffer size (in KiB) for Direct-IO
-    /// mode. Ignored when `direct = false`.
+    /// Sets the **per-slot** in-memory log buffer size (in KiB) for
+    /// Direct-IO mode. Ignored when `direct = false`.
     ///
-    /// Clamped to `[4, 65 536]` KiB. The default is 64 KiB.
+    /// **0.9.5+ — this is per slot, not total.** The Direct-mode
+    /// journal allocates a **dual** log buffer (one active slot
+    /// receiving appends, one dormant slot being flushed). Total
+    /// heap usage is therefore `2 × log_buffer_kib`. Setting
+    /// `log_buffer_kib(64)` allocates **128 KiB total** per
+    /// Direct journal handle.
+    ///
+    /// Clamped to `[4, 65 536]` KiB per slot. The default is 64
+    /// KiB per slot (128 KiB total).
     ///
     /// **Larger buffers** amortise the cost of group-commit
     /// fsyncs across more records (better sustained throughput,
@@ -312,6 +320,19 @@ impl JournalOptions {
     /// **Smaller buffers** trigger more frequent flushes (lower
     /// latency-per-record at peak, lower aggregate throughput on
     /// burst workloads).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use fsys::{builder, JournalOptions};
+    /// # fn main() -> fsys::Result<()> {
+    /// let fs = builder().build()?;
+    /// // 256 KiB per slot → 512 KiB total per journal handle.
+    /// let opts = JournalOptions::new().direct(true).log_buffer_kib(256);
+    /// let log = fs.journal_with("/var/log/big.wal", opts)?;
+    /// # let _ = log;
+    /// # Ok(()) }
+    /// ```
     pub fn log_buffer_kib(mut self, kib: u32) -> Self {
         self.log_buffer_kib = kib.clamp(MIN_LOG_BUFFER_BYTES / 1024, MAX_LOG_BUFFER_BYTES / 1024);
         self

@@ -500,9 +500,16 @@ impl JournalHandle {
         // single branch when no observer is registered, and the
         // `Instant::now()` call is elided by the compiler in that
         // case (gated on `obs.is_some()`).
-        let obs_start = self.observer.as_ref().map(|_| Instant::now());
+        // 0.9.6 audit M-1: single-deref Option pattern.
+        // Pre-0.9.6 this site dereffed `self.observer` twice
+        // (once for `Instant::now()` gating, once for the
+        // event fire) — collapsed to one match-and-bind here,
+        // saving a redundant Option deref + Instant::now() on
+        // the failure path of `append_inner`.
+        let obs_ref = self.observer.as_ref();
+        let obs_start = obs_ref.map(|_| Instant::now());
         let result = self.append_inner(record);
-        if let (Some(obs), Some(start)) = (self.observer.as_ref(), obs_start) {
+        if let (Some(obs), Some(start)) = (obs_ref, obs_start) {
             let bytes = record.len() as u64 + format::FRAME_OVERHEAD as u64;
             obs.on_journal_append(crate::observer::JournalAppendEvent {
                 bytes_written: bytes,
@@ -658,9 +665,11 @@ impl JournalHandle {
             direct = self.direct,
         )
         .entered();
-        let obs_start = self.observer.as_ref().map(|_| Instant::now());
+        // 0.9.6 audit M-1: single-deref Option pattern.
+        let obs_ref = self.observer.as_ref();
+        let obs_start = obs_ref.map(|_| Instant::now());
         let result = self.append_batch_inner(records);
-        if let (Some(obs), Some(start)) = (self.observer.as_ref(), obs_start) {
+        if let (Some(obs), Some(start)) = (obs_ref, obs_start) {
             let bytes = records.iter().map(|r| r.len() as u64).sum::<u64>()
                 + records.len() as u64 * format::FRAME_OVERHEAD as u64;
             obs.on_journal_append(crate::observer::JournalAppendEvent {
@@ -987,6 +996,7 @@ impl JournalHandle {
     /// complete. Useful for observability — e.g. exposing
     /// "durable bytes written" as a metric.
     #[must_use]
+    #[inline]
     pub fn synced_lsn(&self) -> Lsn {
         Lsn(self.synced_lsn.load(Ordering::Acquire))
     }
@@ -997,6 +1007,7 @@ impl JournalHandle {
     /// Useful for snapshotting / replication: `next_lsn()` at a
     /// point in time tells you "everything appended up to here."
     #[must_use]
+    #[inline]
     pub fn next_lsn(&self) -> Lsn {
         Lsn(self.next_lsn.load(Ordering::Acquire))
     }

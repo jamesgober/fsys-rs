@@ -907,6 +907,19 @@ pub(crate) fn fiemap_extents(
         // Heap allocation aligned to u64 boundary (the kernel
         // touches u64-aligned fields in the header).
         let mut buf: Vec<u8> = vec![0u8; buf_size];
+        // 0.9.6 audit L-1: defensive assertion that Vec<u8>'s
+        // allocator gave us a u64-aligned start. The kernel's
+        // FIEMAP header has u64 fields at offset 0; on x86_64 /
+        // aarch64 the allocator returns 16-byte alignment in
+        // practice (jemalloc/glibc malloc both align to ≥ 16),
+        // but stricter ISAs (MIPS, SPARC, some ARM32) would fault
+        // on unaligned u64 access. This assert catches the
+        // mismatch in debug builds — zero cost in release.
+        debug_assert_eq!(
+            buf.as_ptr() as usize % std::mem::align_of::<u64>(),
+            0,
+            "fiemap header allocation must be u64-aligned"
+        );
 
         // Populate the header.
         // SAFETY: `buf` is at least `header_size` bytes and `Vec<u8>`
