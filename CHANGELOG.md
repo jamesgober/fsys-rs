@@ -125,13 +125,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so they inline across the crate boundary. `Lsn::new` /
   `as_u64` / `From` impls and `synced_lsn` / `next_lsn` already
   had `#[inline]` from earlier work.
-- **H-16 verification** — added `group_commit_wake_stampede_128_followers`
-  unit test that fires 128 concurrent followers at a single
-  target LSN, asserts no deadlock + zero `pending_followers`
-  leak after all threads join + all followers see their target
-  as durable. Validates the structural correctness of the
-  atomic-decrement + lock-free early-exit path under the
-  contention level the audit flagged.
+- **H-16 verification** — added `group_commit_wake_stampede_64_followers`
+  unit test that fires 64 concurrent followers (via
+  `std::sync::Barrier`, not spin-loop) at a single target LSN
+  and asserts no deadlock + zero `pending_followers` leak after
+  all threads join + all followers see their target as durable.
+  Validates the structural correctness of the atomic-decrement
+  + lock-free early-exit path under the contention level the
+  audit flagged. 64 (rather than 100+) is the chosen size
+  because the stampede semantics — `notify_all` waking N parked
+  threads — kick in at any N > 1; 64 is well within the regime
+  the audit was concerned about, and keeps the test viable on
+  shared CI runners where a 100+ spin-gate test would starve
+  the rest of the parallel `cargo test` suite.
 - **`AUDIT-0.9.6.md` status accuracy** — updated stale "OPEN"
   statuses on M-1 + L-1 (both confirmed already-fixed in 0.9.6)
   and on every 0.9.7-shipped finding (H-2, H-7, H-9, H-16, M-2,
