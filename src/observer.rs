@@ -74,28 +74,69 @@ use std::time::Duration;
 ///
 /// Every method has a default no-op body, so implementors override
 /// only the events they care about. Implementors must be `Send +
-/// Sync + Debug`. Methods MUST NOT block, panic, or invoke fsys IO
-/// on the same handle.
+/// Sync + Debug`.
+///
+/// ## Contract
+///
+/// Implementations of these methods MUST NOT:
+///
+/// - **Block.** Observers run on the calling thread of the
+///   instrumented op; blocking inside a callback blocks every caller
+///   of that op.
+/// - **Panic.** The library does not `catch_unwind` around observer
+///   calls; a panic propagates exactly like any other panic on the
+///   calling thread.
+/// - **Invoke fsys methods on the same `Handle` / `JournalHandle`.**
+///   Doing so risks deadlock (e.g., a write observer that calls
+///   `Handle::write` recursively) or unbounded recursion. Invoking
+///   methods on a **different** handle is safe.
+///
+/// High-frequency callers should accumulate into in-memory atomics or
+/// lock-free histograms rather than calling back into a logger or
+/// external system on every event.
 pub trait FsysObserver: std::fmt::Debug + Send + Sync {
     /// Fired after a [`crate::JournalHandle::append`] or
     /// [`crate::JournalHandle::append_batch`] completes (success or
     /// failure). Called once per call regardless of how many records
     /// the call carried — see [`JournalAppendEvent::records`].
+    ///
+    /// If the call returned an error, [`JournalAppendEvent::error`]
+    /// is `true` and [`JournalAppendEvent::bytes_written`] reflects
+    /// what was *attempted*, not what made it to durable storage —
+    /// the journal contract makes no promise about pre-`sync_through`
+    /// durability either way.
     fn on_journal_append(&self, _event: JournalAppendEvent) {}
 
     /// Fired after a [`crate::JournalHandle::sync_through`] completes
     /// (success or failure). For group-committed syncs, only the
-    /// **leader** thread emits this event; followers return without
-    /// firing — this is the design choice that makes per-syscall
-    /// latency observable rather than per-caller latency.
+    /// **leader** thread emits this event; followers wake from the
+    /// leader's `notify_all` and return without firing.
+    ///
+    /// This makes the event's `duration` field reflect per-syscall
+    /// latency (the fsync the leader actually performed) rather than
+    /// per-caller wall-clock latency (which varies with how long each
+    /// follower waited). Track per-caller latency in user code if
+    /// needed.
     fn on_journal_sync(&self, _event: JournalSyncEvent) {}
 
-    /// Fired after a [`crate::Handle::write`] (atomic-replace primitive)
-    /// completes (success or failure).
+    /// Fired after a [`crate::Handle::write`] (the atomic-replace
+    /// primitive) completes (success or failure). The
+    /// [`HandleWriteEvent::bytes_written`] field is the caller's
+    /// payload size, not including framing or temp-file overhead.
+    ///
+    /// Batch writes (`write_batch`, `Batch::commit`, etc.) are not
+    /// currently instrumented — each op inside a batch will not fire
+    /// this event individually. Subscribe to your own per-batch
+    /// telemetry if needed.
     fn on_handle_write(&self, _event: HandleWriteEvent) {}
 
     /// Fired after a [`crate::Handle::read`] completes (success or
-    /// failure).
+    /// failure). The [`HandleReadEvent::bytes_read`] field is the
+    /// actual count returned; may be less than the requested size if
+    /// the file is shorter, and is `0` on error.
+    ///
+    /// `read_at`, batch reads, and directory operations (`scan`,
+    /// `find`, `count`) are not currently instrumented.
     fn on_handle_read(&self, _event: HandleReadEvent) {}
 }
 
