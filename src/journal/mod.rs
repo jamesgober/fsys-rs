@@ -73,7 +73,6 @@ use std::fs::{File, OpenOptions};
 use std::io::Seek;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Threshold for the stack-allocated frame fast path on the
@@ -212,7 +211,7 @@ pub struct JournalHandle {
     /// because direct-mode appends serialise into a single shared
     /// buffer (the InnoDB / WiredTiger pattern). Buffered-mode
     /// journals retain their lock-free fast path.
-    pub(crate) log_buffer: Option<Mutex<LogBuffer>>,
+    pub(crate) log_buffer: Option<LogBuffer>,
     /// 0.9.2 — optional structured-telemetry observer cloned in
     /// from the parent [`crate::Handle`] at journal-open time.
     /// `None` for journals on observer-less handles. Per-op cost
@@ -376,12 +375,15 @@ impl JournalHandle {
             // is primed with the partial trailing sector content
             // (so subsequent flushes overwrite the zero-pad
             // cleanly).
+            // 0.9.5: `log_buffer_kib` is now PER SLOT (each of
+            // the two buffer slots in the dual-buffer
+            // implementation). Total memory: 2 × cap_bytes.
             let cap_bytes = options.log_buffer_kib.saturating_mul(1024);
-            let mut buf = LogBuffer::new(cap_bytes, sector_size, 0)?;
+            let buf = LogBuffer::new(cap_bytes, sector_size, 0)?;
             if resume_lsn > 0 {
-                rehydrate_log_buffer(&mut buf, &file, sector_size, resume_lsn)?;
+                rehydrate_log_buffer(&buf, &file, sector_size, resume_lsn)?;
             }
-            Some(Mutex::new(buf))
+            Some(buf)
         } else {
             None
         };
@@ -470,15 +472,16 @@ impl JournalHandle {
     }
 
     fn append_inner(&self, record: &[u8]) -> Result<Lsn> {
-        if let Some(buffer_mutex) = &self.log_buffer {
-            // Direct-IO log-buffer path. Mutex-serialised: one
-            // appender at a time copies its frame into the shared
-            // buffer. This trades the lock-free fast path for
-            // sector-aligned zero-copy DMA writes.
-            let mut buf = buffer_mutex.lock().unwrap_or_else(|p| p.into_inner());
-            let (_start, end) = buf.append_frame(&self.file, record)?;
-            // Update next_lsn under the lock so observers see a
-            // consistent (next_lsn, buffer state) pair.
+        if let Some(log_buffer) = &self.log_buffer {
+            // Direct-IO log-buffer path.
+            // 0.9.5: the LogBuffer is now self-locking
+            // (internal mutex + condvar). Multiple appenders
+            // serialise briefly on the state lock for the copy
+            // into the active slot, but the slow `write_at_direct`
+            // syscall happens unlocked — appenders into the new
+            // active slot proceed concurrently with the flush
+            // of the dormant slot.
+            let (_start, end) = log_buffer.append_frame(&self.file, record)?;
             self.next_lsn.store(end, Ordering::Release);
             #[cfg(feature = "tracing")]
             tracing::trace!(end_lsn = end, "direct append complete");
@@ -662,18 +665,20 @@ impl JournalHandle {
             })?;
         }
 
-        if let Some(buffer_mutex) = &self.log_buffer {
-            // Direct-IO log-buffer path. Acquire the buffer
-            // mutex once for the whole batch; each record still
-            // funnels through `append_frame` so the buffer's
-            // partial-flush / oversize-record invariants stay
-            // intact. Net win vs N independent `append` calls:
-            // N-1 fewer mutex-acquire pairs and N-1 fewer
-            // `next_lsn` stores on the hot path.
-            let mut buf = buffer_mutex.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(log_buffer) = &self.log_buffer {
+            // Direct-IO log-buffer path. Each record funnels
+            // through `append_frame` so the buffer's partial-
+            // flush / oversize-record invariants stay intact.
+            // 0.9.5: the LogBuffer self-locks per call; we lose
+            // the "one mutex acquire per whole batch" of pre-
+            // 0.9.5 dual-mutex coordination, but gain
+            // concurrent flush/append from the dual-buffer design.
+            // The net win on multi-record batches comes from the
+            // dual-buffer letting rotation happen mid-batch
+            // without blocking subsequent records.
             let mut last_end: u64 = self.next_lsn.load(Ordering::Acquire);
             for record in records {
-                let (_start, end) = buf.append_frame(&self.file, record)?;
+                let (_start, end) = log_buffer.append_frame(&self.file, record)?;
                 last_end = end;
             }
             self.next_lsn.store(last_end, Ordering::Release);
@@ -842,15 +847,12 @@ impl JournalHandle {
 
         // Direct-IO mode: flush any partially buffered records
         // through a sector-aligned positioned write *before* the
-        // fsync, holding the log-buffer mutex briefly. The
-        // log-buffer mutex is independent of the group-commit
-        // state mutex; concurrent appenders that try to enter
-        // the buffer block here too, which is required to make
-        // the captured frontier (loaded next) include
-        // everything in the buffer at flush time.
-        if let Some(buffer_mutex) = &self.log_buffer {
-            let mut buf = buffer_mutex.lock().unwrap_or_else(|p| p.into_inner());
-            buf.flush_partial(&self.file)?;
+        // fsync. 0.9.5: the LogBuffer self-locks and waits for
+        // any in-flight dormant-slot flush before issuing the
+        // partial flush, so this call is consistent with the
+        // group-commit captured-frontier invariant.
+        if let Some(log_buffer) = &self.log_buffer {
+            log_buffer.flush_partial(&self.file)?;
         }
 
         // Capture the append frontier. We commit only up
@@ -1039,10 +1041,9 @@ impl Drop for JournalHandle {
         // close — flush whatever's in the log buffer so the
         // partial trailing sector lands on disk before we lose
         // the writer's view of it.
-        if let Some(buffer_mutex) = &self.log_buffer {
-            if let Ok(mut buf) = buffer_mutex.lock() {
-                let _ = buf.flush_partial(&self.file);
-            }
+        if let Some(log_buffer) = &self.log_buffer {
+            // 0.9.5: self-locking LogBuffer; no outer mutex.
+            let _ = log_buffer.flush_partial(&self.file);
             let _ = self.file.sync_data();
         }
     }
@@ -1279,7 +1280,7 @@ fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
 /// subsequent flushes overwrite the zero-pad cleanly without
 /// destroying records.
 fn rehydrate_log_buffer(
-    buf: &mut LogBuffer,
+    buf: &LogBuffer,
     file: &File,
     sector_size: u32,
     resume_lsn: u64,
