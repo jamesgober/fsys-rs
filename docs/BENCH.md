@@ -17,6 +17,10 @@ cargo bench --bench direct_iouring
 cargo bench --bench async_native_vs_blocking   # 0.7.0
 cargo bench --bench tail_validation            # 0.7.0
 cargo bench --bench matrix_with_peers --features async  # 0.8.0 F (peer comparison)
+cargo bench --bench journal_vs_atomic_replace  # 0.9.0 R-1 (journal substrate)
+cargo bench --bench batch_throughput           # batch dispatcher
+cargo bench --bench concurrent_batches         # multi-shard dispatcher (0.9.3)
+cargo bench --bench solo_vs_batch              # solo vs batched cost
 ```
 
 `cargo bench` (no `--bench`) runs the full Criterion suite. Build with `--features async` for the async-substrate benches.
@@ -262,12 +266,12 @@ The atomic-replace primitive caps around 200–500 K writes/sec on bare-metal Li
 | Tier | Implementation | Target throughput |
 |------|----------------|------------------:|
 | **Tier 1 (shipped 0.9.0)** | Cross-platform synchronous core: atomic LSN cursor + `pwrite` (POSIX) / `WriteFile`+`OVERLAPPED` (Windows) + group-commit fsync. | 100 K – 500 K ops/s (Windows), 1 M – 3 M (bare Linux). |
-| **Tier 2 (shipped 0.9.0)** | Lock-free append. Concurrent `pwrite` directly against `&File` (no mutex on the hot path). | + 2–5× on multi-threaded workloads vs Tier 1. |
+| **Tier 2 (shipped 0.9.0)** | Lock-free append. Concurrent `pwrite` directly against `&File` (no mutex on the hot path). 0.9.1 added vectored `append_batch` for ~1.6× per-record reduction. 0.9.5 added the dual-buffer Direct-mode log buffer for multi-core scalable Direct appends. | + 2–5× on multi-threaded workloads vs Tier 1. |
 | **Tier 3 (shipped 0.9.0)** | Native io_uring asynchronous substrate on Linux + `async` feature. `IORING_OP_WRITE` / `IORING_OP_FSYNC(DATASYNC)` SQEs through the per-handle completion driver. No `spawn_blocking` thread-pool hop. | + 1.5–3× on Linux async workloads vs Tier 2. |
-| **Direct-IO mode (shipped 0.9.0)** | Opt-in via `JournalOptions::direct(true)`. Sector-aligned in-memory log buffer; `O_DIRECT` / `F_NOCACHE` / `FILE_FLAG_NO_BUFFERING`; zero-copy DMA into the device. | Best for sustained sequential append workloads where page-cache jitter is observable. |
-| **Tier 4 (0.9.x polish)** | io_uring registered buffers (`io_uring_register_buffers`) + registered files + SQPOLL kernel polling thread. | 5 M – 10 M ops/s target on bare-metal Linux + NVMe. Deferred from 0.9.0 RC pending real-world bottleneck data. |
+| **Direct-IO mode (shipped 0.9.0)** | Opt-in via `JournalOptions::direct(true)`. Sector-aligned in-memory log buffer; `O_DIRECT` / `F_NOCACHE` / `FILE_FLAG_NO_BUFFERING`; zero-copy DMA into the device. 0.9.6 added `IORING_OP_WRITE_FIXED` for the Direct-mode flush path on Linux. | Best for sustained sequential append workloads where page-cache jitter is observable. |
+| **Tier 4 — io_uring elite path** | **Shipped across 0.9.4–0.9.7.** `IORING_SETUP_COOP_TASKRUN` / `SINGLE_ISSUER` / `DEFER_TASKRUN` setup flags (0.9.4, kernel ≥ 5.19 / 6.0 / 6.1); linked Write+Fsync via `IOSQE_IO_LINK` (0.9.4); `IORING_REGISTER_FILES` for fd slot-upgrade (0.9.5); `IORING_OP_WRITE_FIXED` against pre-registered AlignedBuf slots (0.9.6); `IORING_SETUP_SQPOLL` opt-in (0.9.7, `Builder::sqpoll(idle_ms)`). | 5 M – 10 M ops/s ceiling on bare-metal Linux + NVMe. Measurement pending Phase 9 bare-metal re-run. |
 
-The Tier 4 ceiling is the same one Oracle, OceanBase, and PolarDB hit with their internal storage engines — the same Linux primitives are available to any application that uses them correctly. The 0.9.0 RC ships everything below the polish line; tier-4 lands once measurements identify it as the actual bottleneck.
+The Tier 4 ceiling is the same one Oracle, OceanBase, and PolarDB hit with their internal storage engines — the same Linux primitives are available to any application that uses them correctly. As of 0.9.7 every tier-4 primitive ships in code; the bench numbers documenting the win are the 0.9.8 release-prep deliverable.
 
 ---
 
@@ -305,6 +309,39 @@ The harness then asserts three load-bearing invariants:
 - **No torn-frame surface.** Records past the sync barrier may or may not be present — the journal contract makes no promise about unsynced records — but any record that the reader does surface must match its expected payload byte-for-byte. The CRC-32C check is what enforces this; if a single bit in the on-disk frame is wrong, the decoder must surface `ChecksumMismatch` rather than yielding the corrupted bytes as a "valid" record.
 
 Both `JournalOptions::default()` (buffered/lock-free) and `JournalOptions::direct(true)` (direct-IO log buffer) pass the harness across 10 consecutive runs.
+
+---
+
+## 0.9.1–0.9.7 features awaiting numbered results
+
+These features shipped between 0.9.1 and 0.9.7. They are
+**production-ready** — covered by unit / integration / fuzz
+tests and validated in the CI matrix — but bench numbers
+isolating each feature's contribution are pending the 0.9.8
+release-prep bare-metal Linux re-run.
+
+| Feature | Release | Expected win | Bench |
+|---|---|---|---|
+| `JournalHandle::append_batch` vectored append | 0.9.1 | ~1.6× per-record vs `append`-in-loop on Windows NTFS; larger on Linux NVMe | needs dedicated bench |
+| Hardware-accelerated CRC-32C (SSE4.2 / ARMv8 CRC) | 0.9.1 | ~10× CRC compute vs scalar fallback | covered indirectly by journal benches |
+| `Builder::dispatcher_shards(N)` multi-shard batch | 0.9.3 | near-linear scaling with `N` for concurrent writers to distinct paths | `benches/concurrent_batches.rs` |
+| `Batch::commit_grouped()` amortised parent-dir fsync | 0.9.3 | M/N reduction where M = distinct parent dirs, N = ops | needs dedicated bench |
+| `SyncMode::Barrier` (macOS `F_BARRIERFSYNC`) | 0.9.4 | 10–100× cheaper than `F_FULLFSYNC` on Apple Silicon NVMe | macOS-only |
+| io_uring elite flags (`COOP_TASKRUN` / `SINGLE_ISSUER` / `DEFER_TASKRUN`) | 0.9.4 | ~5–15% per-op reduction on supported kernels | covered by all io_uring benches |
+| Linked Write+Fsync via `IOSQE_IO_LINK` | 0.9.4 | ~2× round-trip reduction on durable Direct writes | needs dedicated bench |
+| Dual-buffer Direct-mode log buffer | 0.9.5 | Direct mode: single-core ceiling → multi-core scalable | needs concurrent-append bench |
+| `IORING_REGISTER_FILES` slot-upgrade | 0.9.5 | ~50–200 ns per SQE | not isolable in user-space bench |
+| `IORING_OP_WRITE_FIXED` Direct journal flush | 0.9.6 | Saves per-SQE kernel buffer pinning | not isolable in user-space bench |
+| APFS `clonefile(2)` / ReFS `FSCTL_DUPLICATE_EXTENTS_TO_FILE` reflinks | 0.9.6 | Multi-GiB clones: seconds → microseconds | filesystem-specific bench needed |
+| GroupCommit wake-stampede fix | 0.9.7 | ~5× lock-hold reduction under 100+ followers | covered by stress test |
+| LSN reservation `AcqRel` → `Release` | 0.9.7 | ~0.2–0.5 µs/op on aarch64 | needs aarch64 bench |
+| `Builder::sqpoll(idle_ms)` kernel-side polling | 0.9.7 | Eliminates `io_uring_enter` syscall in steady state | needs sustained-write bench |
+
+The Phase 9 release-prep pass produces bare-metal Linux numbers
+for each row in this table. Until then, the regression-budget
+infrastructure (per-class baselines, ≤ 5–25% strictness gates
+in [`baselines.json`](../benches/baselines.json)) catches any
+regression even on the older bench shapes.
 
 ---
 
