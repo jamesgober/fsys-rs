@@ -37,11 +37,7 @@ static C: AtomicU64 = AtomicU64::new(0);
 
 fn tmp_path(tag: &str) -> PathBuf {
     let n = C.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "fsys_plat_sym_{}_{}_{tag}",
-        std::process::id(),
-        n
-    ))
+    std::env::temp_dir().join(format!("fsys_plat_sym_{}_{}_{tag}", std::process::id(), n))
 }
 
 struct Cleanup(PathBuf);
@@ -182,14 +178,8 @@ fn empty_record_round_trip_is_platform_symmetric() {
 fn active_durability_primitive_per_method_is_documented() {
     use fsys::primitive;
 
-    let sync = builder()
-        .method(Method::Sync)
-        .build()
-        .expect("handle Sync");
-    let data = builder()
-        .method(Method::Data)
-        .build()
-        .expect("handle Data");
+    let sync = builder().method(Method::Sync).build().expect("handle Sync");
+    let data = builder().method(Method::Data).build().expect("handle Data");
 
     let p_sync = sync.active_durability_primitive();
     let p_data = data.active_durability_primitive();
