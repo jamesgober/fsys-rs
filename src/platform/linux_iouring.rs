@@ -173,7 +173,7 @@ impl IoUringRing {
         // process; ring construction here just calls
         // `apply(&mut builder)` to set the cached bits.
         let mut probe_builder = io_uring::IoUring::builder();
-        super::iouring_features::apply(&mut probe_builder);
+        super::iouring_features::apply(&mut probe_builder, super::iouring_features::RingMode::Sync);
         match probe_builder.build(queue_depth) {
             Ok(_probe) => {}
             Err(source) => return Err(Error::IoUringSetupFailed { source }),
@@ -363,7 +363,7 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>) {
     // flag set the probe succeeded with — no second kernel probe
     // happens here.
     let mut builder = io_uring::IoUring::builder();
-    super::iouring_features::apply(&mut builder);
+    super::iouring_features::apply(&mut builder, super::iouring_features::RingMode::Sync);
     let mut ring = match builder.build(queue_depth) {
         Ok(r) => r,
         // The probe in `IoUringRing::new` already succeeded; if
