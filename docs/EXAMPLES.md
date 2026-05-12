@@ -6,7 +6,9 @@
   EXAMPLES
 </h1>
 
-The [`examples/`](../examples/) directory contains 16 runnable examples covering every part of the public API. Each example is self-contained, comment-documented, and produces visible output so you can confirm the path you exercised.
+The [`examples/`](../examples/) directory contains **17 runnable examples** covering every part of the public API. Each example is self-contained, comment-documented, and produces visible output so you can confirm the path you exercised.
+
+> The 0.9.8 release is adding focused examples for the 0.9.1–0.9.7 surface additions (`append_batch`, `commit_grouped`, `tune_for(Workload::Database)`, `punch_hole`/`write_zeros`, `SyncMode::Barrier`, `dispatcher_shards`, `FsysObserver`, `sqpoll`, `is_plp_protected`, `atomic_write_unit`, `WriteLifetimeHint`). They land between this commit and the 0.9.8 tag; this doc updates as they merge.
 
 ## Running
 
@@ -99,7 +101,7 @@ For release-mode timings (closer to production), append `--release`. The dev pro
 ## What's deliberately not included
 
 - **`Method::Journal`** — reserved variant; selecting it returns `Error::UnsupportedMethod`. No example because there's no behaviour to demonstrate.
-- **A single "kitchen-sink" example** — reading 16 small focused examples is more useful than one 800-line example that buries the concept under setup. If you want to see how the pieces fit together end-to-end, read `02_handle_basics.rs` then the one for the specific feature you need.
+- **A single "kitchen-sink" example** — reading 17 small focused examples is more useful than one 800-line example that buries the concept under setup. If you want to see how the pieces fit together end-to-end, read `02_handle_basics.rs` then the one for the specific feature you need.
 
 ## See also
 
