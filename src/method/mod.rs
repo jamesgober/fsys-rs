@@ -36,10 +36,15 @@ use std::fmt;
 
 /// Durability strategy for file IO operations.
 ///
-/// The variant controls which OS synchronisation primitive is invoked after
-/// every write. `Sync`, `Data`, `Direct`, and `Auto` are fully functional
-/// in `0.4.0` and earlier; `Mmap` becomes a real backend in `0.5.0`.
-/// `Journal` is reserved for `0.7.0`.
+/// The variant controls which OS synchronisation primitive is invoked
+/// after every write. Five variants ship: `Sync`, `Data`, `Mmap`,
+/// `Direct`, and the hardware-aware `Auto`. `Journal` is a reserved
+/// forward-compatibility placeholder — for append-only / WAL workloads,
+/// use the [`JournalHandle`](crate::JournalHandle) substrate instead.
+///
+/// The enum is `#[non_exhaustive]` so the library can add new variants
+/// in patch releases without breaking external `match` arms (callers
+/// must include a `_` fallback).
 ///
 /// # Platform-specific behavior
 ///
@@ -47,10 +52,10 @@ use std::fmt;
 /// |---------|-------|-------|---------|
 /// | `Sync`  | `fsync(2)` | `fcntl(F_FULLFSYNC)` | `FlushFileBuffers` |
 /// | `Data`  | `fdatasync(2)` | `F_FULLFSYNC` (fallback) | `FlushFileBuffers` (fallback) |
-/// | `Direct`| `O_DIRECT` + `io_uring` (0.5.0) / `fdatasync` (fallback) | `F_NOCACHE` + `F_FULLFSYNC` | `FILE_FLAG_NO_BUFFERING\|WRITE_THROUGH` |
-/// | `Mmap`  | `mmap` + `msync(MS_SYNC)` (0.5.0) | `mmap` + `msync(MS_SYNC)` (0.5.0) | `MapViewOfFile` + `FlushViewOfFile` (0.5.0) |
-/// | `Journal`| *reserved* | *reserved* | *reserved* |
-/// | `Auto`  | hardware ladder (real probe in 0.5.0) | hardware ladder | hardware ladder |
+/// | `Direct`| `O_DIRECT` + `io_uring` (+ NVMe IOCTL on capable hardware, 0.9.4+) / `pwrite` + `fdatasync` (fallback) | `F_NOCACHE` + `F_FULLFSYNC` | `FILE_FLAG_NO_BUFFERING\|WRITE_THROUGH` (+ NVMe IOCTL on capable hardware) |
+/// | `Mmap`  | `mmap` + `msync(MS_SYNC)` | `mmap` + `msync(MS_SYNC)` | `MapViewOfFile` + `FlushViewOfFile` |
+/// | `Journal`| *reserved* — use [`JournalHandle`](crate::JournalHandle) | *reserved* | *reserved* |
+/// | `Auto`  | hardware-probe ladder | hardware-probe ladder | hardware-probe ladder |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -126,15 +131,17 @@ pub enum Method {
     ///
     /// Reads come from a mapped region; writes flow through the mapping
     /// with explicit `msync(MS_SYNC)` (Linux/macOS) or `FlushViewOfFile`
-    /// (Windows) for durability. Falls back to [`Method::Sync`] for
-    /// files smaller than the page size, special files (sockets, pipes,
-    /// FIFOs), and filesystems that reject `mmap`. The fallback is
-    /// observable via
+    /// (Windows) for durability. Falls back **permanently** to
+    /// [`Method::Sync`] for files smaller than the page size, special
+    /// files (sockets, pipes, FIFOs), and filesystems that reject
+    /// `mmap`. Once a handle's `Mmap` path falls back, it stays fallen-
+    /// back for the handle's lifetime; the downgrade is observable via
     /// [`Handle::active_method`](crate::Handle::active_method).
     ///
-    /// **Real backend lands in `0.5.0`.** Earlier versions return
-    /// [`Error::UnsupportedMethod`](crate::Error::UnsupportedMethod) at
-    /// runtime.
+    /// Best for **read-heavy random-access workloads** (B-tree pages,
+    /// LSM-tree level files, mmap'd indexes). Not a fit for sequential
+    /// streaming writes — use [`Method::Sync`] / [`Method::Data`] /
+    /// [`Method::Direct`] for that.
     Mmap = 3,
 
     /// Intent-log (journal) durability mode.
@@ -165,12 +172,14 @@ pub enum Method {
     /// [`Handle::active_method`](crate::Handle::active_method) (which
     /// never returns `Auto`).
     ///
-    /// # Resolution ladder (0.5.0)
+    /// # Resolution ladder
     ///
-    /// 0.5.0 replaces 0.3.0's heuristic ladder with one that consults
-    /// real probe data ([`crate::hardware::info`]). See the
-    /// crate-internal `auto` module and the 0.5.0 prompt's Auto table
-    /// for the full matrix.
+    /// The ladder consults real probe data via
+    /// [`crate::hardware::info`] at handle construction time and is
+    /// cached process-wide. The resolved method is locked at
+    /// [`Builder::build`](crate::Builder::build) time; subsequent
+    /// runtime fallbacks (e.g. `O_DIRECT` rejected by tmpfs) update
+    /// [`Handle::active_method`](crate::Handle::active_method).
     ///
     /// | Condition | Resolves to |
     /// |---|---|
@@ -186,9 +195,14 @@ pub enum Method {
     /// | Windows + HDD or Unknown | `Sync` |
     /// | Hardware probe failed entirely | `Sync` (universal safety) |
     ///
-    /// PLP is **not** consulted by the 0.5.0 ladder — the elite
-    /// NVMe-passthrough path that benefits most from PLP is deferred to
-    /// `0.6.0`.
+    /// PLP detection (0.9.2,
+    /// [`Handle::is_plp_protected`](crate::Handle::is_plp_protected))
+    /// and NVMe atomic-write-unit detection (0.9.4,
+    /// [`Handle::atomic_write_unit`](crate::Handle::atomic_write_unit))
+    /// are exposed as separate accessors rather than ladder inputs —
+    /// they inform user-level decisions (skip per-commit fsync on PLP
+    /// drives, skip torn-write detection on NAWUN-guaranteeing
+    /// drives) rather than auto-resolution.
     Auto = 5,
 }
 
@@ -218,11 +232,19 @@ impl Method {
         }
     }
 
-    /// Returns `true` for reserved variants not yet implemented.
+    /// Returns `true` for reserved variants that cannot be selected.
     ///
-    /// In 0.5.0 the only reserved variant is [`Method::Journal`]
-    /// (deferred to 0.7.0). [`Method::Mmap`] is no longer reserved —
-    /// it ships with a real backend in this phase.
+    /// The only reserved variant is [`Method::Journal`] — kept in the
+    /// public enum as a forward-compatibility placeholder. For
+    /// append-only / WAL workloads, use the
+    /// [`JournalHandle`](crate::JournalHandle) substrate instead,
+    /// which is structurally a different primitive (open-once log
+    /// file with explicit LSN reservation and group-commit fsync)
+    /// rather than a per-write durability strategy.
+    ///
+    /// All other variants ([`Method::Sync`], [`Method::Data`],
+    /// [`Method::Mmap`], [`Method::Direct`], [`Method::Auto`]) ship
+    /// real backends and return `false`.
     #[must_use]
     #[inline]
     pub const fn is_reserved(self) -> bool {
