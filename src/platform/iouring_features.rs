@@ -179,6 +179,11 @@ where
 /// feature-matrix CI exercised the async tests on a kernel with
 /// `DEFER_TASKRUN` support (≥ 6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Variant usage is feature-gated: Sync used by
+                    // linux_iouring.rs (cfg target_os=linux); Async used by
+                    // completion_driver.rs (cfg target_os=linux + feature=async).
+                    // The default-features Linux build constructs Sync only,
+                    // so dead_code would fire on Async without this allow.
 pub(crate) enum RingMode {
     /// Sync owner-thread ring (`linux_iouring.rs`). Uses
     /// `submit_and_wait(n)` which drives the completion processing
