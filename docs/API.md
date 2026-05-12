@@ -6,13 +6,17 @@
   API DOCS
 </h1>
 
-> **Coverage.** This document describes every public item in
-> the `fsys` crate as of `0.9.0`. The API is treated as
-> **frozen at the 0.9.0 release-candidate tag** — only genuine
-> bugs may change a name or signature after that point. The
-> 1.0 stable tag inherits this surface verbatim once
-> real-world testing confirms the API decisions. If you are
-> reading this against `master`, the rendered docs at
+> **Coverage.** This document describes the public API surface of
+> the `fsys` crate. The API was **frozen at the `0.9.0`
+> release-candidate** — every name and signature documented at
+> 0.9.0 is preserved through the current release. Subsequent
+> minor versions (0.9.1 through 0.9.7) added new public items
+> backward-compatibly; those additions are captured in the
+> [API additions in 0.9.1–0.9.7](#api-additions-in-091097)
+> section. The 1.0 stable tag will carry the current surface
+> forward verbatim under SemVer guarantees.
+>
+> If you are reading this against `master`, the rendered docs at
 > [docs.rs/fsys](https://docs.rs/fsys) are the source of truth.
 
 ---
@@ -35,6 +39,7 @@
 14. [Stability + breaking-change policy](#stability--breaking-change-policy)
 15. [Journal substrate (`JournalHandle`, `JournalReader`, `JournalOptions`)](#journal-substrate)
 16. [API changes in 0.9.0](#api-changes-in-090)
+17. [API additions in 0.9.1–0.9.7](#api-additions-in-091097)
 
 ---
 
@@ -119,10 +124,16 @@ passthrough slot (Linux + Windows). It is `Send + Sync` and
 |---|---|
 | `write(path, data)` | Atomic-replace write; durable on return. |
 | `write_copy(path, data)` | Atomic-replace write **preserving the existing target's metadata** (mode/ACLs/timestamps). *Not* a file-to-file copy — see [`std::fs::copy`] for that. |
+| `write_at(path, offset, data)` | Positioned write at `offset` without atomic-replace. |
 | `append(path, data)` | Append to an existing file (creates if missing). Not individually flushed; call `Handle::sync` for batched durability. |
 | `read(path)` | Read full file contents into a `Vec<u8>`. |
-| `read_at(path, offset, len)` | Read `len` bytes from `offset`. (Renamed from `read_range` in 0.7.0; see [API changes](#api-changes-in-070).) |
+| `read_at(path, offset, len)` | Read `len` bytes from `offset`. *(Renamed from `read_range` in 0.7.0.)* |
+| `copy(src, dst)` | File-to-file copy. On APFS uses `clonefile(2)` for instant reflink; on ReFS uses `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. Falls back to `std::fs::copy` on unsupported filesystems. *(0.9.6 reflink fast-path.)* |
 | `delete(path)` | Unlink a file. |
+| `truncate(path, len)` | Truncate file to `len` bytes. |
+| `rename(from, to)` | Rename a file or directory. |
+| `punch_hole(path, offset, len)` | Deallocate a range, leaving a sparse hole. Linux `fallocate(FALLOC_FL_PUNCH_HOLE)`, macOS `fcntl(F_PUNCHHOLE)`, Windows `FSCTL_SET_ZERO_DATA`. *(0.9.5 — WAL-trim primitive.)* |
+| `write_zeros(path, offset, len)` | Write zeros to a range; same syscalls as `punch_hole` with the `KEEP_SIZE` flag where applicable. *(0.9.5.)* |
 | `exists(path)` | `bool` for path existence. |
 | `meta(path)` | `FileMeta` for a path (size, kind, times, mode). |
 | `is_file(path)` | `bool` — is the path a regular file? |
@@ -157,6 +168,10 @@ exception because glob patterns express recursion natively via
 | `async_substrate()` | Which substrate the async layer uses. See [`AsyncSubstrate`](#asyncsubstrate--runtime-substrate-observability). |
 | `mode()` | The resolved [`Mode`](#mode--environment-profile). |
 | `sector_size()` | Probed logical sector size in bytes. |
+| `is_plp_protected()` | `bool` — whether the underlying drive has confirmed power-loss-protection (PLP capacitors). When `true`, databases can safely skip per-commit fsync on enterprise NVMe. *(0.9.2.)* |
+| `plp_status()` | Full PLP probe state (`Detected`, `NotDetected`, `Unknown`). *(0.9.2.)* |
+| `atomic_write_unit()` | `Option<u32>` — NVMe NAWUN / NAWUPF probe result. When `Some(n)`, the drive guarantees torn-write-free writes up to `n` bytes; databases on guaranteeing drives can skip torn-write detection on writes of that size or smaller. *(0.9.4, Linux.)* |
+| `observer()` | The registered [`FsysObserver`](#fsysobserver-trait-092) hook, if any. *(0.9.2.)* |
 
 ### Sync
 
@@ -267,6 +282,10 @@ let fs = fsys::builder()
 | `buffer_pool_count(usize)` | `64` | Number of aligned buffers in the per-handle pool. *(Renamed from `buffer_pool_size` in 0.7.0.)* |
 | `buffer_pool_block_size(usize)` | `4096` | Per-buffer size in bytes. *(Renamed from `buffer_pool_block` in 0.7.0.)* |
 | `io_uring_queue_depth(u32)` | `128` | Linux io_uring SQ depth. |
+| `dispatcher_shards(usize)` | `1` | Number of group-lane dispatcher threads per handle. Values > 1 spawn N independent dispatchers; batches hash-route by first op's path. Lifts the pre-0.9.3 one-core ceiling. Clamped to `1..=64`. *(0.9.3.)* |
+| `observer(Arc<dyn FsysObserver>)` | `None` | Register a structured-telemetry hook. Per-op events (journal append / sync / handle write / read) fire on the originating thread. *(0.9.2.)* |
+| `tune_for(Workload)` | — | One-line preset for coordinated knobs. `Workload::Database` sets `buffer_pool_count=1024`, `buffer_pool_block_size=8192`, `io_uring_queue_depth=256`, `batch_queue_max=4096`. *(0.9.2.)* |
+| `sqpoll(u32)` | `None` | Opt-in `IORING_SETUP_SQPOLL` with the given idle timeout (ms). Kernel-side polling thread drains the SQ without `io_uring_enter` syscalls. Linux-only consumption; ignored elsewhere. Falls back to non-SQPOLL on EPERM. *(0.9.7.)* |
 
 ---
 
@@ -274,107 +293,25 @@ let fs = fsys::builder()
 
 `Batch` is the type returned by `Handle::batch()` for the
 fluent batch-builder ergonomics. Operations accumulate via
-`.write(path, data)` / `.delete(path)` / `.sync(path)` and
-flush on `.commit()`.
+`.write(path, data)` / `.delete(path)` / `.sync(path)` /
+`.copy(src, dst)` and flush on `.commit()` (best-effort) or
+`.commit_grouped()` (atomic).
 
 For programmatic batch construction, prefer
 `Handle::write_batch(Vec<BatchOp>)` directly.
 
-`BatchError` is the error type returned by partial-failure
-batches: it carries per-op error information without aborting
-the rest of the batch.
+### `commit` vs `commit_grouped` (0.9.3)
 
----
-
-## Journal substrate
-
-For high-throughput durable writes (database WAL, queue persistence, ledger append), use the **journal substrate** — open-once log file, atomic LSN reservation, group-commit fsync. Shipped in 0.9.0.
-
-### Public types
-
-```rust
-pub struct JournalHandle { /* opaque */ }
-pub struct Lsn(pub u64);
-```
-
-`JournalHandle` is `Send + Sync`; share via `Arc<JournalHandle>`. `Lsn` is the byte-offset of the *next* write position in the journal — monotonic per-handle, with transparent ordering (`Lsn(100) < Lsn(200)` ⟺ first record was appended before the second).
-
-### API
-
-| Method | Purpose |
+| Method | Semantics |
 |---|---|
-| `Handle::journal(path) -> Result<JournalHandle>` | Opens the journal at `path`. Resumes at the existing file size if the file exists; creates if not. |
-| `JournalHandle::append(record) -> Result<Lsn>` | Appends a record (NO fsync). Returns the LSN immediately past the record. Concurrent-safe across threads. |
-| `JournalHandle::sync_through(lsn) -> Result<()>` | Group-commit fsync: forces all bytes up to `lsn` to stable storage. Concurrent calls coalesce into one fsync syscall. |
-| `JournalHandle::synced_lsn() -> Lsn` | Highest LSN known durable. Observability. |
-| `JournalHandle::next_lsn() -> Lsn` | Next LSN to be assigned by `append`. Snapshot point. |
-| `JournalHandle::close(self) -> Result<()>` | Final sync + close (consumes self). Drop is the implicit best-effort close. |
-| `JournalHandle::append_async(self: Arc<Self>, record: Vec<u8>) -> Result<Lsn>` | Async sibling. Requires `async` feature + tokio runtime. |
-| `JournalHandle::sync_through_async(self: Arc<Self>, lsn: Lsn) -> Result<()>` | Async sibling for group-commit. |
+| `commit()` | Best-effort. Each op runs through the dispatcher individually; failures surface a `BatchError` but successful ops are preserved. |
+| `commit_grouped()` | **Atomic-batch fsync.** Amortises parent-directory `fsync` across the entire batch — one syscall per unique parent directory instead of one per op. Right choice for bulk-load / SST-flush / checkpoint workloads where the batch is the durability unit. *(0.9.3.)* |
 
-### When to use the journal
-
-Use the journal when:
-- You're building a **database WAL**, **persistent queue**, **event log**, or **ledger** — anywhere the natural unit is "stream of records" not "single-file replacement."
-- You need **commit-LSN semantics**: durability is "everything up to LSN X is on disk," not "every individual write fsynced."
-- You want **group-commit** — N records amortised across one fsync.
-
-Use [`Handle::write`](#handle--primary-type) instead when:
-- You need **atomic-replace semantics**: the file is either entirely the old payload or entirely the new payload at every observable point.
-- You're updating individual files (config, manifests).
-- Throughput is not the dominant concern.
-
-### Throughput
-
-Measured in [`docs/BENCH.md`](BENCH.md) on `windows-ntfs-nvme`:
-
-| Payload | Atomic-replace | Journal (sync-at-end) | Speedup |
-|---------|---------------:|----------------------:|--------:|
-| 64 B | 634 ops/s | 462.9 K ops/s | **730×** |
-| 4 KiB | 891 ops/s | 189.3 K ops/s | **212×** |
-
-Bare-metal Linux + NVMe is expected to push the journal substrate to 1–3 M ops/sec on tier-2 (current) and 5–10 M ops/sec on tier-3 (Linux io_uring SQE batching + registered buffers, filed for 0.9.0).
-
-### LSN semantics
-
-- `append(record)` returns `Lsn(start_offset + record.len())` — the position just past the record.
-- `sync_through(lsn)` blocks until every byte from offset 0 through `lsn.0 - 1` is on stable storage.
-- `Lsn::ZERO` (= `Lsn(0)`) is the start-of-journal sentinel. `sync_through(Lsn::ZERO)` is a no-op.
-- LSNs are monotonic per-handle — they reset only when the underlying file is truncated or recreated.
-
-### Concurrency
-
-- **Concurrent appends** — multiple threads can call `append` against the same `Arc<JournalHandle>`. The append path is lock-free (atomic LSN reservation + concurrent-safe `pwrite` per POSIX). On Linux + ext4/xfs, multi-thread aggregate throughput scales near-linearly with thread count up to the storage queue depth. On Windows + NTFS, the OS serialises writes to a single fd at the kernel-driver level — multi-thread aggregate is capped by NTFS's per-file write throughput (this is an OS limitation, not an fsys limitation).
-- **Concurrent `sync_through`** — group-commit. Many threads calling `sync_through` simultaneously coalesce into one fsync syscall via an internal sync-gate.
-
-### Tiering roadmap
-
-| Tier | Status | Implementation |
-|------|--------|----------------|
-| Tier 1 | **Shipped 0.9.0** | Cross-platform synchronous core: atomic LSN reservation via `AtomicU64::fetch_add`, positioned writes via `pwrite` (POSIX) / `WriteFile` + `OVERLAPPED` (Windows), durability via `fdatasync` / `fsync` / `FlushFileBuffers`. Group-commit fsync coalesces concurrent `sync_through` callers behind a single mutex-gated syscall. |
-| Tier 2 | **Shipped 0.9.0** | Lock-free append. POSIX uses concurrent `pwrite` directly against `&File` — no mutex on the hot path; per-POSIX, concurrent `pwrite` calls to distinct offsets are atomic per call. Windows uses `WriteFile` with an `OVERLAPPED` struct carrying the offset (concurrent-safe at the API level; OS-bounded by NTFS's per-file write coordination). |
-| Tier 3 | **Shipped 0.9.0** | Native io_uring asynchronous substrate on Linux when the `async` feature is enabled. `append_async` submits `IORING_OP_WRITE` SQEs; `sync_through_async` submits `IORING_OP_FSYNC(DATASYNC)` SQEs. The calling tokio task awaits a `oneshot` driven by the journal's per-handle completion driver, eliminating the `spawn_blocking` thread-pool hop. Engagement is observable via [`JournalHandle::native_iouring_active`]. On non-Linux platforms, on Linux without the `async` feature, or when `io_uring_setup(2)` fails, async ops fall back to `spawn_blocking` against the synchronous tier. |
-| Tier 4 | **0.9.x polish** | io_uring registered buffers (`io_uring_register_buffers` — no per-op kernel-side buffer pinning) + registered files (`io_uring_register_files` — no per-op fd-table lookup) + SQPOLL kernel polling thread (no syscall in the steady-state hot path). Target: 5–10 M durable ops/sec on bare-metal Linux + NVMe. Deferred from 0.9.0 RC because the tier-3 native substrate combined with the Direct-IO log buffer already saturates most realistic workloads; tier-4 is a measured-bottleneck optimisation worth attacking once real-world benchmarks identify it as the actual ceiling. |
-
-### Direct-IO journal mode (0.9.0)
-
-When `JournalOptions::direct(true)` is active, the journal opens the underlying file with `O_DIRECT` (Linux) / `F_NOCACHE` (macOS) / `FILE_FLAG_NO_BUFFERING` (Windows) and routes appends through a sector-aligned in-memory log buffer. This is the architecture that database storage engines use for their write-ahead log — most notably InnoDB (MySQL) and the WiredTiger journal (MongoDB) — to bypass the kernel page cache and write directly into device DMA.
-
-**Architectural trade-off.** The lock-free hot path of the buffered tiers is replaced by a single mutex protecting the log buffer; appenders serialise through that mutex while their frames are copied into the shared buffer. In exchange, the journal gains:
-
-- Zero memory copy from user space into the page cache. The frame is encoded into the log buffer once; the kernel writes it directly to the block device via DMA.
-- Predictable tail latency. The page cache's writeback policy can introduce jitter on buffered writes; Direct IO removes that source of non-determinism.
-- Reduced page-cache pressure. High-throughput WAL workloads otherwise compete for cache pages with the rest of the system.
-
-**When to enable it.** The default (`direct(false)`) is the right choice for general-purpose use — the lock-free path scales linearly with thread count and the kernel page cache absorbs bursty writes well. Direct-IO mode is the right choice when:
-
-- The workload is a database / queue / ledger WAL whose throughput is gated by sustained sequential append.
-- Tail latency matters and the page cache's writeback jitter is observable in measurements.
-- The system is otherwise memory-pressured and the WAL should not compete for page-cache space.
-
-**Flush semantics.** The log buffer flushes to disk in two situations: (1) when the buffer fills, the entire buffer is written via a single sector-aligned positioned write and the buffer is reset for the next round; (2) when `sync_through` is called with unflushed records, the records plus zero-pad to the next sector boundary are written but the buffer's logical position is not advanced — subsequent appends continue filling from where they were, and the next buffer-full flush overwrites the prior partial-sector pad with real record bytes.
-
-**Crash safety.** Resume after a crash scans the existing file forward from offset zero, finds the LSN immediately past the last cleanly-decoded frame, and reseats the log buffer's flush position at the largest sector boundary at or before that LSN. The partial trailing sector is rehydrated into the buffer's first sector so subsequent flushes overwrite the existing on-disk zero-pad cleanly without destroying records. Non-recoverable tail states (`BadMagic`, `LengthOverflow`) surface as an `Error::Io(InvalidData)` from `Handle::journal_with` rather than auto-truncating past suspect data.
+`BatchError` is the error type returned by partial-failure
+batches. Per the 0.9.6 H-4 audit, its fields are private; use
+the `failed_at() -> usize`, `completed() -> usize`,
+`inner() -> &Error`, and `into_inner() -> Box<Error>`
+accessor methods.
 
 ---
 
@@ -660,6 +597,7 @@ log.sync_through(lsn3)?;
 | `Handle::journal(path)` | Open with default options (buffered / lock-free). |
 | `Handle::journal_with(path, opts)` | Open with caller-supplied [`JournalOptions`]. |
 | `JournalHandle::append(&[u8]) -> Lsn` | Append one framed record. Returns the LSN immediately past the record. |
+| `JournalHandle::append_batch(&[&[u8]]) -> Lsn` | **Vectored append.** Submit N records as a single framed-write syscall (~1.6× faster than `append`-in-loop on Windows NTFS; larger wins on Linux NVMe). One LSN reservation, one contiguous allocation, one `pwrite` (or one log-buffer acquisition in Direct mode). *(0.9.1.)* |
 | `JournalHandle::sync_through(Lsn)` | Group-commit fsync — make all bytes ≤ `lsn` durable. |
 | `JournalHandle::synced_lsn() / next_lsn()` | Observability accessors. |
 | `JournalHandle::preallocate(off, len)` | Reserve filesystem extents (Linux `fallocate(KEEP_SIZE)` / macOS `F_PREALLOCATE` / Windows `FileAllocationInfo`). |
@@ -689,7 +627,11 @@ let log = fs.journal_with(
 |---|---|---|
 | `JournalOptions::new()` | — | Library-default values. |
 | `.direct(bool)` | `false` | Open with Direct-IO; route appends through a sector-aligned log buffer. |
-| `.log_buffer_kib(u32)` | `64` | Log buffer size in KiB. Clamped to `[4, 65536]`. |
+| `.log_buffer_kib(u32)` | `64` | **Per-slot** size in KiB of the dual-buffer Direct-IO log buffer. Total resident memory is `2 × log_buffer_kib`. Clamped to `[4, 65536]`. *(Per-slot semantics: 0.9.5.)* |
+| `.group_commit_window(Option<Duration>)` | `Some(500 µs)` | Leader/follower group-commit wait window. The leader optionally pauses up to `window` for additional followers to enqueue before issuing the fsync, batching durability across more callers. *(0.9.1.)* |
+| `.group_commit_max_batch(u32)` | `8` | Maximum followers the leader will batch before exiting the window-wait early. *(0.9.1.)* |
+| `.sync_mode(SyncMode)` | `SyncMode::Full` | `Full` = `fsync` / `fdatasync` family (default). `Barrier` = macOS `F_BARRIERFSYNC` (10–100× cheaper than `F_FULLFSYNC` on Apple Silicon NVMe; crash-safe **only** on PLP drives or under explicit eventual-`Full`-sync discipline). No-op on Linux + Windows. *(0.9.4.)* |
+| `.write_lifetime_hint(Option<WriteLifetimeHint>)` | `None` | Linux `F_SET_RW_HINT` fcntl. `Long` clusters journal data into separate NAND blocks on multi-stream NVMe drives, reducing GC write amplification. No-op elsewhere. *(0.9.4.)* |
 
 ### `JournalReader`
 
@@ -758,6 +700,94 @@ methods.
    native_iouring_active}` (gated behind `async` feature).
 - New cargo feature `tracing` — opt-in `tracing::trace_span!`
   instrumentation on the journal append / sync_through paths.
+
+---
+
+## API additions in 0.9.1–0.9.7
+
+The 0.9.x minor releases added net-new public surface backward-
+compatibly. No removals, no breaking renames, no behavior
+changes to existing items. The two pre-1.0 lockdowns (Lsn and
+BatchError field privatisation) shipped at 0.9.6 with stable
+accessor methods.
+
+### 0.9.1 — vectored journal append
+
+- `JournalHandle::append_batch(records: &[&[u8]]) -> Result<Lsn>` —
+  one LSN reservation, one contiguous allocation, one syscall for
+  N records. ~1.6× faster than `append`-in-loop.
+- `JournalOptions::group_commit_window(Option<Duration>)` /
+  `group_commit_max_batch(u32)` — leader/follower batching tuning.
+- Internal: hardware-accelerated CRC-32C (SSE4.2 / ARMv8 CRC);
+  cache-padded hot atomics; stack-allocated frame encoding for
+  small records.
+
+### 0.9.2 — hardware-aware database surface
+
+- `Handle::is_plp_protected() -> bool` — PLP detection.
+- `Handle::plp_status() -> PlpStatus` — full probe state.
+- `Builder::observer(Arc<dyn FsysObserver>)` — register telemetry
+  hook.
+- `pub trait FsysObserver` with `on_journal_append` /
+  `on_journal_sync` / `on_handle_write` / `on_handle_read` event
+  callbacks.
+- `Builder::tune_for(Workload)` — coordinated knob preset
+  (`Workload::Database` / `Workload::Default`).
+
+### 0.9.3 — pipeline throughput tier
+
+- `Builder::dispatcher_shards(usize)` — N-way batch dispatcher
+  per handle.
+- `Batch::commit_grouped() -> Result<()>` — atomic-batch fsync
+  with amortised parent-dir syncs.
+
+### 0.9.4 — io_uring elite + cross-platform sync tuning
+
+- `Handle::atomic_write_unit() -> Option<u32>` — NVMe NAWUN /
+  NAWUPF probe.
+- `JournalOptions::sync_mode(SyncMode)` — `Full` (default) or
+  macOS `Barrier` (`F_BARRIERFSYNC`).
+- `pub enum SyncMode { Full, Barrier }`.
+- `JournalOptions::write_lifetime_hint(Option<WriteLifetimeHint>)` —
+  Linux multi-stream NVMe hint.
+- `pub enum WriteLifetimeHint { None, Short, Medium, Long, Extreme }`.
+
+### 0.9.5 — performance + IO tuning
+
+- `Handle::punch_hole(path, offset, len) -> Result<()>` —
+  cross-platform sparse-file primitive (WAL trim).
+- `Handle::write_zeros(path, offset, len) -> Result<()>` — same
+  primitives with `KEEP_SIZE` where applicable.
+- Internal: dual-buffered Direct-mode log buffer
+  (`log_buffer_kib` is now per-slot, not total);
+  `IORING_REGISTER_FILES` on both io_uring rings.
+
+### 0.9.6 — audit + journal-on-io_uring + reflinks
+
+- `Handle::copy(src, dst) -> Result<()>` now uses
+  `clonefile(2)` (APFS) / `FSCTL_DUPLICATE_EXTENTS_TO_FILE` (ReFS)
+  for instant reflinks, falling back to `std::fs::copy` cleanly.
+- `Lsn` field privatisation (was `pub struct Lsn(pub u64)`). Use
+  `Lsn::new(u64) -> Self` / `Lsn::as_u64(self) -> u64` /
+  `From<u64> for Lsn` / `From<Lsn> for u64`.
+- `BatchError` field privatisation. Use `failed_at() -> usize`,
+  `completed() -> usize`, `inner() -> &Error`, and
+  `into_inner() -> Box<Error>`.
+- Internal: journal Direct-mode flush via
+  `IORING_OP_WRITE_FIXED` against pre-registered `AlignedBuf`
+  slots; real OS-version probes via `sysctlbyname` (macOS) and
+  `RtlGetVersion` (Windows); real page-size probe via
+  `sysconf` / `GetSystemInfo`.
+
+### 0.9.7 — completion + optimisation + stabilisation
+
+- `Builder::sqpoll(idle_ms: u32)` — opt-in
+  `IORING_SETUP_SQPOLL` for sustained-throughput writers.
+- Internal: GroupCommit wake-stampede fix (atomic
+  `pending_followers`); LSN reservation atomics tightened from
+  `AcqRel` to `Release`; `#[inline]` sweep on `Handle` public
+  accessors; OOM-injection test infrastructure (internal
+  `oom_inject` cargo feature).
 
 ### API changes in 0.7.0 (carried forward)
 
