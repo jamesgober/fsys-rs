@@ -683,6 +683,14 @@ mod tests {
 /// divided by the device's logical sector size gives the
 /// **starting LBA** of the extent — that's the value the NVMe
 /// Dataset Management Deallocate command needs.
+///
+/// `#[allow(dead_code)]`: forward-looking helper. The NVMe DSM
+/// Deallocate submission path that consumes these extents is
+/// the legitimate architectural-dep deferral from the 0.9.5
+/// scope discussion — the helper is in place so the future
+/// release can wire it without re-litigating the extent-flag
+/// safety model.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FiemapExtent {
     /// File offset (in bytes) of the first byte of this extent.
@@ -699,31 +707,45 @@ pub(crate) struct FiemapExtent {
     pub flags: u32,
 }
 
+// `#[allow(dead_code)]` on each constant: same justification as
+// `FiemapExtent` above — the NVMe DSM Deallocate submission path
+// that would dispatch on these flag bits is a future-release
+// architectural item; the flag table is in place now so the
+// future wiring is mechanical, not exploratory.
 /// `FIEMAP_EXTENT_LAST` — the kernel sets this on the final
 /// extent returned for the requested range.
+#[allow(dead_code)]
 pub(crate) const FIEMAP_EXTENT_LAST: u32 = 0x0000_0001;
 /// `FIEMAP_EXTENT_UNKNOWN` — extent's physical location is
 /// unknown to the kernel.
+#[allow(dead_code)]
 pub(crate) const FIEMAP_EXTENT_UNKNOWN: u32 = 0x0000_0002;
 /// `FIEMAP_EXTENT_DELALLOC` — data is delayed-allocated; no
 /// physical mapping yet.
+#[allow(dead_code)]
 pub(crate) const FIEMAP_EXTENT_DELALLOC: u32 = 0x0000_0004;
 /// `FIEMAP_EXTENT_ENCODED` — extent is compressed or encoded;
 /// physical mapping does not correspond to raw data bytes.
+#[allow(dead_code)]
 pub(crate) const FIEMAP_EXTENT_ENCODED: u32 = 0x0000_0008;
 /// `FIEMAP_EXTENT_DATA_ENCRYPTED` — extent is encrypted.
+#[allow(dead_code)]
 pub(crate) const FIEMAP_EXTENT_DATA_ENCRYPTED: u32 = 0x0000_0080;
 /// `FIEMAP_EXTENT_NOT_ALIGNED` — physical alignment unknown
 /// (e.g., XFS-style real-time subvolume).
+#[allow(dead_code)]
 pub(crate) const FIEMAP_EXTENT_NOT_ALIGNED: u32 = 0x0000_0100;
 /// `FIEMAP_EXTENT_DATA_INLINE` — data is inlined in the inode;
 /// no separate block allocation.
+#[allow(dead_code)]
 pub(crate) const FIEMAP_EXTENT_DATA_INLINE: u32 = 0x0000_0200;
 /// `FIEMAP_EXTENT_DATA_TAIL` — data is packed with other items
 /// (e.g., ReiserFS tail packing).
+#[allow(dead_code)]
 pub(crate) const FIEMAP_EXTENT_DATA_TAIL: u32 = 0x0000_0400;
 /// `FIEMAP_EXTENT_UNWRITTEN` — block is allocated but contains
 /// no written data yet (returns zeros on read).
+#[allow(dead_code)]
 pub(crate) const FIEMAP_EXTENT_UNWRITTEN: u32 = 0x0000_0800;
 
 /// 0.9.5 — Returns `true` if the extent is safe to issue an NVMe
@@ -744,6 +766,7 @@ pub(crate) const FIEMAP_EXTENT_UNWRITTEN: u32 = 0x0000_0800;
 /// step of `punch_hole`; we just don't issue NVMe DSM for them
 /// (which would be a meaningless operation against a region the
 /// drive doesn't have an LBA mapping for).
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn fiemap_extent_is_usable_for_dsm(flags: u32) -> bool {
     const UNUSABLE: u32 = FIEMAP_EXTENT_UNKNOWN
@@ -779,6 +802,7 @@ pub(crate) fn fiemap_extent_is_usable_for_dsm(flags: u32) -> bool {
 /// - [`Error::Io`] wrapping the ioctl errno on failure (commonly
 ///   `EOPNOTSUPP` on filesystems that don't implement
 ///   `FIEMAP` — tmpfs, FUSE, etc.).
+#[allow(dead_code)]
 pub(crate) fn fiemap_extents(
     fd: std::os::unix::io::RawFd,
     start: u64,
