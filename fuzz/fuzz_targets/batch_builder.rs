@@ -26,14 +26,14 @@ fuzz_target!(|data: &[u8]| {
         let payload = vec![b; (b as usize).min(64)];
         match b % 3 {
             0 => {
-                let _ = batch.write(&path, payload);
+                batch.write(&path, &payload[..]);
             }
             1 => {
-                let _ = batch.delete(&path);
+                batch.delete(&path);
             }
             _ => {
                 let dst = PathBuf::from(format!("fuzz_op_{i}_dst"));
-                let _ = batch.copy(&path, &dst);
+                batch.copy(&path, &dst);
             }
         }
     }

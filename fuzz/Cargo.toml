@@ -50,6 +50,36 @@ doc = false
 bench = false
 required-features = ["fuzz"]
 
+# 0.9.7 audit M-7 — journal append-path fuzzing.
+# Drives the end-to-end append → sync → close → reopen → decode
+# round-trip with length-prefixed records of fuzzer-chosen sizes.
+[[bin]]
+name = "journal_append"
+path = "fuzz_targets/journal_append.rs"
+test = false
+doc = false
+bench = false
+
+# 0.9.7 audit M-7 — batch commit dispatcher fuzzing.
+# Builds and commits a batch with adversarial paths + payloads
+# against a per-iteration tmpdir.
+[[bin]]
+name = "batch_writes"
+path = "fuzz_targets/batch_writes.rs"
+test = false
+doc = false
+bench = false
+
+# 0.9.7 audit M-7 — aligned-buffer-pool stress via Direct-IO.
+# Cycles Direct writes with boundary-case payload sizes (0 / 1
+# / sector ± 1 / N×sector) to stress the pool's lease/return cycle.
+[[bin]]
+name = "aligned_pool_stress"
+path = "fuzz_targets/aligned_pool_stress.rs"
+test = false
+doc = false
+bench = false
+
 [features]
 # Enables the parent crate's `fuzz` feature, which in turn exposes
 # `pub(crate)` frame helpers via the `__fuzz` module so the harness
