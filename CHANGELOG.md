@@ -5,6 +5,121 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.7] - 2026-05-12
+
+> **Completion + optimization + stabilization.** Every 0.9.6 audit
+> carryover landed (H-2, H-7, H-9, H-16) plus a Builder knob
+> (`sqpoll`) for kernel-side io_uring submission polling. The
+> 0.9.6 `IORING_REGISTER_FILES` capability was restored on both
+> the sync ring and the async substrate now that the
+> `DEFER_TASKRUN` / `SINGLE_ISSUER` async hang was root-caused
+> and gated via `RingMode`. The 4 HIGH carryovers from 0.9.6 are
+> now resolved; the 0.9.7 release is the foundation surface
+> 0.9.8 polishes for the 1.0 RC.
+
+### Added — 0.9.7
+
+- **`Builder::sqpoll(idle_ms: u32)`** — opt-in
+  `IORING_SETUP_SQPOLL` for the per-handle io_uring sync ring.
+  When enabled, the kernel spawns a polling thread that drains
+  the submission queue without requiring `io_uring_enter`
+  syscalls, useful for sustained-throughput writers (database
+  WAL flush loops, LSM compaction). After `idle_ms` of no
+  submissions the kernel thread sleeps. Linux-only; macOS /
+  Windows ignore the value. Default OFF. Falls back cleanly to
+  non-SQPOLL `pwrite + fdatasync` on EPERM (kernel < 5.13
+  without `CAP_SYS_NICE`, sandboxed containers).
+- **OOM-injection test infrastructure** (audit H-7) — internal
+  `oom_inject` cargo feature exposes
+  `OomInjectingAllocator` + `OomThreshold` RAII guard via the
+  doc-hidden `fsys::test_support` module. Tests bracket code
+  under test with the guard so allocations ≥ threshold return
+  null; the fallible-alloc paths surface
+  `Error::Io(OutOfMemory)` cleanly rather than panicking.
+  Documented "NEVER enable in production builds" — every
+  allocation pays a thread-local lookup + comparison.
+- **Cross-platform symmetry tests** (audit M-5) —
+  `tests/platform_symmetry.rs` runs 7 tests on every supported
+  OS (Linux / macOS / Windows) asserting the same contract on
+  each, with platform-specific assertions only where the
+  underlying primitive legitimately differs.
+- **Three new fuzz targets** (audit M-7):
+  - `journal_append.rs` — end-to-end fuzz of append + sync +
+    close + reopen + decode round-trip with length-prefixed
+    fuzzer-chosen records.
+  - `batch_writes.rs` — fuzz of the batch commit dispatcher
+    (where `batch_builder` only fuzzed the chainable builder).
+    Validates `BatchError` accessor consistency.
+  - `aligned_pool_stress.rs` — fuzz of `AlignedBufferPool` via
+    the public `Method::Direct` write path with boundary-case
+    payload sizes.
+- **kernel-version fallback tests** (audit H-9) —
+  `tests/iouring_features_fallback.rs` exercises the
+  no-elite-flags baseline (kernels < 5.19) and the
+  `fallocate → posix_fallocate` fallback path via env-var
+  test hooks (`FSYS_TEST_FORCE_NO_IOURING_FEATURES=1`,
+  `FSYS_TEST_FORCE_POSIX_FALLOCATE=1`).
+- **Journal frame boundary tests** (audit M-11) — 7 new tests
+  for one-byte records, exact 4 KiB / 16 KiB / 64 KiB frame
+  alignment, and empty-record batch shapes.
+
+### Changed — 0.9.7
+
+- **`IORING_REGISTER_FILES` re-enabled on both rings** — the
+  pre-0.9.6 fd-registry slot-upgrade capability is back, this
+  time backed by explicit slot-table-exhaustion and
+  same-fd-reuse test coverage. Sync ring (dedicated owner
+  thread) + async substrate (tokio-task-driven) both register a
+  16-slot sparse file table at startup and lazily upgrade per-
+  op fds via `register_files_update`. Submissions for cached
+  fds use `IORING_OP_WRITE` with `IOSQE_FIXED_FILE`, saving
+  per-syscall fd validation. Table-full fallback is silent —
+  ops on uncached fds use raw `io_uring::types::Fd(raw)` and
+  succeed unchanged.
+- **GroupCommit wake-stampede fixed** (audit H-16) —
+  `pending_followers` moved from `GroupCommitState`
+  (lock-protected `u32`) to `GroupCommit` (`AtomicU32`). On
+  follower wake, the state lock is dropped immediately; the
+  follower atomic-decrements `pending_followers` and atomic-
+  checks `synced_lsn` (the public mirror of `committed_lsn`).
+  If the target is covered — the common case — the follower
+  returns without ever re-acquiring the state lock. Architect-
+  urally: the critical-section width drops from
+  "lock + counter decrement + LSN compare + drop" to
+  "lock + drop" — a ~5x reduction in per-follower lock-hold
+  time under 100+ follower stampedes.
+- **LSN atomic-ordering tightened** (audit M-2) — three
+  `fetch_add(... AcqRel)` sites on `next_lsn`
+  (single-record + batch sync append in `journal/mod.rs`,
+  native async append in `async_io/journal.rs`) downgraded to
+  `Release`. The reservation step does not consult shared
+  non-atomic state set up by a peer appender; the `Acquire`
+  half was defensive overhead. On aarch64,
+  `fetch_add(Release)` lowers to a single store-release
+  barrier (LDADDL) vs `AcqRel`'s LDADDAL with the additional
+  load-acquire fence. ~0.2-0.5 µs/op saved.
+- **`JournalHandle` impl-detail fields** (audit H-2) — audited
+  the 9 `pub(crate)` fields. Six remain `pub(crate)`
+  (`file`, `next_lsn`, `synced_lsn`, `group_commit`,
+  `native_ring`, `direct`) because they're consumed by the
+  `impl JournalHandle` blocks in `src/async_io/journal.rs`.
+  Three (`log_buffer`, `observer`, `sync_mode`) are now
+  private — only accessed from `src/journal/mod.rs` itself.
+
+### Fixed — 0.9.7
+
+- Stale `Vec<u8>` argument typing in the `batch_builder` fuzz
+  target — pre-existing API drift the new fuzz targets surfaced.
+
+### Internal — 0.9.7
+
+- New CI matrix job `oom-inject` runs the `oom_injection` test
+  binary on ubuntu / macos / windows with the
+  `--features oom_inject` flag, separately from the regular
+  test matrix (the global allocator replacement applies to
+  every test in the binary so it can't share the default
+  matrix).
+
 ## [0.9.6] - 2026-05-12
 
 > **Full-codebase audit + architectural centerpiece.** 38 findings
