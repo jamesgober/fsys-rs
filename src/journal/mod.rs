@@ -907,8 +907,14 @@ impl JournalHandle {
                     leader_start = Instant::now();
                     break;
                 }
-                // Become a follower.
-                state.pending_followers += 1;
+                // Become a follower. 0.9.7 H-16 —
+                // `pending_followers` is an `AtomicU32` on
+                // `GroupCommit`; atomic-increment publishes the
+                // join to the leader's window-check.
+                let _ = self
+                    .group_commit
+                    .pending_followers
+                    .fetch_add(1, Ordering::Release);
                 // Wake leader so it can re-check max_batch
                 // against the new pending_followers count.
                 // `notify_one` returns whether a thread was
@@ -917,20 +923,49 @@ impl JournalHandle {
                 // it isn't currently parked.
                 let _ = self.group_commit.cv_leader.notify_one();
                 self.group_commit.cv_followers.wait(&mut state);
-                state.pending_followers -= 1;
-                // Loop and re-check; possibly become the next
-                // cycle's leader.
+                // 0.9.7 H-16 — release the state lock
+                // **immediately** after the condvar wake. Under
+                // 100+ followers, the previous code held the
+                // lock long enough to decrement `pending_followers`
+                // and re-check `state.committed_lsn`, forcing
+                // every woken follower to serialise through the
+                // lock. The fast path now uses atomics only.
+                drop(state);
+                let _ = self
+                    .group_commit
+                    .pending_followers
+                    .fetch_sub(1, Ordering::AcqRel);
+                // Atomic-load `synced_lsn` (the public atomic
+                // mirror of `state.committed_lsn`, updated by the
+                // leader on commit at line ~997 with `Release`).
+                // If our target is covered, return without ever
+                // re-acquiring the state lock — this is the wake-
+                // stampede fix.
+                if self.synced_lsn.load(Ordering::Acquire) >= lsn.0 {
+                    return Ok(());
+                }
+                // Slow path: target not yet covered (a later
+                // append landed after the leader captured its
+                // frontier). Re-acquire the lock and loop to
+                // possibly become the next cycle's leader.
+                state = self.group_commit.state.lock();
             }
 
             // Leader path: optionally wait `window` for
             // additional followers to enqueue, exiting early
             // once `max_batch` are present. We hold the state
             // lock during this wait; followers acquire the
-            // lock briefly to bump `pending_followers` and
-            // notify `cv_leader`, so contention is minimal.
+            // lock briefly to call `cv_followers.wait` (which
+            // releases on park), so contention is minimal.
+            // 0.9.7 H-16 — `pending_followers` is atomic; the
+            // leader's reads are advisory loads, not under-lock
+            // reads (stale values just affect window-wait
+            // timing, never correctness).
             if let Some(window) = self.group_commit.window {
                 let deadline = Instant::now() + window;
-                while state.pending_followers < self.group_commit.max_batch {
+                while self.group_commit.pending_followers.load(Ordering::Acquire)
+                    < self.group_commit.max_batch
+                {
                     let now = Instant::now();
                     if now >= deadline {
                         break;
@@ -996,7 +1031,11 @@ impl JournalHandle {
                 state.committed_lsn = frontier;
                 self.synced_lsn.store(frontier, Ordering::Release);
             }
-            followers_at_commit = state.pending_followers;
+            // 0.9.7 H-16 — atomic-load advisory snapshot of
+            // currently parked followers (for the observer
+            // hook). Reading inside the lock window gives a
+            // stable value for the duration of `notify_all`.
+            followers_at_commit = self.group_commit.pending_followers.load(Ordering::Acquire);
             state.in_flight = false;
             // `notify_all` returns the count of woken threads;
             // we don't care for backpressure purposes — every
@@ -1170,10 +1209,11 @@ pub(crate) struct GroupCommitState {
     /// completed fsync. Followers that arrive with a target LSN
     /// `≤ committed_lsn` return immediately without waiting.
     pub(crate) committed_lsn: u64,
-    /// Number of follower threads currently parked on
-    /// `cv_followers`. Read by the leader as the early-exit hint
-    /// against [`GroupCommit::max_batch`].
-    pub(crate) pending_followers: u32,
+    // `pending_followers` moved out of GroupCommitState in 0.9.7
+    // H-16 — it is now an `AtomicU32` on `GroupCommit` so a
+    // woken follower can decrement + early-exit without
+    // re-acquiring this state mutex (the source of the audit's
+    // "thundering herd" 100+ follower stampede).
 }
 
 /// 0.9.1 leader/follower group-commit coordinator. See
@@ -1206,6 +1246,19 @@ pub(crate) struct GroupCommit {
     cv_leader: Condvar,
     window: Option<Duration>,
     max_batch: u32,
+    /// 0.9.7 H-16 — atomic counter of followers currently parked
+    /// on `cv_followers`. Moved out of `GroupCommitState` so a
+    /// woken follower can decrement it + early-exit without
+    /// re-acquiring the state mutex (the source of the audit's
+    /// "thundering herd" 100+ follower stampede after
+    /// `notify_all`).
+    ///
+    /// Read by the leader as the early-exit hint against
+    /// `max_batch` during the optional `window` follower-batch
+    /// wait. The leader's reads are advisory — a stale value
+    /// just means the leader may wait slightly longer or shorter
+    /// than ideal, never a correctness violation.
+    pub(crate) pending_followers: std::sync::atomic::AtomicU32,
 }
 
 impl GroupCommit {
@@ -1218,12 +1271,12 @@ impl GroupCommit {
             state: PlMutex::new(GroupCommitState {
                 in_flight: false,
                 committed_lsn: initial_committed_lsn,
-                pending_followers: 0,
             }),
             cv_followers: Condvar::new(),
             cv_leader: Condvar::new(),
             window,
             max_batch,
+            pending_followers: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
