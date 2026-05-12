@@ -51,6 +51,10 @@ pub struct Builder {
     buffer_pool_count: usize,
     buffer_pool_block_size: usize,
     io_uring_queue_depth: u32,
+    /// 0.9.7 — opt-in `IORING_SETUP_SQPOLL` idle timeout (ms).
+    /// `None` (default) = SQPOLL disabled. `Some(idle_ms)` opts in.
+    /// Linux-only; ignored elsewhere.
+    iouring_sqpoll_idle_ms: Option<u32>,
     observer: Option<Arc<dyn FsysObserver>>,
 }
 
@@ -66,6 +70,7 @@ impl Builder {
             buffer_pool_count: 64,
             buffer_pool_block_size: 4096,
             io_uring_queue_depth: 128,
+            iouring_sqpoll_idle_ms: None,
             observer: None,
         }
     }
@@ -221,6 +226,48 @@ impl Builder {
     #[must_use]
     pub fn io_uring_queue_depth(mut self, depth: u32) -> Self {
         self.io_uring_queue_depth = depth;
+        self
+    }
+
+    /// 0.9.7 — opts the per-handle io_uring sync ring into
+    /// `IORING_SETUP_SQPOLL` with the given idle timeout in
+    /// milliseconds.
+    ///
+    /// SQPOLL spawns (or shares) a kernel-side polling thread that
+    /// drains the submission queue without requiring
+    /// `io_uring_enter` syscalls. After `idle_ms` of no
+    /// submissions, the kernel thread sleeps and the next push
+    /// wakes it via an `io_uring_enter` syscall. The intended
+    /// workload is sustained-throughput writers (database WAL
+    /// flush loops, log-structured merge tree compaction) where
+    /// the syscall amortisation matters.
+    ///
+    /// **When to enable.** Sustained Direct-IO write workloads on
+    /// kernels ≥ 5.13 where the process has `CAP_SYS_NICE`
+    /// (or runs as root). Typical idle values: `1000`-`5000`
+    /// (1-5 s) for steady-state workloads; `100`-`200` for
+    /// latency-sensitive bursty loads.
+    ///
+    /// **When to leave it off (the default).** Idle / low-rate
+    /// workloads, containerised deployments without
+    /// `CAP_SYS_NICE`, sandboxed environments with restrictive
+    /// SECCOMP, kernels < 5.13. The kernel polling thread costs
+    /// a kernel CPU while spinning — wasteful for low-rate
+    /// workloads.
+    ///
+    /// **Fallback behaviour.** If `io_uring_setup(2)` rejects
+    /// `IORING_SETUP_SQPOLL` (EPERM, unsupported kernel, etc.)
+    /// the per-handle io_uring slot flips to `Disabled` and the
+    /// Direct path uses non-SQPOLL `pwrite` + `fdatasync` —
+    /// identical durability contract, slower path. No panic, no
+    /// hang, no observable correctness change.
+    ///
+    /// Linux-only knob. On macOS / Windows the value is captured
+    /// but never consulted (no io_uring on those platforms by
+    /// design — locked decision #1 in `.dev/DECISIONS-0.5.0.md`).
+    #[must_use]
+    pub fn sqpoll(mut self, idle_ms: u32) -> Self {
+        self.iouring_sqpoll_idle_ms = Some(idle_ms);
         self
     }
 
@@ -433,6 +480,7 @@ impl Builder {
             pipeline,
             pool_config,
             self.io_uring_queue_depth,
+            self.iouring_sqpoll_idle_ms,
             self.observer,
         ))
     }
@@ -505,6 +553,26 @@ mod tests {
             .expect("build with Sync");
         assert_eq!(h.method(), Method::Sync);
         assert_eq!(h.active_method(), Method::Sync);
+    }
+
+    /// 0.9.7 SQPOLL knob — `Builder::sqpoll(idle_ms)` is captured
+    /// at build time. On Linux it's consumed by the io_uring sync
+    /// ring's lazy construction; on macOS / Windows the value is
+    /// captured but unused (per platform's design — no io_uring
+    /// off Linux). Building never fails on a knob-set-only call;
+    /// runtime failure (EPERM on a restricted kernel) is handled
+    /// downstream by the per-handle `iouring_slot` flipping to
+    /// `Disabled` and the Direct path using the pwrite fallback.
+    #[test]
+    fn test_builder_sqpoll_knob_is_idempotent_on_default_handle() {
+        let h_default = Builder::new().build().expect("default");
+        let h_sqpoll = Builder::new().sqpoll(1000).build().expect("sqpoll(1000)");
+        // Both handles must report the same configured method, the
+        // same resolved active method, and the same sector size —
+        // SQPOLL is a transparent perf knob, not a semantic one.
+        assert_eq!(h_default.method(), h_sqpoll.method());
+        assert_eq!(h_default.active_method(), h_sqpoll.active_method());
+        assert_eq!(h_default.sector_size(), h_sqpoll.sector_size());
     }
 
     #[test]
