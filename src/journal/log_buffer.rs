@@ -258,7 +258,12 @@ impl LogBuffer {
         bufs: &[UnsafeCell<AlignedBuf>; 2],
         cap: usize,
     ) -> Option<IouringFlushState> {
-        let ring = crate::platform::linux_iouring::IoUringRing::new(8).ok()?;
+        // 0.9.7 SQPOLL: the LogBuffer's internal flush ring is
+        // distinct from the per-Handle io_uring sync ring and is
+        // not user-configurable. We never enable SQPOLL here —
+        // the LogBuffer's submission rate is bounded by sector
+        // flushes and doesn't benefit from kernel-side polling.
+        let ring = crate::platform::linux_iouring::IoUringRing::new(8, None).ok()?;
         // Collect the (ptr, len) of each slot's underlying
         // AlignedBuf. We're inside the constructor, so nothing
         // else has access to the cells; reading the start

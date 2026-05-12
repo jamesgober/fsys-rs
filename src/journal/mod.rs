@@ -480,6 +480,7 @@ impl JournalHandle {
     /// silently downgraded to buffered (filesystem rejected
     /// `O_DIRECT`).
     #[must_use]
+    #[inline]
     pub fn is_direct_active(&self) -> bool {
         self.direct
     }
@@ -2132,6 +2133,102 @@ mod tests {
         // sync_through(ZERO) is always a fast-path no-op.
         j.sync_through(Lsn::ZERO).expect("zero sync");
         assert!(j.synced_lsn() >= lsn);
+    }
+
+    /// 0.9.7 H-16 follow-up — wake-stampede stress test.
+    ///
+    /// Spawns 128 follower threads + 1 leader, all racing to
+    /// sync the same record. Validates:
+    ///
+    /// 1. **No deadlock** — every thread joins within a finite
+    ///    timeout. Under the pre-0.9.7 lock-protected
+    ///    `pending_followers` design, a 128-thread stampede
+    ///    serialised through the state mutex on every cycle;
+    ///    a real-world deadlock here would be a missed-wakeup
+    ///    regression.
+    /// 2. **All followers see their target as durable.** Every
+    ///    thread's `sync_through` returns `Ok(())` and
+    ///    `synced_lsn() >= their_lsn` after return.
+    /// 3. **`pending_followers` returns to zero.** After all
+    ///    threads join, the atomic counter is back at 0 —
+    ///    no follower leaked the counter on an early-exit path.
+    ///
+    /// The test does NOT assert absolute wall-clock timing
+    /// (CI variance defeats µs-level claims). The audit's
+    /// estimated 0.5-2 µs/follower win is documented in the
+    /// commit message; this test validates **structural
+    /// correctness** of the atomic-decrement + lock-free
+    /// early-exit path under the contention level the audit
+    /// flagged.
+    #[test]
+    fn group_commit_wake_stampede_128_followers() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        const FOLLOWER_COUNT: usize = 128;
+        const BUDGET: Duration = Duration::from_secs(60);
+
+        let path = tmp_path("gc_wake_stampede_128");
+        let _g = Cleanup(path.clone());
+        // Small window so the leader doesn't burn the whole
+        // 60s budget waiting for follower batching — the
+        // stampede happens on the wake side regardless of
+        // window size.
+        let opts = JournalOptions::new()
+            .group_commit_window(Some(Duration::from_micros(100)))
+            .group_commit_max_batch(FOLLOWER_COUNT as u32);
+        let j = Arc::new(JournalHandle::open_with_options(&path, opts).expect("open"));
+
+        // One appender writes a single record; every thread
+        // syncs through that record's LSN. This is the
+        // worst-case stampede pattern: N threads concurrently
+        // race to sync the same target, exactly one becomes
+        // leader, N-1 park on `cv_followers`, then notify_all
+        // wakes them en masse.
+        let target_lsn = j.append(b"stampede-target-record").expect("append");
+
+        let started = AtomicUsize::new(0);
+        let started = Arc::new(started);
+        let start = Instant::now();
+        let mut handles = Vec::with_capacity(FOLLOWER_COUNT);
+        for _ in 0..FOLLOWER_COUNT {
+            let j = j.clone();
+            let started = started.clone();
+            handles.push(std::thread::spawn(move || {
+                // Wait for every thread to be runnable before any
+                // of them call sync_through, maximising the
+                // chance that they all hit the gate concurrently.
+                let _ = started.fetch_add(1, Ordering::Release);
+                while started.load(Ordering::Acquire) < FOLLOWER_COUNT {
+                    std::hint::spin_loop();
+                }
+                j.sync_through(target_lsn).expect("follower sync");
+                // Verify the contract: post-return, our target
+                // must be at-or-below the durable frontier.
+                assert!(
+                    j.synced_lsn() >= target_lsn,
+                    "follower returned but durable frontier still below target",
+                );
+            }));
+        }
+        for h in handles {
+            h.join().expect("follower thread join");
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < BUDGET,
+            "wake-stampede 128-follower test exceeded {BUDGET:?} budget: {elapsed:?} — \
+             possible missed-wakeup regression",
+        );
+        // `pending_followers` must be back at zero after every
+        // follower joined. A leaked counter would surface a bug
+        // in either the increment or the atomic-decrement path.
+        assert_eq!(
+            j.group_commit.pending_followers.load(Ordering::Acquire),
+            0,
+            "pending_followers leaked a count — increment/decrement asymmetry",
+        );
+        assert!(j.synced_lsn() >= target_lsn);
     }
 
     #[test]

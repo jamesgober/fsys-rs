@@ -301,6 +301,7 @@ impl Handle {
     /// registration in tests; the hot paths consult this slot
     /// internally without going through the public method.
     #[must_use]
+    #[inline]
     pub fn observer(&self) -> Option<&std::sync::Arc<dyn crate::observer::FsysObserver>> {
         self.observer.as_ref()
     }
@@ -683,6 +684,7 @@ impl Handle {
     /// This may be [`Method::Auto`] if the caller did not specify a method;
     /// see [`Handle::active_method`] for the resolved value.
     #[must_use]
+    #[inline]
     pub fn method(&self) -> Method {
         Method::from_u8(self.configured_method.load(Ordering::Relaxed))
     }
@@ -693,6 +695,7 @@ impl Handle {
     /// never `Auto`. If `O_DIRECT` was rejected at open time and the
     /// handle fell back to `Data`, this method will reflect that change.
     #[must_use]
+    #[inline]
     pub fn active_method(&self) -> Method {
         Method::from_u8(self.active_method.load(Ordering::Relaxed))
     }
@@ -717,12 +720,14 @@ impl Handle {
 
     /// Returns the root directory scope, if one was configured.
     #[must_use]
+    #[inline]
     pub fn root(&self) -> Option<&Path> {
         self.root.as_deref()
     }
 
     /// Returns the operating mode.
     #[must_use]
+    #[inline]
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -731,6 +736,7 @@ impl Handle {
     ///
     /// Used to size aligned Direct IO buffers.
     #[must_use]
+    #[inline]
     pub fn sector_size(&self) -> u32 {
         self.sector_size
     }
