@@ -254,12 +254,19 @@ pub struct JournalHandle {
     /// because direct-mode appends serialise into a single shared
     /// buffer (the InnoDB / WiredTiger pattern). Buffered-mode
     /// journals retain their lock-free fast path.
-    pub(crate) log_buffer: Option<LogBuffer>,
+    ///
+    /// 0.9.7 H-2 — private (not `pub(crate)`): only accessed
+    /// from within `src/journal/mod.rs`. Demoted so future
+    /// refactors can change the field shape without breaking
+    /// callers in other modules.
+    log_buffer: Option<LogBuffer>,
     /// 0.9.2 — optional structured-telemetry observer cloned in
     /// from the parent [`crate::Handle`] at journal-open time.
     /// `None` for journals on observer-less handles. Per-op cost
     /// when `None`: a single `Option::is_some` branch.
-    pub(crate) observer: Option<std::sync::Arc<dyn crate::observer::FsysObserver>>,
+    ///
+    /// 0.9.7 H-2 — private. Set via [`Self::set_observer`].
+    observer: Option<std::sync::Arc<dyn crate::observer::FsysObserver>>,
     /// 0.9.4 — durability primitive choice for `sync_through`.
     /// `SyncMode::Full` (default) calls
     /// `file.sync_data()` (the platform's full media-durability
@@ -267,7 +274,10 @@ pub struct JournalHandle {
     /// `platform::sync_barrier()` (cheaper on macOS with PLP).
     /// Captured at journal-open time from
     /// `JournalOptions::sync_mode`.
-    pub(crate) sync_mode: options::SyncMode,
+    ///
+    /// 0.9.7 H-2 — private (not `pub(crate)`): only consulted
+    /// inside `do_sync_locked` / `sync_through` in this module.
+    sync_mode: options::SyncMode,
 }
 
 impl JournalHandle {
