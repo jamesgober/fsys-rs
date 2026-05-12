@@ -20,7 +20,9 @@ Pick the cheapest method that satisfies your durability requirement.
 | `Journal` | reserved variant — no committed implementation | reserved variant | reserved variant | n/a | reserved enum slot only; see note below |
 | `Auto` | hardware-aware | hardware-aware | hardware-aware | varies | "pick something sensible" |
 
-> **Note on `Method::Journal`.** This enum variant is a forward-compatibility placeholder reserved at 0.7.0 and intentionally not implemented. Append-only / write-ahead-log workloads should use the dedicated [journal substrate](API.md#journal-substrate) shipped in 0.9.0 — opened via [`Handle::journal`] / [`Handle::journal_with`], surfaced through [`JournalHandle`], and entirely independent of the `Method` enum. The journal substrate is a structurally different primitive (open-once log file with explicit LSN reservation and group-commit fsync) rather than a per-write durability strategy, which is why it lives outside the `Method` taxonomy.
+> **Note on `Method::Journal`.** This enum variant is a forward-compatibility placeholder reserved at 0.7.0 and intentionally not implemented. Append-only / write-ahead-log workloads should use the dedicated [journal substrate](API.md#journal-substrate) shipped in 0.9.0 — opened via `Handle::journal` / `Handle::journal_with`, surfaced through `JournalHandle`, and entirely independent of the `Method` enum. The journal substrate is a structurally different primitive (open-once log file with explicit LSN reservation and group-commit fsync) rather than a per-write durability strategy, which is why it lives outside the `Method` taxonomy.
+
+> **Journal tuning cross-references.** Journal users on macOS may want `JournalOptions::sync_mode(SyncMode::Barrier)` (0.9.4) for the `F_BARRIERFSYNC` primitive — 10–100× cheaper than `F_FULLFSYNC` on Apple Silicon NVMe; crash-safe **only** on PLP drives or under explicit eventual-`Full`-sync discipline. Journal users on Linux multi-stream NVMe may want `JournalOptions::write_lifetime_hint(Some(WriteLifetimeHint::Long))` (0.9.4) to reduce GC write amplification. See [`API.md`](API.md#journaloptions-new-in-090) for the full `JournalOptions` surface.
 
 ## How to pick
 
@@ -50,7 +52,8 @@ Pick the cheapest method that satisfies your durability requirement.
 ## What `Auto` picks
 
 Resolved once at handle construction. The decision is deterministic
-given the hardware probe.
+given the hardware probe; the probe runs at first-handle construction
+and is cached process-wide.
 
 ```
 Linux + io_uring + NVMe + NVMe passthrough capability  →  Direct
@@ -70,6 +73,33 @@ Anything that fails to probe                           →  Sync (universal safe
 locked at handle construction. Subsequent runtime fallbacks (e.g.
 `O_DIRECT` rejected by tmpfs) are observable via
 `Handle::active_method()`.
+
+### Probe inputs (current accuracy)
+
+The `Auto` ladder above is fed by the hardware + OS probes that
+fsys runs at first-handle construction. Probe accuracy evolved
+across the 0.9.x series:
+
+- **CPU-feature detection** (SSE4.2, ARMv8 CRC, etc.) — runtime
+  detection via `is_x86_feature_detected!` / equivalents on
+  ARM (0.9.2+). Before 0.9.2 these were compile-time constants
+  that lied on cross-target builds.
+- **OS-version detection** — real runtime probes via
+  `sysctlbyname("kern.osproductversion")` on macOS and
+  `RtlGetVersion` (from `ntdll.dll`) on Windows (0.9.6+).
+  Before 0.9.6 these returned "unknown" stubs.
+- **Page-size detection** — real `sysconf(_SC_PAGESIZE)` on
+  Unix and `GetSystemInfo` on Windows (0.9.6+). Before 0.9.6
+  the value was a build-time constant (16 KiB on Apple Silicon,
+  4 KiB elsewhere).
+- **NVMe atomic-write-unit** — NAWUN / NAWUPF via the NVMe
+  Identify Namespace command (0.9.4+, Linux). Exposed via
+  `Handle::atomic_write_unit() -> Option<u32>`; databases on
+  guaranteeing drives can safely skip torn-write detection on
+  writes ≤ that size.
+- **Power-loss-protection (PLP)** — `Handle::is_plp_protected()`
+  / `plp_status()` (0.9.2+). Confirmed PLP enables safe
+  per-commit fsync skip for transaction throughput (3–10× lever).
 
 ## Observing fallbacks
 
