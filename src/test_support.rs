@@ -21,9 +21,13 @@
 //! The threshold is a `thread_local!` value. Tests on different
 //! threads have independent budgets; tests on the same thread
 //! run sequentially under the default test runner. The
-//! [`OomThreshold`] drop guard restores the threshold to
+//! `OomThreshold` drop guard restores the threshold to
 //! `usize::MAX` (no failures) on scope exit, including unwinding
 //! on panic — so a panicking test never poisons subsequent tests.
+//! (Plain code-formatting rather than an intra-doc link because
+//! this module is `#[doc(hidden)]` from the published surface and
+//! rustdoc rejects same-module intra-doc links to `pub(crate)`
+//! / hidden items under `-D warnings`.)
 //!
 //! ## Targeted injection
 //!
