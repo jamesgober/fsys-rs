@@ -418,6 +418,71 @@ pub(crate) fn sync_parent_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 0.9.5 — Punches a hole at `[offset, offset + len)` via
+/// `DeviceIoControl(FSCTL_SET_ZERO_DATA)`.
+///
+/// Windows' `FSCTL_SET_ZERO_DATA` is the closest semantic match
+/// to Linux `fallocate(PUNCH_HOLE)` / macOS `F_PUNCHHOLE`. On
+/// NTFS sparse files the operation truly releases backing
+/// blocks; on regular (non-sparse) NTFS files it zero-fills the
+/// range without releasing storage — equivalent semantics from
+/// the caller's perspective (reads return zeros after the call).
+///
+/// The IOCTL takes a `FILE_ZERO_DATA_INFORMATION` payload
+/// (16 bytes: two `LARGE_INTEGER`s for the inclusive start +
+/// exclusive end byte offsets of the range to zero).
+pub(crate) fn punch_hole(file: &File, offset: u64, len: u64) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    if len == 0 {
+        return Ok(());
+    }
+
+    /// `FILE_ZERO_DATA_INFORMATION` — start and end (exclusive)
+    /// byte offsets of the range to zero. Both `LONGLONG`
+    /// (i64) on Windows.
+    #[repr(C)]
+    struct FileZeroDataInformation {
+        file_offset: i64,
+        beyond_final_zero: i64,
+    }
+    /// `FSCTL_SET_ZERO_DATA` ioctl code.
+    /// Equivalent C macro: `CTL_CODE(FILE_DEVICE_FILE_SYSTEM=0x09, 50,
+    /// METHOD_BUFFERED=0, FILE_WRITE_DATA=2)` = 0x000980c8.
+    const FSCTL_SET_ZERO_DATA: u32 = 0x0009_80c8;
+
+    let payload = FileZeroDataInformation {
+        file_offset: offset as i64,
+        beyond_final_zero: offset.saturating_add(len) as i64,
+    };
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut bytes_returned: u32 = 0;
+    // SAFETY: handle is owned by `file` for the duration of this
+    // call. `payload` is a stack-allocated, properly-aligned
+    // `FILE_ZERO_DATA_INFORMATION`. The ioctl reads exactly
+    // `size_of::<FileZeroDataInformation>()` bytes; we pass the
+    // matching size.
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_SET_ZERO_DATA,
+            &payload as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<FileZeroDataInformation>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != FALSE {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::last_os_error()))
+    }
+}
+
 pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
     // std::fs::copy uses CopyFileExW internally.
     // TODO(0.5.0): investigate FSCTL_DUPLICATE_EXTENTS_TO_FILE for

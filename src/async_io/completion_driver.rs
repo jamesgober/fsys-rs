@@ -344,6 +344,25 @@ async fn owner_loop(queue_depth: u32, eventfd_raw: RawFd, mut rx: mpsc::Unbounde
         Err(_) => return, // owned_fd drops, eventfd closes once
     };
 
+    // 0.9.5 — IORING_REGISTER_FILES. Pre-register a 16-slot
+    // sparse file table at owner startup. Each per-op `fd` is
+    // lazily upgraded to a fixed-file slot via
+    // `register_files_update` on first use; subsequent
+    // submissions for the same fd reuse the cached slot and
+    // submit SQEs with `IOSQE_FIXED_FILE` semantics. This
+    // saves kernel-side fd validation on every SQE, an
+    // observable per-syscall win on rings that do many ops
+    // against a small set of fds (the journal hot path).
+    //
+    // If the kernel rejects the initial registration (rare —
+    // it has been stable since 5.1), or if the table fills
+    // (>16 distinct fds in one ring's lifetime, unusual for
+    // fsys workloads), we fall back to raw-fd SQEs cleanly —
+    // the registry simply returns `None` and the SQE builder
+    // uses `types::Fd(raw)` instead of `types::Fixed(slot)`.
+    let mut fd_registry = FdRegistry::new();
+    let _ = fd_registry.initial_register(&ring.submitter());
+
     // Register the eventfd with the ring so the kernel signals it
     // when CQ has new entries. Use `as_raw_fd()` — registration
     // does not transfer ownership.
@@ -381,7 +400,7 @@ async fn owner_loop(queue_depth: u32, eventfd_raw: RawFd, mut rx: mpsc::Unbounde
                         let id = next_id;
                         next_id = next_id.wrapping_add(1);
                         if id == 0 { next_id = 1; } // 0 reserved
-                        push_sqe_for(&mut ring, id, &op);
+                        push_sqe_for(&mut ring, id, &op, &mut fd_registry);
                         match op {
                             Op::Write { reply, .. }
                             | Op::Read { reply, .. }
@@ -436,13 +455,98 @@ fn drain_completions_into(
     }
 }
 
+/// 0.9.5 — `IORING_REGISTER_FILES` slot registry.
+///
+/// Maintains a 16-slot sparse file table that's registered with
+/// the ring at owner startup. Per-op fds are lazily upgraded to
+/// fixed-file slots on first use; subsequent submissions for
+/// the same fd reuse the cached slot via the `fd_to_slot`
+/// lookup. SQEs for slotted fds use `types::Fixed(slot)`
+/// instead of `types::Fd(raw)` — the kernel skips per-SQE fd
+/// validation, an observable per-syscall win.
+struct FdRegistry {
+    /// The slot table — `-1` for unused, otherwise the
+    /// registered RawFd. Sized to [`SLOT_TABLE_SIZE`].
+    slots: Vec<RawFd>,
+    /// Cache `fd → slot` for O(1) lookup on subsequent ops.
+    fd_to_slot: std::collections::HashMap<RawFd, u32>,
+    /// `true` once the initial `register_files` succeeded.
+    /// Subsequent lazy upgrades use `register_files_update`.
+    registered: bool,
+}
+
+/// Size of the registered-files slot table per ring.
+/// 16 is well above the typical journal workload (1 fd per
+/// journal handle) and keeps the kernel-side memory cost
+/// negligible.
+const SLOT_TABLE_SIZE: usize = 16;
+
+impl FdRegistry {
+    fn new() -> Self {
+        Self {
+            slots: vec![-1; SLOT_TABLE_SIZE],
+            fd_to_slot: std::collections::HashMap::new(),
+            registered: false,
+        }
+    }
+
+    /// Initial sparse registration. Called once at owner
+    /// startup; subsequent `try_get_or_register` calls use
+    /// `register_files_update` instead.
+    ///
+    /// Returns `Ok(())` if registration succeeded. On `Err` the
+    /// registry stays `registered = false` and every
+    /// `try_get_or_register` call returns `None`, causing
+    /// `push_sqe_for` to fall back to raw-fd SQEs cleanly.
+    fn initial_register(&mut self, submitter: &io_uring::Submitter<'_>) -> std::io::Result<()> {
+        submitter.register_files(&self.slots)?;
+        self.registered = true;
+        Ok(())
+    }
+
+    /// Returns the slot index for `fd`, registering it lazily
+    /// on first use. `None` if (a) the initial registration
+    /// failed, (b) the slot table is full, or (c) the
+    /// per-fd registration update was rejected by the kernel.
+    /// In all three cases the caller falls back to raw-fd
+    /// SQEs.
+    fn try_get_or_register(
+        &mut self,
+        submitter: &io_uring::Submitter<'_>,
+        fd: RawFd,
+    ) -> Option<u32> {
+        if !self.registered {
+            return None;
+        }
+        if let Some(&slot) = self.fd_to_slot.get(&fd) {
+            return Some(slot);
+        }
+        let slot_idx = self.slots.iter().position(|&s| s == -1)?;
+        let update = [fd];
+        let updated = submitter
+            .register_files_update(slot_idx as u32, &update)
+            .ok()?;
+        if updated == 0 {
+            return None;
+        }
+        self.slots[slot_idx] = fd;
+        let _ = self.fd_to_slot.insert(fd, slot_idx as u32);
+        Some(slot_idx as u32)
+    }
+}
+
 /// Push the SQE for the given op onto the ring's submission queue.
+///
+/// 0.9.5: each fd-bearing SQE consults `fd_registry` to upgrade
+/// to a fixed-file slot when available. Falls back to raw-fd
+/// SQEs cleanly when the registry is full or unregistered.
+///
 /// Inlined per-variant to honour the 0.5.1 ICE workaround
 /// (no `&mut io_uring::IoUring` as function parameter — but here
 /// we're calling from the OWNER's loop so the parameter is
 /// already on this task's stack; the rule is about *cross-module*
 /// references).
-fn push_sqe_for(ring: &mut io_uring::IoUring, id: u64, op: &Op) {
+fn push_sqe_for(ring: &mut io_uring::IoUring, id: u64, op: &Op, fd_registry: &mut FdRegistry) {
     use io_uring::{opcode, types};
 
     match op {
@@ -453,10 +557,19 @@ fn push_sqe_for(ring: &mut io_uring::IoUring, id: u64, op: &Op) {
             offset,
             ..
         } => {
-            let entry = opcode::Write::new(types::Fd(*fd), *buf_ptr as *const u8, *buf_len as u32)
-                .offset(*offset)
-                .build()
-                .user_data(id);
+            // 0.9.5 — try the fixed-file fast path first.
+            let entry = if let Some(slot) = fd_registry.try_get_or_register(&ring.submitter(), *fd)
+            {
+                opcode::Write::new(types::Fixed(slot), *buf_ptr as *const u8, *buf_len as u32)
+                    .offset(*offset)
+                    .build()
+                    .user_data(id)
+            } else {
+                opcode::Write::new(types::Fd(*fd), *buf_ptr as *const u8, *buf_len as u32)
+                    .offset(*offset)
+                    .build()
+                    .user_data(id)
+            };
             // SAFETY: Submitter's `&[u8]` borrow is held alive by
             // the awaiting future across the oneshot. The kernel
             // reads the buffer at `buf_ptr` for `buf_len` bytes
@@ -471,19 +584,35 @@ fn push_sqe_for(ring: &mut io_uring::IoUring, id: u64, op: &Op) {
             offset,
             ..
         } => {
-            let entry = opcode::Read::new(types::Fd(*fd), *buf_ptr as *mut u8, *buf_len as u32)
-                .offset(*offset)
-                .build()
-                .user_data(id);
+            let entry = if let Some(slot) = fd_registry.try_get_or_register(&ring.submitter(), *fd)
+            {
+                opcode::Read::new(types::Fixed(slot), *buf_ptr as *mut u8, *buf_len as u32)
+                    .offset(*offset)
+                    .build()
+                    .user_data(id)
+            } else {
+                opcode::Read::new(types::Fd(*fd), *buf_ptr as *mut u8, *buf_len as u32)
+                    .offset(*offset)
+                    .build()
+                    .user_data(id)
+            };
             // SAFETY: same shape as Op::Write — submitter holds
             // the `&mut [u8]` borrow alive.
             let _ = unsafe { ring.submission().push(&entry) };
         }
         Op::Fdatasync { fd, .. } => {
-            let entry = opcode::Fsync::new(types::Fd(*fd))
-                .flags(io_uring::types::FsyncFlags::DATASYNC)
-                .build()
-                .user_data(id);
+            let entry = if let Some(slot) = fd_registry.try_get_or_register(&ring.submitter(), *fd)
+            {
+                opcode::Fsync::new(types::Fixed(slot))
+                    .flags(io_uring::types::FsyncFlags::DATASYNC)
+                    .build()
+                    .user_data(id)
+            } else {
+                opcode::Fsync::new(types::Fd(*fd))
+                    .flags(io_uring::types::FsyncFlags::DATASYNC)
+                    .build()
+                    .user_data(id)
+            };
             // SAFETY: no buffer; fd held alive by submitter.
             let _ = unsafe { ring.submission().push(&entry) };
         }

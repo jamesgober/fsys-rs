@@ -353,6 +353,54 @@ pub(crate) fn sync_barrier(file: &File) -> Result<()> {
     }
 }
 
+/// 0.9.5 — Punches a hole at `[offset, offset + len)` via Apple's
+/// `fcntl(F_PUNCHHOLE)`.
+///
+/// macOS exposes a structured `fpunchhole_t` payload (8-byte
+/// reserved header + u64 offset + u64 length) instead of the
+/// Linux `fallocate` int64-pair argument style. We construct the
+/// payload here and pass it through `fcntl`.
+///
+/// Available on macOS 10.12 (Sierra) and later. On older
+/// systems the kernel returns `EOPNOTSUPP`, which we surface as
+/// an `Err`.
+pub(crate) fn punch_hole(file: &File, offset: u64, len: u64) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    /// Apple's `fpunchhole_t` (from `<sys/fcntl.h>`). Three
+    /// `u32` flag/version fields followed by two `u64` offsets.
+    /// Total 24 bytes.
+    #[repr(C)]
+    #[derive(Default)]
+    struct FPunchHole {
+        fp_flags: u32,  // reserved; must be zero
+        reserved: u32,  // reserved; must be zero
+        fp_offset: u64, // start
+        fp_length: u64, // length
+    }
+    /// Apple's `F_PUNCHHOLE` fcntl number. Defined in the
+    /// macOS SDK as 99.
+    const F_PUNCHHOLE: libc::c_int = 99;
+    let payload = FPunchHole {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: offset,
+        fp_length: len,
+    };
+    let fd = file.as_raw_fd();
+    // SAFETY: fd is a valid open file descriptor; `payload` is a
+    // stack-allocated `FPunchHole` matching the kernel's
+    // expected size. fcntl with `F_PUNCHHOLE` reads the
+    // structure pointed to by the third argument.
+    let ret = unsafe { libc::fcntl(fd, F_PUNCHHOLE, &payload as *const FPunchHole) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::last_os_error()))
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Rename, directory sync, copy
 // ──────────────────────────────────────────────────────────────────────────────

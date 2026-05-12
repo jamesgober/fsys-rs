@@ -765,6 +765,100 @@ impl Handle {
         )
     }
 
+    /// 0.9.5 — Punches a hole in `path` at `[offset, offset + len)`.
+    ///
+    /// After this call the file's logical size is **unchanged** —
+    /// the byte range is still addressable and reads return
+    /// zeros — but the underlying storage blocks are released
+    /// to the filesystem free pool. Most modern filesystems
+    /// (ext4 with `discard`, xfs, btrfs, APFS, NTFS-sparse)
+    /// also notify the underlying NVMe / SATA SSD via TRIM /
+    /// DEALLOCATE, so the drive's wear-leveler can reuse the
+    /// erase blocks.
+    ///
+    /// **Use cases.** WAL truncation (free the prefix of a
+    /// journal after a checkpoint), sparse-file management
+    /// (release a dead range from a key-value store's data
+    /// file), database vacuum operations.
+    ///
+    /// **Per-platform implementation:**
+    /// - **Linux**: `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`.
+    ///   On filesystems with `discard` mount option, the kernel
+    ///   issues NVMe DEALLOCATE / SATA TRIM automatically.
+    /// - **macOS**: `fcntl(F_PUNCHHOLE)` (10.12+).
+    /// - **Windows**: `DeviceIoControl(FSCTL_SET_ZERO_DATA)` —
+    ///   on NTFS sparse files this truly releases blocks; on
+    ///   regular files it zero-fills (same observable
+    ///   semantics — reads return zeros).
+    /// - **Other**: returns `Error::Io` with `Unsupported` kind.
+    ///
+    /// **Sector alignment.** Most filesystems will silently
+    /// round the range to filesystem-block boundaries (4 KiB
+    /// typical). Callers that need precise byte-level zeros
+    /// should follow with [`Self::write_zeros`] on the
+    /// trailing partial sectors.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidPath`] if path resolution fails.
+    /// - [`Error::Io`] wrapping the underlying syscall error.
+    ///   Common variants: `EOPNOTSUPP` on filesystems that
+    ///   don't support hole-punching (older ext2, vfat,
+    ///   certain FUSE mounts) — caller's data is unchanged.
+    pub fn punch_hole(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        let resolved = self.resolve_path(path.as_ref())?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&resolved)
+            .map_err(Error::Io)?;
+        crate::platform::punch_hole(&file, offset, len)
+    }
+
+    /// 0.9.5 — Zero-fills `path` at `[offset, offset + len)`.
+    ///
+    /// On capable Linux + NVMe configurations the kernel
+    /// translates this into an NVMe `WRITE ZEROES` command —
+    /// the drive controller marks the range as zeros without
+    /// any host→device data transfer. On other platforms /
+    /// configurations the implementation falls back to a
+    /// regular `pwrite` of an aligned zero buffer.
+    ///
+    /// Unlike [`Self::punch_hole`], `write_zeros` **does not**
+    /// release the underlying storage — the bytes are
+    /// guaranteed to read as zeros, but the blocks remain
+    /// allocated. Use this when you need explicit byte-level
+    /// zero semantics without changing the file's storage
+    /// footprint (e.g., pre-zeroing a WAL segment to avoid
+    /// sparse-file metadata bookkeeping during sustained
+    /// appends).
+    ///
+    /// **Per-platform implementation:**
+    /// - **Linux**: `fallocate(FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE)`.
+    /// - **macOS / Windows / other**: aligned-buffer `pwrite`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidPath`] if path resolution fails.
+    /// - [`Error::Io`] wrapping the underlying syscall error.
+    pub fn write_zeros(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        let resolved = self.resolve_path(path.as_ref())?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&resolved)
+            .map_err(Error::Io)?;
+        crate::platform::zero_range(&file, offset, len)
+    }
+
     /// 0.9.4 — Returns the device's **atomic-write unit** (NAWUPF)
     /// in **bytes**, or `None` when the probe could not determine
     /// it.
@@ -1562,6 +1656,137 @@ mod tests {
         let bool_form = h.is_plp_protected();
         let status_form = h.plp_status();
         assert_eq!(bool_form, status_form == crate::hardware::PlpStatus::Yes);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 0.9.5 — punch_hole + write_zeros
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_write_zeros_overwrites_existing_bytes() {
+        // Create a file with non-zero data, call write_zeros on
+        // a sub-range, confirm the range now reads as zeros.
+        let h = make_handle(Method::Sync);
+        let path = std::env::temp_dir().join(format!(
+            "fsys_handle_write_zeros_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _g = Cleanup(path.clone());
+
+        // Initialise with 16 KiB of 0xAB.
+        let payload = vec![0xABu8; 16 * 1024];
+        std::fs::write(&path, &payload).expect("seed");
+        // Zero bytes [4096..8192].
+        h.write_zeros(&path, 4096, 4096).expect("write_zeros");
+        // Read back and verify.
+        let data = std::fs::read(&path).expect("read back");
+        assert_eq!(data.len(), payload.len());
+        assert!(
+            data[0..4096].iter().all(|&b| b == 0xAB),
+            "pre-range untouched"
+        );
+        assert!(data[4096..8192].iter().all(|&b| b == 0), "range zeroed");
+        assert!(
+            data[8192..].iter().all(|&b| b == 0xAB),
+            "post-range untouched"
+        );
+    }
+
+    #[test]
+    fn test_write_zeros_empty_range_is_noop() {
+        // len = 0 must succeed silently without touching the
+        // file. Matches the cross-platform contract.
+        let h = make_handle(Method::Sync);
+        let path = std::env::temp_dir().join(format!(
+            "fsys_handle_write_zeros_empty_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _g = Cleanup(path.clone());
+        let payload = vec![0xCDu8; 1024];
+        std::fs::write(&path, &payload).expect("seed");
+        h.write_zeros(&path, 512, 0).expect("write_zeros empty");
+        let data = std::fs::read(&path).expect("read back");
+        assert_eq!(data, payload, "empty range must not touch the file");
+    }
+
+    #[test]
+    fn test_punch_hole_zeros_range_on_every_platform() {
+        // The cross-platform contract: after punch_hole, the
+        // byte range reads as zeros. Block-release behaviour
+        // is filesystem-dependent and not directly observable
+        // through `std::fs::read`, but the zero-read invariant
+        // holds on every supported platform.
+        let h = make_handle(Method::Sync);
+        let path = std::env::temp_dir().join(format!(
+            "fsys_handle_punch_hole_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _g = Cleanup(path.clone());
+
+        // 64 KiB of 0xEE.
+        let payload = vec![0xEEu8; 64 * 1024];
+        std::fs::write(&path, &payload).expect("seed");
+        // Punch a 16 KiB hole at offset 16 KiB.
+        match h.punch_hole(&path, 16 * 1024, 16 * 1024) {
+            Ok(()) => {
+                let data = std::fs::read(&path).expect("read back");
+                assert_eq!(data.len(), payload.len(), "file size unchanged");
+                assert!(
+                    data[0..16 * 1024].iter().all(|&b| b == 0xEE),
+                    "pre-hole untouched"
+                );
+                assert!(
+                    data[16 * 1024..32 * 1024].iter().all(|&b| b == 0),
+                    "hole reads as zeros"
+                );
+                assert!(
+                    data[32 * 1024..].iter().all(|&b| b == 0xEE),
+                    "post-hole untouched"
+                );
+            }
+            Err(crate::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::Unsupported
+                    || e.raw_os_error() == Some(95) /* EOPNOTSUPP */
+                    || e.raw_os_error() == Some(1) /* ERROR_INVALID_FUNCTION */ =>
+            {
+                // Filesystem doesn't support hole-punching
+                // (vfat, certain FUSE mounts, some Windows
+                // shares). Test runner may be on such a fs;
+                // accept the gap-feature error as documented
+                // contract behaviour.
+            }
+            Err(e) => panic!("unexpected punch_hole error: {e:?}"),
+        }
     }
 
     #[test]

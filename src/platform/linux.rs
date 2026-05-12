@@ -670,3 +670,317 @@ mod tests {
         assert_eq!(content, b"line1\nline2\n");
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 0.9.5 — Hole punch + zero range + fiemap extent mapping
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// 0.9.5 — A single contiguous extent reported by the `FIEMAP`
+/// ioctl. Maps a logical byte range within a file to its physical
+/// byte position on the underlying block device.
+///
+/// Constructed by [`fiemap_extents`]. The `physical` byte offset
+/// divided by the device's logical sector size gives the
+/// **starting LBA** of the extent — that's the value the NVMe
+/// Dataset Management Deallocate command needs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FiemapExtent {
+    /// File offset (in bytes) of the first byte of this extent.
+    pub logical: u64,
+    /// Device byte offset of the first byte. Divide by
+    /// `logical_sector_size` to get the starting LBA.
+    pub physical: u64,
+    /// Length of the extent in bytes. Always a multiple of the
+    /// filesystem's allocation unit on well-aligned extents.
+    pub length: u64,
+    /// Raw `FIEMAP_EXTENT_*` flag bits as returned by the kernel.
+    /// See [`fiemap_extent_is_usable_for_dsm`] for the canonical
+    /// "is this extent safe to issue DSM Deallocate against" check.
+    pub flags: u32,
+}
+
+/// `FIEMAP_EXTENT_LAST` — the kernel sets this on the final
+/// extent returned for the requested range.
+pub(crate) const FIEMAP_EXTENT_LAST: u32 = 0x0000_0001;
+/// `FIEMAP_EXTENT_UNKNOWN` — extent's physical location is
+/// unknown to the kernel.
+pub(crate) const FIEMAP_EXTENT_UNKNOWN: u32 = 0x0000_0002;
+/// `FIEMAP_EXTENT_DELALLOC` — data is delayed-allocated; no
+/// physical mapping yet.
+pub(crate) const FIEMAP_EXTENT_DELALLOC: u32 = 0x0000_0004;
+/// `FIEMAP_EXTENT_ENCODED` — extent is compressed or encoded;
+/// physical mapping does not correspond to raw data bytes.
+pub(crate) const FIEMAP_EXTENT_ENCODED: u32 = 0x0000_0008;
+/// `FIEMAP_EXTENT_DATA_ENCRYPTED` — extent is encrypted.
+pub(crate) const FIEMAP_EXTENT_DATA_ENCRYPTED: u32 = 0x0000_0080;
+/// `FIEMAP_EXTENT_NOT_ALIGNED` — physical alignment unknown
+/// (e.g., XFS-style real-time subvolume).
+pub(crate) const FIEMAP_EXTENT_NOT_ALIGNED: u32 = 0x0000_0100;
+/// `FIEMAP_EXTENT_DATA_INLINE` — data is inlined in the inode;
+/// no separate block allocation.
+pub(crate) const FIEMAP_EXTENT_DATA_INLINE: u32 = 0x0000_0200;
+/// `FIEMAP_EXTENT_DATA_TAIL` — data is packed with other items
+/// (e.g., ReiserFS tail packing).
+pub(crate) const FIEMAP_EXTENT_DATA_TAIL: u32 = 0x0000_0400;
+/// `FIEMAP_EXTENT_UNWRITTEN` — block is allocated but contains
+/// no written data yet (returns zeros on read).
+pub(crate) const FIEMAP_EXTENT_UNWRITTEN: u32 = 0x0000_0800;
+
+/// 0.9.5 — Returns `true` if the extent is safe to issue an NVMe
+/// Dataset Management Deallocate against.
+///
+/// We require:
+/// - A stable physical mapping (`!UNKNOWN`, `!DELALLOC`,
+///   `!NOT_ALIGNED`).
+/// - No encoding / compression / encryption (`!ENCODED`,
+///   `!DATA_ENCRYPTED`).
+/// - Not an inline / tail-packed extent (`!DATA_INLINE`,
+///   `!DATA_TAIL`).
+/// - Already written data (`!UNWRITTEN` — unwritten extents have
+///   no real LBA content to deallocate; the kernel returns
+///   zeros on read regardless).
+///
+/// Skipped extents are still freed by the `fallocate(PUNCH_HOLE)`
+/// step of `punch_hole`; we just don't issue NVMe DSM for them
+/// (which would be a meaningless operation against a region the
+/// drive doesn't have an LBA mapping for).
+#[inline]
+pub(crate) fn fiemap_extent_is_usable_for_dsm(flags: u32) -> bool {
+    const UNUSABLE: u32 = FIEMAP_EXTENT_UNKNOWN
+        | FIEMAP_EXTENT_DELALLOC
+        | FIEMAP_EXTENT_ENCODED
+        | FIEMAP_EXTENT_DATA_ENCRYPTED
+        | FIEMAP_EXTENT_NOT_ALIGNED
+        | FIEMAP_EXTENT_DATA_INLINE
+        | FIEMAP_EXTENT_DATA_TAIL
+        | FIEMAP_EXTENT_UNWRITTEN;
+    (flags & UNUSABLE) == 0
+}
+
+/// 0.9.5 — Issues `FS_IOC_FIEMAP` against `fd` for the byte
+/// range `[start, start + length)` and returns the list of
+/// extents the kernel reports.
+///
+/// The returned vector is in ascending logical-offset order.
+/// Callers that want only DSM-safe extents should filter via
+/// [`fiemap_extent_is_usable_for_dsm`].
+///
+/// Implementation detail: makes up to 4 ioctl calls in a row,
+/// each requesting 64 extents. Most files map to under 64
+/// extents (filesystems coalesce contiguous allocations
+/// aggressively); 256 is a reasonable practical ceiling without
+/// unbounded buffer growth. Files with > 256 extents in the
+/// requested range have their extent list truncated; the
+/// truncation is observable because the last extent's
+/// `FIEMAP_EXTENT_LAST` flag will not be set.
+///
+/// # Errors
+///
+/// - [`Error::Io`] wrapping the ioctl errno on failure (commonly
+///   `EOPNOTSUPP` on filesystems that don't implement
+///   `FIEMAP` — tmpfs, FUSE, etc.).
+pub(crate) fn fiemap_extents(
+    fd: std::os::unix::io::RawFd,
+    start: u64,
+    length: u64,
+) -> Result<Vec<FiemapExtent>> {
+    /// Kernel uapi `struct fiemap_extent` layout — 56 bytes.
+    /// All fields little-endian on x86_64 / aarch64.
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct KernelFiemapExtent {
+        fe_logical: u64,
+        fe_physical: u64,
+        fe_length: u64,
+        fe_reserved64: [u64; 2],
+        fe_flags: u32,
+        fe_reserved: [u32; 3],
+    }
+    /// Kernel uapi `struct fiemap` (header). 32 bytes.
+    #[repr(C)]
+    #[derive(Default)]
+    struct KernelFiemapHeader {
+        fm_start: u64,
+        fm_length: u64,
+        fm_flags: u32,
+        fm_mapped_extents: u32,
+        fm_extent_count: u32,
+        fm_reserved: u32,
+    }
+    /// FS_IOC_FIEMAP = _IOWR('f' = 0x66, 11, struct fiemap)
+    /// = (3 << 30) | (32 << 16) | (0x66 << 8) | 11 = 0xc020660b.
+    const FS_IOC_FIEMAP: libc::c_ulong = 0xc020_660b;
+    /// Default per-call extent batch size. 64 covers the
+    /// overwhelming majority of files in one ioctl; we loop up
+    /// to 4 times for files with more extents.
+    const EXTENTS_PER_CALL: u32 = 64;
+    const MAX_CALLS: usize = 4;
+
+    let mut out: Vec<FiemapExtent> = Vec::new();
+    let mut current_start = start;
+    let mut remaining = length;
+
+    for _call in 0..MAX_CALLS {
+        if remaining == 0 {
+            break;
+        }
+        // Allocate a contiguous buffer for the header + extent
+        // array. Layout: [fiemap_header][fiemap_extent; N].
+        let header_size = std::mem::size_of::<KernelFiemapHeader>();
+        let extent_size = std::mem::size_of::<KernelFiemapExtent>();
+        let buf_size = header_size + (EXTENTS_PER_CALL as usize) * extent_size;
+        // Heap allocation aligned to u64 boundary (the kernel
+        // touches u64-aligned fields in the header).
+        let mut buf: Vec<u8> = vec![0u8; buf_size];
+
+        // Populate the header.
+        // SAFETY: `buf` is at least `header_size` bytes and `Vec<u8>`
+        // is allocated with alignment ≥ alignment_of::<u8>() = 1;
+        // we cast through `*mut KernelFiemapHeader` and only access
+        // fields via `ptr::write` (no unaligned reads through a
+        // typed reference).
+        unsafe {
+            let header_ptr = buf.as_mut_ptr() as *mut KernelFiemapHeader;
+            std::ptr::write(
+                header_ptr,
+                KernelFiemapHeader {
+                    fm_start: current_start,
+                    fm_length: remaining,
+                    fm_flags: 0,
+                    fm_mapped_extents: 0,
+                    fm_extent_count: EXTENTS_PER_CALL,
+                    fm_reserved: 0,
+                },
+            );
+        }
+
+        // SAFETY: `fd` is a valid open file descriptor for the
+        // duration of this call. `buf.as_mut_ptr()` points to
+        // `buf_size` bytes of valid memory. The kernel reads the
+        // header in-place and writes up to `EXTENTS_PER_CALL`
+        // entries into the array that follows.
+        let rc = unsafe { libc::ioctl(fd, FS_IOC_FIEMAP, buf.as_mut_ptr() as *mut libc::c_void) };
+        if rc < 0 {
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
+
+        // Read back the header to find how many extents the
+        // kernel actually populated.
+        // SAFETY: header is at the start of the buffer; we wrote
+        // a valid KernelFiemapHeader there before the ioctl, and
+        // the kernel updates only the in-out fields per the
+        // FIEMAP contract.
+        let mapped = unsafe {
+            let header_ptr = buf.as_ptr() as *const KernelFiemapHeader;
+            std::ptr::read(header_ptr).fm_mapped_extents
+        };
+        if mapped == 0 {
+            break;
+        }
+
+        // Pull out each extent. Track the last extent's end
+        // position so we can advance `current_start` for the
+        // next call if needed.
+        let mut last_logical_end: u64 = current_start;
+        let mut hit_last = false;
+        for i in 0..(mapped as usize).min(EXTENTS_PER_CALL as usize) {
+            // SAFETY: each extent is `extent_size` bytes after
+            // the header at index `i`. We read via `ptr::read`
+            // (handles unaligned reads on platforms where it
+            // matters; on x86_64 / aarch64 the buffer happens to
+            // be naturally aligned at the start).
+            let extent: KernelFiemapExtent = unsafe {
+                let ext_ptr =
+                    buf.as_ptr().add(header_size + i * extent_size) as *const KernelFiemapExtent;
+                std::ptr::read_unaligned(ext_ptr)
+            };
+            last_logical_end = extent.fe_logical.saturating_add(extent.fe_length);
+            if (extent.fe_flags & FIEMAP_EXTENT_LAST) != 0 {
+                hit_last = true;
+            }
+            out.push(FiemapExtent {
+                logical: extent.fe_logical,
+                physical: extent.fe_physical,
+                length: extent.fe_length,
+                flags: extent.fe_flags,
+            });
+        }
+
+        if hit_last {
+            break;
+        }
+        // Advance for the next call. Bail if we didn't make
+        // forward progress (paranoid against pathological
+        // filesystems).
+        if last_logical_end <= current_start {
+            break;
+        }
+        let advanced = last_logical_end - current_start;
+        if advanced >= remaining {
+            break;
+        }
+        current_start = last_logical_end;
+        remaining -= advanced;
+    }
+
+    Ok(out)
+}
+
+/// 0.9.5 — Punches a hole in `file` at `[offset, offset + len)`.
+///
+/// Calls `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`
+/// — the canonical Linux primitive for hole-punching. After this
+/// call the byte range still exists logically (the file size is
+/// unchanged) but reads from it return zeros, and the underlying
+/// blocks are returned to the filesystem free pool. Most modern
+/// filesystems (ext4 with `discard`, xfs, btrfs) issue NVMe TRIM
+/// to the device automatically as part of the operation.
+///
+/// Returns `Ok(())` on success. Returns an `Err` wrapping
+/// `EOPNOTSUPP` on filesystems that don't support `FALLOC_FL_PUNCH_HOLE`
+/// (rare on modern Linux — ext2 / vfat / certain FUSE mounts).
+/// Callers building cross-platform code should treat the error
+/// as a feature gap (the caller's data is unchanged) rather than
+/// as a hard failure.
+pub(crate) fn punch_hole(file: &File, offset: u64, len: u64) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let fd = file.as_raw_fd();
+    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    // SAFETY: fd is a valid open file descriptor. fallocate(2)
+    // returns 0 on success and -1 on error with errno set.
+    let rc = unsafe { libc::fallocate(fd, mode, offset as i64, len as i64) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::last_os_error()))
+    }
+}
+
+/// 0.9.5 — Zero-fills `file` at `[offset, offset + len)`.
+///
+/// Calls `fallocate(FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE)`.
+/// On capable filesystems + NVMe drives the kernel translates
+/// this to an NVMe `WRITE ZEROES` command — the drive controller
+/// marks the range as zeros without any host→device data
+/// transfer. Falls back to a regular write-of-zeros on
+/// filesystems that don't implement `FALLOC_FL_ZERO_RANGE`.
+///
+/// Returns `Ok(())` on success. Returns an `Err` wrapping
+/// `EOPNOTSUPP` on filesystems that don't support
+/// `FALLOC_FL_ZERO_RANGE`.
+pub(crate) fn zero_range(file: &File, offset: u64, len: u64) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let fd = file.as_raw_fd();
+    let mode = libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE;
+    // SAFETY: fd is a valid open file descriptor.
+    let rc = unsafe { libc::fallocate(fd, mode, offset as i64, len as i64) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::last_os_error()))
+    }
+}
