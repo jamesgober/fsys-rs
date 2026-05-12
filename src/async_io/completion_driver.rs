@@ -136,7 +136,15 @@ impl AsyncIoUring {
         // process; subsequent ring constructions just re-apply
         // the cached bits.
         let mut probe_builder = io_uring::IoUring::builder();
-        crate::platform::iouring_features::apply(&mut probe_builder);
+        // 0.9.6 fix: pass RingMode::Async — DEFER_TASKRUN is
+        // incompatible with the eventfd-driven completion loop
+        // because the kernel won't post CQEs without an
+        // explicit io_uring_enter(GETEVENTS) call. See
+        // `RingMode` doc in iouring_features.rs.
+        crate::platform::iouring_features::apply(
+            &mut probe_builder,
+            crate::platform::iouring_features::RingMode::Async,
+        );
         match probe_builder.build(queue_depth) {
             Ok(_probe) => {}
             Err(source) => return Err(Error::IoUringSetupFailed { source }),
@@ -337,8 +345,14 @@ async fn owner_loop(queue_depth: u32, eventfd_raw: RawFd, mut rx: mpsc::Unbounde
     // failure as a clean error.)
     // 0.9.4: apply the cached elite setup flags so this ring
     // gets the same kernel feature set the probe accepted.
+    // 0.9.6 fix: RingMode::Async excludes DEFER_TASKRUN — the
+    // eventfd-driven loop here is incompatible with that flag's
+    // explicit-driving requirement (see `RingMode` doc).
     let mut builder = io_uring::IoUring::builder();
-    crate::platform::iouring_features::apply(&mut builder);
+    crate::platform::iouring_features::apply(
+        &mut builder,
+        crate::platform::iouring_features::RingMode::Async,
+    );
     let mut ring = match builder.build(queue_depth) {
         Ok(r) => r,
         Err(_) => return, // owned_fd drops, eventfd closes once
