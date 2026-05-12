@@ -61,6 +61,7 @@ not trying to replace `std::fs` for ordinary application code.
 - **io_uring elite &mdash; Linux (0.9.4)** &mdash; process-cached kernel-feature probe applies `IORING_SETUP_COOP_TASKRUN` / `SINGLE_ISSUER` / `DEFER_TASKRUN` to every io_uring ring fsys constructs (kernel &ge; 5.19 / 6.0 / 6.1 respectively, with graceful downgrade on older kernels); linked `Write + Fsync(DATASYNC)` via `IOSQE_IO_LINK` halves the durable-write syscall round-trip on the atomic-replace Direct path; NAWUN / NAWUPF probe via NVMe Identify Namespace exposes `Handle::atomic_write_unit() -> Option<u32>` so databases on guaranteeing drives can safely skip torn-write detection on writes up to that size. Linux-only paths are `#[cfg(target_os = "linux")]`-gated.
 - **Cross-platform sync tuning (0.9.4)** &mdash; `JournalOptions::sync_mode(SyncMode::Barrier)` opts into macOS `F_BARRIERFSYNC` (10&ndash;100&times; cheaper than `F_FULLFSYNC` on Apple Silicon NVMe; crash-safe **only** on PLP drives or under explicit eventual-`Full`-sync discipline). `JournalOptions::write_lifetime_hint(Some(WriteLifetimeHint::Long))` applies the Linux `F_SET_RW_HINT` fcntl so multi-stream NVMe drives cluster long-lived journal data into separate NAND blocks, reducing GC write amplification. Both knobs default off; pre-0.9.4 behaviour preserved exactly.
 - **Performance + IO tuning (0.9.5)** &mdash; **dual-buffered Direct-mode log buffer** decouples appends from in-flight flushes so concurrent writers no longer block on the `write_at_direct` syscall (Direct mode goes from a single-core ceiling to multi-core scalable on HiveDB-class workloads). `Handle::punch_hole(path, offset, len)` and `Handle::write_zeros(path, offset, len)` expose cross-platform sparse-file primitives backed by Linux `fallocate(FALLOC_FL_PUNCH_HOLE | FL_ZERO_RANGE)`, macOS `fcntl(F_PUNCHHOLE)`, and Windows `FSCTL_SET_ZERO_DATA` &mdash; the WAL-trim primitive databases use to give back consumed segments without touching the page cache. Both Linux io_uring rings (sync owner-thread + async substrate) now use `IORING_REGISTER_FILES` so per-op `fd`s are lazily upgraded to fixed-file slots, eliminating per-SQE kernel-side fd validation on the hot path.
+- **0.9.6 audit + journal-on-io_uring + reflinks** &mdash; full-codebase audit pass with **38 findings** triaged (all 5 CRITICAL resolved; 13 of 16 HIGH resolved with the others deferred to documented architectural-dep follow-ups). Architectural centerpiece: the Direct-mode journal flush path now routes through **`IORING_OP_WRITE_FIXED`** against pre-registered AlignedBuf slots on Linux (silent fallback to `pwrite` elsewhere); macOS `clonefile(2)` and Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE` give APFS/ReFS reflink semantics for `copy_file`; real OS-version probes via `sysctlbyname` (macOS) and `RtlGetVersion` (Windows); real page-size probe via `sysconf`/`GetSystemInfo`. CI hardening: feature-matrix job + `cargo audit`/`cargo deny` daily workflow + 60-second soak in every PR.
 
 
 &nbsp;
@@ -72,14 +73,14 @@ not trying to replace `std::fs` for ordinary application code.
 
 ```toml
 [dependencies]
-fsys = "0.9.5"
+fsys = "0.9.6"
 ```
 
 To opt into the async layer:
 
 ```toml
 [dependencies]
-fsys = { version = "0.9.5", features = ["async"] }
+fsys = { version = "0.9.6", features = ["async"] }
 ```
 
 <br>

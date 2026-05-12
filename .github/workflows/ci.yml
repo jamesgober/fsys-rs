@@ -102,6 +102,27 @@ jobs:
       - name: Build documentation
         run: cargo doc --no-deps --all-features
 
+  # 0.9.6 audit L-5 — short-budget soak test in default CI.
+  # The `stress` feature flips the soak test to the full 1-hour
+  # run; without the feature the same test self-bounds to ~60s.
+  # 60s is fast enough for every-PR validation and catches
+  # obvious deadlocks before they reach release.
+  soak-short:
+    name: Soak (60s budget)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run soak test (default 60s budget)
+        run: cargo test --test stress --release
+
   # 0.9.6 audit H-13 — feature-matrix coverage.
   # The default + all-features paths are exercised by the `test` /
   # `docs` jobs above; this matrix covers the in-between

@@ -549,10 +549,11 @@ impl From<std::io::Error> for Error {
 ///   failed.
 /// - [`completed`](BatchError::completed): the number of ops that
 ///   completed successfully *before* the failure (always equal to
-///   `failed_at` in `0.4.0`; the field is preserved as a structural
-///   guarantee for future phases that might allow continuation).
-/// - [`source`](BatchError::source): the underlying [`Error`] that
-///   describes the failure.
+///   `failed_at()` in `0.4.0`; the accessor is preserved as a
+///   structural guarantee for future phases that might allow
+///   continuation).
+/// - [`inner`](BatchError::inner) / [`into_inner`](BatchError::into_inner):
+///   the underlying [`Error`] that describes the failure.
 ///
 /// Callers needing all-or-nothing semantics must layer their own
 /// transactional logic on top of fsys, or wait for `Method::Journal`

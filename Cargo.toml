@@ -4,7 +4,7 @@
 ######################################################
 [package]
 name    = "fsys"
-version = "0.9.5"
+version = "0.9.6"
 
 # METADATA
 readme  = "README.md"
@@ -58,6 +58,15 @@ categories = [
 authors = [
     "James Gober <me@jamesgober.com>"
 ]
+
+# DOCS.RS BUILD CONFIG
+# 0.9.6 — explicit metadata. docs.rs builds with --all-features
+# so users see the full surface (async + tracing). The `docsrs`
+# cfg is a convention for items to render only on docs.rs (used
+# by `#[cfg_attr(docsrs, doc(cfg(...)))]` annotations).
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 
 ###########################
