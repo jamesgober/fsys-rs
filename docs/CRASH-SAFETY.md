@@ -112,6 +112,100 @@ the test 100× pre-merge to catch flakes. The 0.5.0 / 0.5.1
 crash-test runs are documented in
 `.dev/DECISIONS-0.5.0.md` and `.dev/DECISIONS-0.6.0.md`.
 
+## Journal substrate durability (0.9.0)
+
+The journal does **not** use atomic-replace. The contract is
+explicit LSN-based durability: every `append` adds bytes to the
+file without an `fsync`; `sync_through(lsn)` is the durability
+barrier.
+
+> **Journal invariant.** After `sync_through(lsn)` returns
+> successfully, every byte from file offset 0 through `lsn.0 - 1`
+> is on stable storage. Bytes past `lsn.0` may or may not be
+> durable; the contract makes no promise about them.
+
+For a database WAL pattern: append many records, take note of
+the last LSN, call `sync_through(last_lsn)`, then commit the
+transaction. The fsync syscall happens once per transaction, not
+once per record — that's where the 100-700× speedup over
+atomic-replace comes from.
+
+### Tail-truncation taxonomy
+
+After a crash, the journal's append-only nature means the file's
+last record may be torn. The 5-state taxonomy classifies what
+the reader sees at the journal tail:
+
+| `JournalTailState` | Meaning | Recoverable? |
+|---|---|---|
+| `CleanEnd` | File ended exactly on a frame boundary. No torn record. | n/a |
+| `TruncatedHeader` | Last frame's 12-byte header is partial. Truncate at frame start. | **Yes** |
+| `TruncatedPayload` | Last frame's payload was cut mid-write. Truncate at frame start. | **Yes** |
+| `ChecksumMismatch` | Frame decoded but CRC-32C check failed. Truncate at frame start. | **Yes** |
+| `BadMagic` | Frame's magic+version doesn't match. Format-level corruption — surfaces as `Error::Io(InvalidData)`. | **No** — operator intervention required |
+| `LengthOverflow` | Frame's declared length exceeds the 256 MiB limit or remaining file size. Same as `BadMagic`. | **No** |
+
+For recoverable tail states, the recovery procedure is:
+
+1. Open the journal via `JournalReader::open(path)`.
+2. Iterate; the iterator stops at the first torn frame.
+3. `reader.position()` returns the byte offset of the torn frame's start.
+4. `reader.tail_state()` returns which of the five states.
+5. Truncate the file to `reader.position()`, then reopen via
+   `Handle::journal` to continue appending.
+
+For unrecoverable states (`BadMagic`, `LengthOverflow`), the
+reader does **not** auto-truncate — these indicate format-level
+corruption that may extend beyond the tail. Surface to a human
+operator for triage.
+
+### Direct-IO journal mode (0.9.5+ dual-buffer)
+
+With `JournalOptions::direct(true)`, the journal opens the file
+with `O_DIRECT` (Linux) / `F_NOCACHE` (macOS) /
+`FILE_FLAG_NO_BUFFERING` (Windows). Appends route through a
+dual-buffered sector-aligned log buffer; the buffer flushes to
+disk at sector boundaries.
+
+The same crash-safety contract applies, with one additional
+recovery detail: the resume path scans the existing file
+forward, finds the LSN past the last cleanly-decoded frame, and
+**re-seats the log buffer at the largest sector boundary at or
+before that LSN**. The partial trailing sector is rehydrated
+into the buffer's first sector so subsequent flushes overwrite
+the existing on-disk zero-pad without destroying records.
+
+### Test harness — `tests/crash_journal.rs`
+
+The journal has its own subprocess-kill harness independent of
+the per-method crash tests above. The harness:
+
+1. Spawns a victim subprocess that opens a journal, appends
+   `SYNCED_COUNT = 50` records, calls `sync_through` to make
+   those records durable, signals `BEGIN`, then continues
+   appending more records **without syncing**.
+2. The parent kills the victim mid-burst (Windows
+   `TerminateProcess` / Unix `SIGKILL`).
+3. The parent reopens the journal and scans it forward.
+
+Three invariants are asserted:
+
+- **Durability.** All 50 synced records are present, intact,
+  with monotonically increasing LSNs and byte-for-byte
+  matching payloads.
+- **Tail truncation.** The reader stops cleanly at the first
+  torn frame. Tail state is one of `CleanEnd`,
+  `TruncatedHeader`, `TruncatedPayload`, or `ChecksumMismatch`
+  — never `BadMagic` or `LengthOverflow`.
+- **No torn-frame surface.** Records past the sync barrier may
+  or may not be present, but any record the reader does surface
+  matches its expected payload byte-for-byte (CRC-32C enforces
+  this).
+
+Both `JournalOptions::default()` (buffered/lock-free) and
+`JournalOptions::direct(true)` (Direct-IO log buffer) pass the
+harness across 10 consecutive runs.
+
 ## Non-write APIs
 
 These APIs do NOT use the atomic-replace pattern (and do not
@@ -129,3 +223,15 @@ guarantee atomicity):
   within a filesystem.
 - `Handle::delete` / `Handle::rmdir*` — `unlink(2)` / `rmdir(2)`
   / `DeleteFile` are atomic.
+- `Handle::punch_hole(path, offset, len)` (0.9.5) — deallocates
+  the range, leaving a sparse hole. Crash mid-call leaves either
+  the original data or the hole at that range; the syscall is
+  atomic at the kernel level (Linux `fallocate`, macOS
+  `fcntl(F_PUNCHHOLE)`, Windows `FSCTL_SET_ZERO_DATA`).
+- `Handle::write_zeros(path, offset, len)` (0.9.5) — same
+  atomicity guarantees as `punch_hole`; the range either reads
+  as zeros after the call or retains its original content.
+- `Handle::copy(src, dst)` — on APFS / ReFS (0.9.6 reflink
+  fast-path), the clone syscall is atomic at the kernel level.
+  Falls back to `std::fs::copy` on unsupported filesystems
+  (which is not atomic — partial copies are possible on crash).
