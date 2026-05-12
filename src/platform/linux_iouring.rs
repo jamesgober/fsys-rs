@@ -632,13 +632,6 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>) {
                 // caller's buffer ranges in the kernel's
                 // page-table so subsequent `WriteFixed` SQEs
                 // skip the per-submission page-pinning hop.
-                // SAFETY: the caller (via the public
-                // `register_buffers` method) is responsible for
-                // keeping the underlying memory alive for the
-                // lifetime of the ring. The kernel reads
-                // `iovs.len()` `iovec` structs, validates the
-                // ranges, and pins the pages. Our local `iovec`
-                // array lives across the syscall.
                 let iovec_array: Vec<libc::iovec> = iovs
                     .iter()
                     .map(|(p, l)| libc::iovec {
@@ -646,6 +639,15 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>) {
                         iov_len: *l,
                     })
                     .collect();
+                // SAFETY: the caller (via the public
+                // `register_buffers` method) is responsible for
+                // keeping the underlying memory alive for the
+                // lifetime of the ring. The kernel reads
+                // `iovec_array.len()` `iovec` structs, validates
+                // the ranges, and pins the pages. The local
+                // `iovec_array` lives across the syscall — the
+                // kernel only needs the iovec descriptors during
+                // the call, not after.
                 let result =
                     unsafe { ring.submitter().register_buffers(&iovec_array) }.map_err(Error::Io);
                 let _ = reply.send(result);
