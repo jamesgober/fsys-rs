@@ -156,3 +156,41 @@ jobs:
 
       - name: Test
         run: cargo test --lib ${{ matrix.features }}
+
+  # 0.9.7 audit H-7 — OOM-injection coverage.
+  # The `oom_inject` feature replaces the global allocator with a
+  # forwarding wrapper that injects allocation failures above a
+  # thread-local size threshold. It is an internal-only test
+  # feature (documented "NEVER enable in production builds") and
+  # must run in its own job because `#[global_allocator]` is a
+  # crate-wide attribute — enabling it for the rest of the test
+  # suite would pay the per-allocation threshold check on every
+  # test, slowing CI without value. Runs on every supported OS
+  # because the cross-platform smoke + guard + buffered-mode tests
+  # exercise allocator pass-through identically on each platform;
+  # the Direct-mode test is itself `#[cfg(target_os = "linux")]`
+  # because Windows / macOS silently downgrade `direct(true)` when
+  # the temp filesystem rejects elite open flags, breaking the
+  # determinism the test needs.
+  oom-inject:
+    name: OOM injection (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build oom_injection test
+        run: cargo build --features oom_inject --test oom_injection --verbose
+
+      - name: Run oom_injection test
+        run: cargo test --features oom_inject --test oom_injection --verbose
