@@ -119,6 +119,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test matrix (the global allocator replacement applies to
   every test in the binary so it can't share the default
   matrix).
+- **L-2 inline pass** — `#[inline]` added to `Handle` public
+  accessors (`method`, `active_method`, `root`, `mode`,
+  `sector_size`, `observer`) and `JournalHandle::is_direct_active`
+  so they inline across the crate boundary. `Lsn::new` /
+  `as_u64` / `From` impls and `synced_lsn` / `next_lsn` already
+  had `#[inline]` from earlier work.
+- **H-16 verification** — added `group_commit_wake_stampede_128_followers`
+  unit test that fires 128 concurrent followers at a single
+  target LSN, asserts no deadlock + zero `pending_followers`
+  leak after all threads join + all followers see their target
+  as durable. Validates the structural correctness of the
+  atomic-decrement + lock-free early-exit path under the
+  contention level the audit flagged.
+- **`AUDIT-0.9.6.md` status accuracy** — updated stale "OPEN"
+  statuses on M-1 + L-1 (both confirmed already-fixed in 0.9.6)
+  and on every 0.9.7-shipped finding (H-2, H-7, H-9, H-16, M-2,
+  M-5, M-7, M-11, L-2) with commit refs.
 
 ## [0.9.6] - 2026-05-12
 

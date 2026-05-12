@@ -1189,7 +1189,7 @@ mod tests {
     /// integration tests, so skipping these here doesn't reduce
     /// coverage on sandboxed runners.
     fn ring_or_skip() -> Option<IoUringRing> {
-        match IoUringRing::new(8) {
+        match IoUringRing::new(8, None) {
             Ok(r) => Some(r),
             Err(Error::IoUringSetupFailed { .. }) => None,
             Err(e) => panic!("unexpected ring construction error: {e:?}"),
@@ -1205,7 +1205,7 @@ mod tests {
 
     #[test]
     fn ring_construction_returns_ring_or_setup_failed() {
-        match IoUringRing::new(8) {
+        match IoUringRing::new(8, None) {
             Ok(_) => {}
             Err(Error::IoUringSetupFailed { .. }) => {}
             Err(e) => panic!("unexpected variant: {e:?}"),
