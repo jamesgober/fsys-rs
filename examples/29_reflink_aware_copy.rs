@@ -91,7 +91,9 @@ fn main() -> fsys::Result<()> {
     #[cfg(target_os = "macos")]
     println!("  this platform: macOS — Handle::copy uses clonefile(2) on APFS");
     #[cfg(target_os = "windows")]
-    println!("  this platform: Windows — Handle::copy uses FSCTL_DUPLICATE_EXTENTS_TO_FILE on ReFS");
+    println!(
+        "  this platform: Windows — Handle::copy uses FSCTL_DUPLICATE_EXTENTS_TO_FILE on ReFS"
+    );
     #[cfg(target_os = "linux")]
     println!("  this platform: Linux — Handle::copy falls back to std::fs::copy (btrfs/XFS reflink not wired)");
 

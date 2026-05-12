@@ -68,7 +68,10 @@ fn main() -> fsys::Result<()> {
         }
     }
     assert_eq!(count, 64, "all 64 records must be present");
-    println!("replay confirmed: {count} records, tail state {:?}", reader.tail_state());
+    println!(
+        "replay confirmed: {count} records, tail state {:?}",
+        reader.tail_state()
+    );
 
     let _ = std::fs::remove_file(&path);
     Ok(())

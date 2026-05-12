@@ -123,14 +123,26 @@ fn main() -> fsys::Result<()> {
     // Read the counters.
     println!();
     println!("observer counters after activity:");
-    println!("  journal appends:  {} (expected 50)", observer.appends.load(Ordering::Relaxed));
-    println!("  journal syncs:    {} (expected 1)", observer.syncs.load(Ordering::Relaxed));
+    println!(
+        "  journal appends:  {} (expected 50)",
+        observer.appends.load(Ordering::Relaxed)
+    );
+    println!(
+        "  journal syncs:    {} (expected 1)",
+        observer.syncs.load(Ordering::Relaxed)
+    );
     let total_sync = observer.total_sync_nanos.load(Ordering::Relaxed);
     let sync_count = observer.syncs.load(Ordering::Relaxed).max(1);
     println!("  avg sync latency: {} µs", total_sync / sync_count / 1000);
     println!();
-    println!("  handle writes:    {} (Handle::write is not currently", observer.writes.load(Ordering::Relaxed));
-    println!("  handle reads:     {}  instrumented; the trait methods", observer.reads.load(Ordering::Relaxed));
+    println!(
+        "  handle writes:    {} (Handle::write is not currently",
+        observer.writes.load(Ordering::Relaxed)
+    );
+    println!(
+        "  handle reads:     {}  instrumented; the trait methods",
+        observer.reads.load(Ordering::Relaxed)
+    );
     println!("                     are reserved for a future release)");
 
     let _ = std::fs::remove_file(&path);

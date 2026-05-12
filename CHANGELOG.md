@@ -5,6 +5,131 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.8] - 2026-05-12
+
+> **The polish + 1.0-RC-prep release.** No new public API. No
+> behaviour changes. Every line of work in this release exists to
+> make the surface that 1.0 will inherit easier to discover, read,
+> and trust. The 0.9.6 audit + 0.9.7 cleanup left the code correct;
+> 0.9.8 makes the documentation, examples, and stability commitment
+> match that bar.
+
+### Added — 0.9.8
+
+- **`docs/STABILITY-1.0.md`** (NEW, ~210 lines) — the 1.0 API
+  commitment doc. Covers every dimension of the stable contract:
+  the public API surface enumerated by re-export, method-signature
+  guarantees, the 11 `#[non_exhaustive]` types reserving forward-
+  compat, FS-XXXXX error-code stability, crash-safety / durability
+  / atomicity contracts, the four Cargo features and their
+  stability tiers, SemVer policy + deprecation timeline, an
+  explicit negative list of what 1.x does NOT guarantee
+  (Display formatting, default values, observable timings,
+  `tracing` output, platform-specific failure modes), MSRV
+  policy, platform support tiers, and the migration into 1.0
+  (zero breaking changes from 0.9.x).
+- **12 new runnable examples** for 0.9.1–0.9.7 capability
+  coverage (`examples/18` through `examples/29`):
+  - `18_journal_append_batch.rs` — vectored journal append (0.9.1)
+  - `19_batch_commit_grouped.rs` — atomic-batch fsync (0.9.3)
+  - `20_tune_for_database.rs` — Workload::Database preset (0.9.2)
+  - `21_punch_hole_wal_trim.rs` — WAL trim primitive (0.9.5)
+  - `22_sync_mode_barrier_macos.rs` — F_BARRIERFSYNC (0.9.4)
+  - `23_multi_shard_batches.rs` — dispatcher_shards(N) (0.9.3)
+  - `24_observer_basics.rs` — FsysObserver trait (0.9.2)
+  - `25_sqpoll_opt_in.rs` — IORING_SETUP_SQPOLL (0.9.7)
+  - `26_plp_aware_skip_fsync.rs` — PLP detection (0.9.2)
+  - `27_atomic_write_unit.rs` — NAWUN/NAWUPF probe (0.9.4)
+  - `28_write_lifetime_hint.rs` — F_SET_RW_HINT (0.9.4)
+  - `29_reflink_aware_copy.rs` — APFS/ReFS reflinks (0.9.6)
+  - Total example count: 17 → 29.
+
+### Changed — 0.9.8
+
+- **README.md rewrite.** Hero positioning sentence + quickstart
+  code on the first screen; feature *table* replacing the prior
+  22-bullet prose dump; explicit "When to use `fsys`" comparison
+  table vs `std::fs` / `tokio::fs` / hand-rolled atomic-replace;
+  refreshed install snippets (0.9.6 → 0.9.7); refreshed example
+  count (16 → 17, soon to be 29); cut the "Coming Soon"
+  contributors filler.
+- **`src/lib.rs` landing page (docs.rs front door) rewrite.**
+  Storage-foundation tagline matching the new Cargo description;
+  runnable journal + `fsys::quick` quickstart on the first screen;
+  Cargo features table; concept-reference cross-link map; the
+  prior 50-line version-history cascade replaced with a single
+  pointer to `CHANGELOG.md`. Doctest count: 39 → 45.
+- **All 9 files in `docs/` refreshed** to 0.9.7-current:
+  - `API.md` — duplicate journal section removed; new "API
+    additions in 0.9.1–0.9.7" section catalogues every minor-
+    release surface addition; method tables updated for all
+    missing 0.9.x methods (`append_batch`, `punch_hole`,
+    `write_zeros`, `atomic_write_unit`, `is_plp_protected`,
+    `dispatcher_shards`, `tune_for`, `sqpoll`, `commit_grouped`,
+    `sync_mode`, `write_lifetime_hint`, etc.).
+  - `ARCHITECTURE.md` — diagram annotated as 0.9.7; pipeline
+    section now describes N-shard dispatcher; new
+    `crate::observer` module section; new "Data flow —
+    Batch::commit_grouped" section; concurrency-model section
+    updated for 0.9.7 H-16 + M-2 atomic-ordering work.
+  - `BENCH.md` — Tier-4 "deferred" → "shipped 0.9.4–0.9.7"; new
+    "0.9.1–0.9.7 features awaiting numbered results" table.
+  - `CRASH-SAFETY.md` — NEW journal-substrate durability section
+    + tail-state taxonomy + crash-test harness description;
+    non-write APIs extended for 0.9.5 punch_hole / write_zeros
+    + 0.9.6 copy-reflink atomicity.
+  - `EXAMPLES.md` — "17 runnable examples" → "29" + new entries
+    for the 12 added examples grouped by capability area.
+  - `METHODS.md` — fixed broken intra-doc-link syntax;
+    journal-tuning cross-reference callout
+    (SyncMode::Barrier / WriteLifetimeHint); new "Probe inputs"
+    section documenting 0.9.x probe evolution.
+  - `PERFORMANCE.md` — Targets table extended with journal
+    append / append_batch / sync_through / reflink targets;
+    tune_for(Workload) presets section; new "0.9.x feature
+    tuning guidance" decision table.
+  - `PLATFORM-NOTES.md` — Linux io_uring elite flags section
+    (0.9.4 setup flags + 0.9.5 REGISTER_FILES + 0.9.6
+    OP_WRITE_FIXED + 0.9.7 SQPOLL); NAWUN probe + OS-version /
+    page-size real probes; macOS F_BARRIERFSYNC + clonefile
+    sections; Windows ReFS FSCTL_DUPLICATE_EXTENTS_TO_FILE
+    section; NEW cross-platform sparse-file primitives section;
+    filesystem caveats table extended with Reflink column +
+    ReFS row.
+  - `README.md` (docs/) — status table covering 0.9.0 → 1.0;
+    map section refreshed.
+- **Per-symbol doc polish** across the highest-leverage public
+  modules: observer.rs (FsysObserver contract sharpened),
+  builder.rs (method + build doc completeness), handle.rs
+  (accessor block expanded), method/mod.rs (5 variants + Auto
+  ladder + is_reserved cleared of stale 0.5.0 framing), error.rs
+  (stale per-variant framings updated), journal/mod.rs (append,
+  append_batch, sync_through gained # Examples), batch.rs
+  (struct-level doctest example), journal/reader.rs + options.rs
+  (open + new accessor improvements), crud/file.rs
+  (Handle::write got the canonical atomic-replace example).
+- **Cargo.toml metadata polish** — sharpened `description` from
+  "Adaptive file and directory IO for Rust" framing to
+  storage-foundation framing; swapped `io` → `journal` in keywords
+  (storage-engine search intent); added `concurrency` to
+  categories. GitHub repo description + topics + homepage URL
+  synced via `gh repo edit`.
+
+### Notes — 0.9.8
+
+- **No public API change.** Programs that compile against 0.9.7
+  compile against 0.9.8 unchanged. The 0.9.x stability practice
+  (every release backward-compatible with the previous) continues
+  through to 1.0.
+- **Bench numbers in `BENCH.md` are deferred to bare-metal Linux
+  release-prep.** Phase 9 verification confirmed the bench
+  infrastructure runs clean (journal-vs-atomic-replace shows the
+  expected 100×+ headline speedup at sync-at-end cadence on
+  Windows NTFS dev hardware) but the canonical numbers require
+  a controlled environment. The 0.9.0 R-1 numbers in `BENCH.md`
+  remain the documented reference; the new "0.9.1–0.9.7 features
+  awaiting numbered results" table catalogues what's pending.
+
 ## [0.9.7] - 2026-05-12
 
 > **Completion + optimization + stabilization.** Every 0.9.6 audit

@@ -61,14 +61,11 @@ fn main() -> fsys::Result<()> {
     // production choice for WAL workloads. On Linux + multi-stream
     // NVMe this clusters journal data into long-lived NAND blocks;
     // elsewhere it's a no-op.
-    let opts = fsys::JournalOptions::new()
-        .write_lifetime_hint(Some(fsys::WriteLifetimeHint::Long));
+    let opts = fsys::JournalOptions::new().write_lifetime_hint(Some(fsys::WriteLifetimeHint::Long));
     let log = fs.journal_with(&path, opts)?;
 
     println!("journal opened with WriteLifetimeHint::Long");
-    println!(
-        "  expected GC write-amplification reduction: 2-5x on Linux + multi-stream NVMe"
-    );
+    println!("  expected GC write-amplification reduction: 2-5x on Linux + multi-stream NVMe");
     println!("  no-op on macOS / Windows / consumer NVMe (silent)");
 
     // Use the journal as you would normally.
