@@ -55,6 +55,51 @@ Linux is the primary perf target. The fastest paths
   `Handle::active_durability_primitive()` returning
   `O_DIRECT + pwrite + fdatasync` instead of `io_uring + …`.
 
+### io_uring elite flags (0.9.4+)
+
+When io_uring is available, fsys runs a one-time
+process-cached probe at handle construction to test which
+elite setup flags the kernel supports:
+
+| Flag | Kernel | Effect |
+|---|---|---|
+| `IORING_SETUP_COOP_TASKRUN` | ≥ 5.19 | Defer completion task work until convenient (reduces IPIs). Pure perf hint. |
+| `IORING_SETUP_SINGLE_ISSUER` | ≥ 6.0 | Kernel-enforced same-task submission. Sync ring only — async substrate disabled because tokio migrates tasks. |
+| `IORING_SETUP_DEFER_TASKRUN` | ≥ 6.1 | Requires `SINGLE_ISSUER`. Sync ring only — needs explicit `io_uring_enter(GETEVENTS)` driving which the async eventfd loop doesn't do. |
+| `IORING_REGISTER_FILES` (0.9.5) | ≥ 5.1 | Pre-register fd-table slots; per-op submissions use `IOSQE_FIXED_FILE`, saving per-SQE kernel-side fd validation. |
+| `IORING_OP_WRITE_FIXED` (0.9.6) | ≥ 5.6 | Pre-register buffer slots; writes against fixed slots avoid per-SQE kernel buffer pinning. Used by the journal Direct-mode flush path. |
+| `IORING_REGISTER_BUFFERS` (0.9.6) | ≥ 5.1 | Companion to `WRITE_FIXED` — registers the `AlignedBuf` slots. |
+| `IORING_SETUP_SQPOLL` (0.9.7, opt-in) | ≥ 5.13 | Kernel-side polling thread drains the SQ without syscalls. Opt-in via `Builder::sqpoll(idle_ms)`. Requires `CAP_SYS_NICE` on kernels < 5.13. |
+
+All flags downgrade gracefully on older kernels; unsupported
+flags are silently omitted and the ring builds with whatever
+the kernel does support.
+
+### NVMe atomic-write unit probe (0.9.4)
+
+`Handle::atomic_write_unit() -> Option<u32>` probes the NVMe
+Identify Namespace command (NAWUN / NAWUPF fields) and returns
+the drive's guaranteed torn-write-free write size, when known.
+Databases on guaranteeing drives can safely skip torn-write
+detection on writes ≤ that size.
+
+The probe runs once at first Direct op via the io_uring
+passthrough path; result is cached for the handle's lifetime.
+Drives that don't expose NAWUN return `None`; non-NVMe storage
+returns `None`.
+
+### OS-version + page-size probes (0.9.6)
+
+- Real OS-version probe via `sysctlbyname` (macOS) /
+  `RtlGetVersion` (Windows) / `uname -r` (Linux). Before 0.9.6
+  these returned `"unknown"` stubs on macOS / Windows.
+- Real page-size probe via `sysconf(_SC_PAGESIZE)` (Unix) /
+  `GetSystemInfo` (Windows). Before 0.9.6 the value was a
+  build-time constant.
+
+Probe results live in `fsys::os::info()` /
+`fsys::hardware::info()`.
+
 ## macOS
 
 ### `Method::Direct` flow
@@ -83,6 +128,40 @@ Filed as F-12 (possibly never).
 `fdatasync(2)` is not available on macOS. `Method::Data`
 transparently falls back to `Method::Sync`'s primitive
 (`F_FULLFSYNC`).
+
+### `SyncMode::Barrier` for journals (0.9.4)
+
+Journal users can opt into `JournalOptions::sync_mode(SyncMode::Barrier)`
+to use Apple's `F_BARRIERFSYNC` instead of `F_FULLFSYNC`. The
+barrier primitive is **10–100× cheaper** than `F_FULLFSYNC` on
+Apple Silicon NVMe because it returns when writes have reached
+the device's volatile cache without waiting for the cache flush
+to media.
+
+**Crash safety contract.** `F_BARRIERFSYNC` is crash-safe **only**
+on PLP-equipped drives (the capacitor backs the cache through
+power loss), **or** under explicit eventual-`SyncMode::Full`-sync
+discipline (a periodic `Full` sync at checkpoint boundaries).
+On non-PLP consumer NVMe without checkpoint discipline, a power
+loss between `Barrier` sync and the next cache flush can lose
+the most recent records.
+
+`SyncMode::Full` (default) is universally crash-safe and remains
+the right choice when in doubt.
+
+### APFS `clonefile(2)` reflink (0.9.6)
+
+`Handle::copy(src, dst)` uses `clonefile(2)` on APFS for instant
+copy-on-write semantics. Multi-GiB file clones drop from seconds
+to microseconds. Falls back to `std::fs::copy` cleanly on:
+- HFS+ (no clonefile support)
+- Cross-volume copies (`EXDEV`)
+- Existing destinations (`EEXIST`)
+- Permission denials (`EACCES`)
+
+The fallback path is observable indirectly via wall-clock time
+on multi-GiB files (clonefile is < 10 ms; fallback scales with
+file size).
 
 ## Windows
 
@@ -116,6 +195,38 @@ Windows has no direct equivalent of `fdatasync`. `Method::Data`
 on Windows uses `FlushFileBuffers` (the Sync primitive) — same
 flush, no metadata-skip optimisation.
 
+### ReFS `FSCTL_DUPLICATE_EXTENTS_TO_FILE` reflink (0.9.6)
+
+`Handle::copy(src, dst)` uses ReFS's reflink semantics via
+`FSCTL_DUPLICATE_EXTENTS_TO_FILE` when both source and
+destination live on the same ReFS volume. Same instant-clone
+behavior as APFS `clonefile` on macOS. Falls back to
+`std::fs::copy` cleanly on:
+- NTFS (no reflink support)
+- Cross-volume copies
+- Permission denials
+- Pre-Windows-Server-2016 systems
+
+The implementation uses raw `DeviceIoControl` against a
+fresh-destination handle with `FILE_SHARE_DELETE`. Verified
+against the FSCTL contract.
+
+## Cross-platform sparse-file primitives (0.9.5)
+
+`Handle::punch_hole(path, offset, len)` and
+`Handle::write_zeros(path, offset, len)` expose cross-platform
+sparse-file APIs:
+
+| Platform | Primitive |
+|---|---|
+| Linux | `fallocate(FALLOC_FL_PUNCH_HOLE | FL_KEEP_SIZE)` for `punch_hole`; `fallocate(FL_ZERO_RANGE)` for `write_zeros` |
+| macOS | `fcntl(F_PUNCHHOLE)` for both |
+| Windows | `FSCTL_SET_ZERO_DATA` for both |
+
+Used as the WAL-trim primitive in databases that give back
+consumed log segments without touching the page cache. All
+three primitives are kernel-atomic.
+
 ## Cross-platform fallback ladder
 
 When a method's primary primitive isn't available, fsys falls
@@ -140,15 +251,17 @@ canonical primitive string for finer-grained observability.
 
 Some filesystems will reject `O_DIRECT` / `FILE_FLAG_NO_BUFFERING`:
 
-| Filesystem | O_DIRECT | NO_BUFFERING | fsys behavior |
-|---|---|---|---|
-| ext4, XFS, btrfs | yes | n/a | Direct path used |
-| tmpfs | NO | n/a | Falls back to Data on Linux |
-| FUSE (most) | NO | n/a | Falls back to Data on Linux |
-| FAT32 | varies | varies | May fall back to Sync |
-| exFAT | varies | varies | May fall back to Sync |
-| NTFS | n/a | yes | Direct path used on Windows |
-| APFS / HFS+ | n/a | n/a (uses F_NOCACHE) | F_NOCACHE used on macOS |
+| Filesystem | O_DIRECT | NO_BUFFERING | Reflink | fsys behavior |
+|---|---|---|---|---|
+| ext4, XFS, btrfs | yes | n/a | varies | Direct path used |
+| tmpfs | NO | n/a | NO | Falls back to Data on Linux |
+| FUSE (most) | NO | n/a | NO | Falls back to Data on Linux |
+| FAT32 | varies | varies | NO | May fall back to Sync; no reflink |
+| exFAT | varies | varies | NO | May fall back to Sync; no reflink |
+| NTFS | n/a | yes | NO | Direct path used on Windows; `copy` falls back to `std::fs::copy` |
+| ReFS | n/a | yes | **YES** (0.9.6) | `copy` uses `FSCTL_DUPLICATE_EXTENTS_TO_FILE` for instant clone |
+| APFS | n/a | n/a (uses F_NOCACHE) | **YES** (0.9.6) | F_NOCACHE used on macOS; `copy` uses `clonefile(2)` for instant clone |
+| HFS+ | n/a | n/a (uses F_NOCACHE) | NO | F_NOCACHE used on macOS; `copy` falls back to `std::fs::copy` |
 
 When in doubt, run a write and check `active_method()` /
 `active_durability_primitive()`.
