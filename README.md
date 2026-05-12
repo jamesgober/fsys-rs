@@ -132,14 +132,14 @@ The read path is essentially `std::fs::read` plus handle bookkeeping &mdash; no 
 
 ```toml
 [dependencies]
-fsys = "0.9.7"
+fsys = "0.9.8"
 ```
 
 With the async layer:
 
 ```toml
 [dependencies]
-fsys = { version = "0.9.7", features = ["async"] }
+fsys = { version = "0.9.8", features = ["async"] }
 ```
 
 ### Cargo features
