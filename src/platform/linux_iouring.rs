@@ -160,7 +160,7 @@ impl IoUringRing {
     ///
     /// Returns [`Error::IoUringSetupFailed`] when ring construction
     /// or owner-thread spawn fails.
-    pub(crate) fn new(queue_depth: u32) -> Result<Self> {
+    pub(crate) fn new(queue_depth: u32, sqpoll_idle_ms: Option<u32>) -> Result<Self> {
         // Probe synchronously. Drop the probe ring before spawning;
         // reconstruction in the owner thread is microsecond-scale,
         // and channel transport of `IoUring` is awkward (it's
@@ -172,8 +172,23 @@ impl IoUringRing {
         // `iouring_features::features()` happens at most once per
         // process; ring construction here just calls
         // `apply(&mut builder)` to set the cached bits.
+        //
+        // 0.9.7 SQPOLL — when the caller opts in via
+        // `Builder::sqpoll(idle_ms)`, enable `IORING_SETUP_SQPOLL`
+        // which spawns a kernel-side polling thread to drain the
+        // submission queue without requiring `io_uring_enter`
+        // syscalls. May fail with `EPERM` on kernels < 5.13 without
+        // `CAP_SYS_NICE`, in sandboxed containers, or under restrictive
+        // SECCOMP. On setup failure we bubble the error up as
+        // `IoUringSetupFailed` — the caller's `iouring_slot` slot
+        // then flips to `Disabled` and the Direct path falls back
+        // to non-SQPOLL pwrite, same contract as for any other
+        // io_uring setup failure.
         let mut probe_builder = io_uring::IoUring::builder();
         super::iouring_features::apply(&mut probe_builder, super::iouring_features::RingMode::Sync);
+        if let Some(idle_ms) = sqpoll_idle_ms {
+            probe_builder.setup_sqpoll(idle_ms);
+        }
         match probe_builder.build(queue_depth) {
             Ok(_probe) => {}
             Err(source) => return Err(Error::IoUringSetupFailed { source }),
@@ -185,7 +200,7 @@ impl IoUringRing {
         let join = thread::Builder::new()
             .name("fsys-iouring".to_string())
             .spawn(move || {
-                owner_loop(queue_depth, rx);
+                owner_loop(queue_depth, rx, sqpoll_idle_ms);
             })
             .map_err(|source| Error::IoUringSetupFailed { source })?;
 
@@ -356,14 +371,21 @@ impl Drop for IoUringRing {
 /// shape triggers the rustc 1.95 `check_mod_deathness` ICE class
 /// (see module docs). Inlining the submit/poll logic per opcode is
 /// the workaround.
-fn owner_loop(queue_depth: u32, rx: Receiver<Op>) {
+fn owner_loop(queue_depth: u32, rx: Receiver<Op>, sqpoll_idle_ms: Option<u32>) {
     // 0.9.4: build with the same elite setup flags the
     // `IoUringRing::new` probe accepted. `iouring_features::apply`
     // reads the process-cached probe result, so this is the same
     // flag set the probe succeeded with — no second kernel probe
     // happens here.
+    // 0.9.7 SQPOLL: re-apply the same SQPOLL toggle the probe in
+    // `IoUringRing::new` succeeded with — the probe ring was
+    // dropped before this thread spawned, so we re-build with
+    // the identical setup here.
     let mut builder = io_uring::IoUring::builder();
     super::iouring_features::apply(&mut builder, super::iouring_features::RingMode::Sync);
+    if let Some(idle_ms) = sqpoll_idle_ms {
+        builder.setup_sqpoll(idle_ms);
+    }
     let mut ring = match builder.build(queue_depth) {
         Ok(r) => r,
         // The probe in `IoUringRing::new` already succeeded; if

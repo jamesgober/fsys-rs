@@ -211,6 +211,17 @@ pub struct Handle {
     /// first Direct-method op.
     #[cfg(target_os = "linux")]
     iouring_queue_depth: u32,
+    /// Linux-only: opt-in `IORING_SETUP_SQPOLL` idle timeout in
+    /// milliseconds, from [`crate::Builder::sqpoll`]. `None` =
+    /// SQPOLL disabled (default; no kernel polling thread).
+    /// `Some(idle_ms)` = enable SQPOLL with the given idle
+    /// timeout. On kernels / environments that reject the setup
+    /// (EPERM on < 5.13 without CAP_SYS_NICE, restricted
+    /// sandboxes), `IoUringRing::new` returns the setup error
+    /// and `iouring_slot` flips to `Disabled` — the Direct path
+    /// then falls back to non-SQPOLL pwrite cleanly.
+    #[cfg(target_os = "linux")]
+    iouring_sqpoll_idle_ms: Option<u32>,
     /// Linux-only: lazy `io_uring` ring slot. `Untried` until the
     /// first Direct op probes; `Active(...)` or `Disabled` for the
     /// rest of this Handle's lifetime.
@@ -257,6 +268,7 @@ impl Handle {
         pipeline: Pipeline,
         pool_config: HandleBufferPoolConfig,
         iouring_queue_depth: u32,
+        iouring_sqpoll_idle_ms: Option<u32>,
         observer: Option<std::sync::Arc<dyn crate::observer::FsysObserver>>,
     ) -> Self {
         Self {
@@ -270,6 +282,8 @@ impl Handle {
             pool_slot: std::sync::OnceLock::new(),
             #[cfg(target_os = "linux")]
             iouring_queue_depth,
+            #[cfg(target_os = "linux")]
+            iouring_sqpoll_idle_ms,
             #[cfg(target_os = "linux")]
             iouring_slot: Mutex::new(IoUringState::Untried),
             #[cfg(target_os = "linux")]
@@ -605,7 +619,7 @@ impl Handle {
             IoUringState::Disabled => return None,
             IoUringState::Untried => {}
         }
-        match IoUringRing::new(self.iouring_queue_depth) {
+        match IoUringRing::new(self.iouring_queue_depth, self.iouring_sqpoll_idle_ms) {
             Ok(ring) => {
                 let arc = Arc::new(ring);
                 *guard = IoUringState::Active(arc.clone());
@@ -1498,6 +1512,7 @@ mod tests {
             default_pool_config(),
             128,
             None,
+            None,
         )
     }
 
@@ -1547,6 +1562,7 @@ mod tests {
             default_pool_config(),
             128,
             None,
+            None,
         );
         assert!(h.use_direct());
         let h2 = make_handle(Method::Sync);
@@ -1578,6 +1594,7 @@ mod tests {
             default_pool_config(),
             128,
             None,
+            None,
         );
         let resolved = h
             .resolve_path(Path::new("subdir/file.txt"))
@@ -1597,6 +1614,7 @@ mod tests {
             Pipeline::new(PipelineConfig::DEFAULT),
             default_pool_config(),
             128,
+            None,
             None,
         );
         let result = h.resolve_path(Path::new("../../etc/passwd"));
@@ -1622,6 +1640,7 @@ mod tests {
             Pipeline::new(PipelineConfig::DEFAULT),
             default_pool_config(),
             128,
+            None,
             None,
         );
         assert_eq!(h.sector_size(), 4096);
