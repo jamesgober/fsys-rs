@@ -1461,6 +1461,200 @@ mod tests {
         assert_eq!(j.next_lsn(), Lsn(29));
     }
 
+    // ─────────────────────────────────────────────────────────
+    // 0.9.7 M-11 — boundary-condition tests
+    //
+    // Audit M-11: existing coverage included min/max log-buffer
+    // sizes and oversize records; missing the single-byte,
+    // exact-sector-size, exact-page-size, and zero-length-batch
+    // boundaries. These tests close those specific gaps with
+    // buffered-mode journals (deterministic, platform-independent,
+    // no Direct-IO alignment requirements).
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn append_one_byte_record_produces_13_byte_frame() {
+        // Smallest non-empty payload: 1 byte. Frame total =
+        // FRAME_OVERHEAD (12) + 1 = 13 bytes. Distinguishes the
+        // 1-byte path from the 0-byte path
+        // (`append_empty_record_writes_framed_marker` covers the
+        // empty case); both must coexist without aliasing.
+        let path = tmp_path("one_byte");
+        let _g = Cleanup(path.clone());
+        let j = JournalHandle::open(&path).expect("open");
+        let lsn = j.append(b"x").expect("append");
+        assert_eq!(lsn.as_u64(), 13, "1-byte payload + 12-byte overhead = 13");
+        assert_eq!(j.next_lsn().as_u64(), 13);
+
+        // Second 1-byte append accumulates correctly.
+        let lsn2 = j.append(b"y").expect("append 2");
+        assert_eq!(lsn2.as_u64(), 26, "two 1-byte frames = 26");
+        j.close().expect("close");
+
+        // Round-trip read confirms both bytes are recoverable.
+        let mut reader = JournalReader::open(&path).expect("reader");
+        let payloads: Vec<Vec<u8>> = reader.iter().map(|r| r.expect("record").payload).collect();
+        assert_eq!(payloads, vec![b"x".to_vec(), b"y".to_vec()]);
+    }
+
+    #[test]
+    fn append_frame_at_exact_4kb_boundary_round_trips() {
+        // Payload sized so the frame total is exactly 4096 bytes
+        // (4 KiB) — the most common page size on Linux/x86_64
+        // and Windows, and the typical NVMe logical-sector size.
+        // A bug at this boundary (off-by-one in framing,
+        // alignment-aware code path falling over at exact-page
+        // size) would manifest here.
+        let payload_len = 4096 - format::FRAME_OVERHEAD;
+        let payload = vec![0xC3u8; payload_len];
+
+        let path = tmp_path("exact_4kb");
+        let _g = Cleanup(path.clone());
+        let j = JournalHandle::open(&path).expect("open");
+        let lsn = j.append(&payload).expect("append");
+        assert_eq!(lsn.as_u64(), 4096, "frame total at exact 4 KiB boundary");
+        j.close().expect("close");
+
+        // Read-back: the payload must come back byte-for-byte.
+        let mut reader = JournalReader::open(&path).expect("reader");
+        let rec = reader
+            .iter()
+            .next()
+            .expect("record present")
+            .expect("decode");
+        assert_eq!(rec.payload.len(), payload_len);
+        assert!(
+            rec.payload.iter().all(|&b| b == 0xC3),
+            "payload content drift at 4 KiB boundary"
+        );
+    }
+
+    #[test]
+    fn append_frame_at_exact_16kb_boundary_round_trips() {
+        // Payload sized so the frame total is exactly 16384
+        // bytes (16 KiB) — Apple Silicon's native page size and
+        // a common large-block boundary on modern NVMe. Catches
+        // any 16-bit-arithmetic edge cases in framing.
+        let payload_len = 16384 - format::FRAME_OVERHEAD;
+        let payload = vec![0x5Au8; payload_len];
+
+        let path = tmp_path("exact_16kb");
+        let _g = Cleanup(path.clone());
+        let j = JournalHandle::open(&path).expect("open");
+        let lsn = j.append(&payload).expect("append");
+        assert_eq!(lsn.as_u64(), 16384, "frame total at exact 16 KiB boundary");
+        j.close().expect("close");
+
+        let mut reader = JournalReader::open(&path).expect("reader");
+        let rec = reader
+            .iter()
+            .next()
+            .expect("record present")
+            .expect("decode");
+        assert_eq!(rec.payload.len(), payload_len);
+        assert!(rec.payload.iter().all(|&b| b == 0x5A));
+    }
+
+    #[test]
+    fn append_frame_at_exact_64kb_boundary_round_trips() {
+        // Payload sized so the frame total is exactly 64 KiB —
+        // the default log-buffer slot size for Direct mode AND
+        // a common alignment unit on modern storage. A buffered-
+        // mode test still exercises the framing layer cleanly
+        // without bringing in Direct-IO requirements.
+        let payload_len = 65536 - format::FRAME_OVERHEAD;
+        let payload = vec![0xA5u8; payload_len];
+
+        let path = tmp_path("exact_64kb");
+        let _g = Cleanup(path.clone());
+        let j = JournalHandle::open(&path).expect("open");
+        let lsn = j.append(&payload).expect("append");
+        assert_eq!(lsn.as_u64(), 65536, "frame total at exact 64 KiB boundary");
+        j.close().expect("close");
+
+        let mut reader = JournalReader::open(&path).expect("reader");
+        let rec = reader
+            .iter()
+            .next()
+            .expect("record present")
+            .expect("decode");
+        assert_eq!(rec.payload.len(), payload_len);
+        assert!(rec.payload.iter().all(|&b| b == 0xA5));
+    }
+
+    #[test]
+    fn append_batch_single_one_byte_record_round_trips() {
+        // Batch path with a single 1-byte record. Distinct from
+        // `append_batch_single_record_matches_append` (which uses
+        // a multi-byte payload) and from
+        // `append_one_byte_record_produces_13_byte_frame` (which
+        // uses the single-record `append` path). Exercises the
+        // batch fast-path on the smallest possible non-empty
+        // record.
+        let path = tmp_path("batch_one_byte");
+        let _g = Cleanup(path.clone());
+        let j = JournalHandle::open(&path).expect("open");
+        let payload: &[u8] = b"\x42";
+        let lsn = j.append_batch(&[payload]).expect("append_batch");
+        assert_eq!(lsn.as_u64(), 13);
+        j.close().expect("close");
+
+        let mut reader = JournalReader::open(&path).expect("reader");
+        let rec = reader.iter().next().expect("present").expect("decode");
+        assert_eq!(rec.payload, vec![0x42]);
+        assert!(reader.iter().next().is_none(), "exactly one record");
+    }
+
+    #[test]
+    fn append_batch_only_empty_records_round_trips() {
+        // Batch of all-empty records: each produces a 12-byte
+        // header-only frame; total advance = N * 12. Exercises
+        // the batch path with zero-payload edge case. Catches
+        // any "must have some payload" assumption in the batch
+        // encoder.
+        let path = tmp_path("batch_empty_records");
+        let _g = Cleanup(path.clone());
+        let j = JournalHandle::open(&path).expect("open");
+        let empties: [&[u8]; 4] = [b"", b"", b"", b""];
+        let lsn = j.append_batch(&empties).expect("append_batch");
+        assert_eq!(lsn.as_u64(), 4 * format::FRAME_OVERHEAD as u64);
+        j.close().expect("close");
+
+        // Read-back: four distinct empty records.
+        let mut reader = JournalReader::open(&path).expect("reader");
+        let payloads: Vec<Vec<u8>> = reader.iter().map(|r| r.expect("decode").payload).collect();
+        assert_eq!(payloads.len(), 4, "all four empty records present");
+        for (i, p) in payloads.iter().enumerate() {
+            assert!(p.is_empty(), "record {i} should be empty");
+        }
+    }
+
+    #[test]
+    fn append_batch_mixed_empty_and_small_records_round_trips() {
+        // Mixed batch — [empty, 1-byte, empty, 1-byte] — exercises
+        // the batch encoder under heterogeneous record sizes
+        // including the empty-record boundary in the middle of
+        // the batch. Each record gets its own frame; LSN
+        // advance is the sum of frame sizes.
+        let path = tmp_path("batch_mixed_empty");
+        let _g = Cleanup(path.clone());
+        let j = JournalHandle::open(&path).expect("open");
+        let mixed: [&[u8]; 4] = [b"", b"a", b"", b"b"];
+        let lsn = j.append_batch(&mixed).expect("append_batch");
+        // Frame sizes: 12 + 13 + 12 + 13 = 50
+        let expected_total =
+            (2 * format::FRAME_OVERHEAD as u64) + (2 * (1 + format::FRAME_OVERHEAD as u64));
+        assert_eq!(lsn.as_u64(), expected_total);
+        j.close().expect("close");
+
+        let mut reader = JournalReader::open(&path).expect("reader");
+        let payloads: Vec<Vec<u8>> = reader.iter().map(|r| r.expect("decode").payload).collect();
+        assert_eq!(
+            payloads,
+            vec![Vec::new(), b"a".to_vec(), Vec::new(), b"b".to_vec()]
+        );
+    }
+
     #[test]
     fn sync_through_zero_is_noop() {
         let path = tmp_path("sync_zero");
