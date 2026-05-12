@@ -1269,6 +1269,124 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────
+    // 0.9.7 — IORING_REGISTER_FILES fd-slot coverage
+    // ─────────────────────────────────────────────────────────
+    //
+    // The sync ring's `FdRegistry` maintains a 16-slot sparse
+    // file table; per-op fds are lazily upgraded via
+    // `register_files_update` on first use and cached for
+    // subsequent submissions. These tests exercise both the
+    // table-allocation path AND the table-full fallback to
+    // raw-fd SQEs.
+    //
+    // Pre-0.9.7 these paths were never directly tested — the
+    // 0.9.5 integration shipped without coverage and the 0.9.6
+    // defensive disable removed them from runtime. The 0.9.7
+    // restoration brings them back with these tests as the
+    // regression guard.
+
+    #[test]
+    fn writes_across_many_distinct_fds_complete_correctly() {
+        // Open 20 distinct files (4 over SLOT_TABLE_SIZE = 16)
+        // and write a unique payload to each. With the slot
+        // registry active, the first 16 fds get
+        // `types::Fixed(slot)` SQEs and the remaining 4 fall
+        // back to `types::Fd(raw)`. With the registry inactive
+        // (the slot-table init disabled), every SQE uses
+        // raw-fd. Either path must produce byte-for-byte
+        // correct writes.
+        let Some(ring) = ring_or_skip() else { return };
+        const N_FDS: usize = 20;
+        const PAYLOAD_LEN: usize = 256;
+
+        let mut paths = Vec::with_capacity(N_FDS);
+        let mut guards = Vec::with_capacity(N_FDS);
+        let mut files = Vec::with_capacity(N_FDS);
+        for i in 0..N_FDS {
+            let path = tmp_path(&format!("manyfds_{i:02}"));
+            guards.push(Cleanup(path.clone()));
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            files.push(f);
+            paths.push(path);
+        }
+
+        for (i, f) in files.iter().enumerate() {
+            let payload = vec![i as u8; PAYLOAD_LEN];
+            let n = ring.write_at(f.as_raw_fd(), &payload, 0).expect("write_at");
+            assert_eq!(n, PAYLOAD_LEN, "fd {i}: short write");
+            ring.fdatasync(f.as_raw_fd()).expect("fdatasync");
+        }
+        drop(files);
+
+        for (i, path) in paths.iter().enumerate() {
+            let bytes = std::fs::read(path).expect("read");
+            assert_eq!(
+                bytes.len(),
+                PAYLOAD_LEN,
+                "fd {i}: wrong file size on read-back"
+            );
+            assert!(
+                bytes.iter().all(|&b| b == i as u8),
+                "fd {i}: content drift — slot/fd mapping bug"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_writes_on_same_fd_round_trip() {
+        // 32 writes on a single fd. With the slot registry
+        // active, the first write should register the fd in
+        // slot 0 and the remaining 31 should hit the cached
+        // slot (no further `register_files_update` syscalls).
+        // With the registry inactive, every write uses raw-fd.
+        // Either path must place every payload at the right
+        // offset with no content aliasing.
+        let Some(ring) = ring_or_skip() else { return };
+        const N_WRITES: usize = 32;
+        const PAYLOAD_LEN: usize = 64;
+
+        let path = tmp_path("slot_cache");
+        let _g = Cleanup(path.clone());
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        std::fs::write(&path, vec![0u8; N_WRITES * PAYLOAD_LEN]).unwrap();
+        let fd = f.as_raw_fd();
+
+        for i in 0..N_WRITES {
+            let payload = vec![(i & 0xFF) as u8; PAYLOAD_LEN];
+            let n = ring
+                .write_at(fd, &payload, (i * PAYLOAD_LEN) as u64)
+                .expect("write_at");
+            assert_eq!(n, PAYLOAD_LEN, "iter {i}: short write");
+        }
+        ring.fdatasync(fd).expect("fdatasync");
+        drop(f);
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), N_WRITES * PAYLOAD_LEN);
+        for i in 0..N_WRITES {
+            let slice = &bytes[i * PAYLOAD_LEN..(i + 1) * PAYLOAD_LEN];
+            let expected = (i & 0xFF) as u8;
+            assert!(
+                slice.iter().all(|&b| b == expected),
+                "iter {i}: content drift (expected {expected}, got {:?}...)",
+                &slice[..4]
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
     // 0.9.4 — Linked write+fsync + NAWUN/NAWUPF parser
     // ─────────────────────────────────────────────────────────
 

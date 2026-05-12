@@ -258,4 +258,162 @@ mod tests {
         })
         .await;
     }
+
+    /// 0.9.7 — `IORING_REGISTER_FILES` fd-slot coverage:
+    /// many-distinct-fds scenario.
+    ///
+    /// Opens N > `SLOT_TABLE_SIZE` (16) distinct files and writes
+    /// a unique payload to each through the async substrate. With
+    /// the slot table active, the first 16 fds get fixed-file
+    /// slots (`types::Fixed(slot)` SQEs); the 17th onwards fall
+    /// back to raw-fd SQEs (`types::Fd(raw)`). With the slot
+    /// table inactive (initial registration failed or disabled),
+    /// every SQE uses the raw-fd path. Either way the write
+    /// semantics must be **identical** — bytes hit the right
+    /// file at the right offset.
+    ///
+    /// This test exists specifically to exercise the fd-slot
+    /// upgrade + table-full fallback paths. Pre-0.9.7 these
+    /// paths were never directly tested — the 0.9.5 integration
+    /// went straight to production and the 0.9.6 follow-up
+    /// disabled them defensively without test coverage. The
+    /// test is the regression guard for any future re-enable
+    /// (or kernel-version interaction surprise).
+    ///
+    /// 20 distinct fds (4 over the slot-table size) — verifies
+    /// both the slot-allocation path AND the fallback path
+    /// within a single test run.
+    #[tokio::test]
+    async fn writes_across_many_distinct_fds_complete_correctly() {
+        with_timeout(async {
+            let Some(ring) = ring_or_skip() else { return };
+            const N_FDS: usize = 20;
+            const PAYLOAD_LEN: usize = 256;
+
+            // Open 20 distinct files. Each gets a unique payload
+            // (the file index, repeated PAYLOAD_LEN times) so we
+            // can verify no cross-contamination at read-back.
+            let mut paths = Vec::with_capacity(N_FDS);
+            let mut guards = Vec::with_capacity(N_FDS);
+            let mut files = Vec::with_capacity(N_FDS);
+            for i in 0..N_FDS {
+                let path = tmp_path(&format!("manyfds_{i:02}"));
+                guards.push(Cleanup(path.clone()));
+                let f = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)
+                    .unwrap();
+                files.push(f);
+                paths.push(path);
+            }
+
+            // Submit one write per fd. Order matters here: this
+            // populates the slot table in registration order
+            // 0..15, then fds 16..19 hit the table-full
+            // fallback path.
+            for (i, f) in files.iter().enumerate() {
+                let payload = vec![i as u8; PAYLOAD_LEN];
+                let n = write_at_native(&ring, f.as_raw_fd(), &payload, 0)
+                    .await
+                    .expect("write_at_native");
+                assert_eq!(n, PAYLOAD_LEN, "fd {i}: short write");
+                fdatasync_native(&ring, f.as_raw_fd())
+                    .await
+                    .expect("fdatasync_native");
+            }
+
+            // Drop the file handles before reading so the writes
+            // are committed and the read path sees a clean
+            // file-system view.
+            drop(files);
+
+            // Verify every file has its expected unique payload.
+            // Any cross-contamination (e.g., wrong slot index
+            // mapped to wrong fd, or a stale slot reused) would
+            // show up here as the wrong byte pattern.
+            for (i, path) in paths.iter().enumerate() {
+                let bytes = std::fs::read(path).expect("read");
+                assert_eq!(
+                    bytes.len(),
+                    PAYLOAD_LEN,
+                    "fd {i}: wrong file size on read-back"
+                );
+                assert!(
+                    bytes.iter().all(|&b| b == i as u8),
+                    "fd {i}: content drift — slot/fd mapping bug"
+                );
+            }
+
+            ring.shutdown().await;
+        })
+        .await;
+    }
+
+    /// 0.9.7 — `IORING_REGISTER_FILES` slot-cache coverage:
+    /// repeated submissions on the same fd must reuse the
+    /// cached slot (no extra `register_files_update` syscall)
+    /// and produce identical write semantics.
+    ///
+    /// We can't directly observe whether a slot was used vs
+    /// raw-fd from outside the kernel, but we CAN verify that
+    /// many submissions on a single fd complete correctly. A
+    /// regression in the slot-cache lookup (e.g., the cache
+    /// returning a stale slot index for a closed/recycled fd)
+    /// would surface as content corruption.
+    #[tokio::test]
+    async fn repeated_writes_on_same_fd_round_trip() {
+        with_timeout(async {
+            let Some(ring) = ring_or_skip() else { return };
+            const N_WRITES: usize = 32;
+            const PAYLOAD_LEN: usize = 64;
+
+            let path = tmp_path("slot_cache");
+            let _g = Cleanup(path.clone());
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            let fd = f.as_raw_fd();
+
+            // Pre-size the file to N_WRITES * PAYLOAD_LEN.
+            std::fs::write(&path, vec![0u8; N_WRITES * PAYLOAD_LEN]).unwrap();
+
+            // 32 writes on the same fd — first write registers the
+            // fd in slot 0 (if active), subsequent writes should
+            // hit the cache. Each write places a distinct payload
+            // at a distinct offset.
+            for i in 0..N_WRITES {
+                let payload = vec![(i & 0xFF) as u8; PAYLOAD_LEN];
+                let n = write_at_native(&ring, fd, &payload, (i * PAYLOAD_LEN) as u64)
+                    .await
+                    .expect("write_at_native");
+                assert_eq!(n, PAYLOAD_LEN, "iter {i}: short write");
+            }
+            fdatasync_native(&ring, fd).await.expect("fdatasync_native");
+            drop(f);
+
+            // Verify every region has its expected payload — no
+            // slot-cache aliasing.
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(bytes.len(), N_WRITES * PAYLOAD_LEN);
+            for i in 0..N_WRITES {
+                let slice = &bytes[i * PAYLOAD_LEN..(i + 1) * PAYLOAD_LEN];
+                let expected = (i & 0xFF) as u8;
+                assert!(
+                    slice.iter().all(|&b| b == expected),
+                    "iter {i}: content drift (expected {expected}, got {:?}...)",
+                    &slice[..4]
+                );
+            }
+
+            ring.shutdown().await;
+        })
+        .await;
+    }
 }
