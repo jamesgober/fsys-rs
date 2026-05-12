@@ -194,7 +194,13 @@ impl JournalHandle {
         let frame = crate::journal::format::encode_frame_owned(&record)?;
         let frame_len = frame.len() as u64;
 
-        let start = self.next_lsn.fetch_add(frame_len, Ordering::AcqRel);
+        // `Release` (0.9.7 M-2 — was `AcqRel`). Same reasoning
+        // as the sync-path equivalent in `journal/mod.rs:604`:
+        // the reservation reads no non-atomic state set up by
+        // a peer appender, so the `Acquire` half is defensive
+        // overhead. The syncer's `Acquire`-load on `next_lsn`
+        // synchronises-with this `Release`.
+        let start = self.next_lsn.fetch_add(frame_len, Ordering::Release);
         let end = start + frame_len;
         let fd = self.file.as_raw_fd();
         let n =
