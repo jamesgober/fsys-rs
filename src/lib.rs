@@ -160,7 +160,7 @@
 //! | Append-only WAL | [`JournalHandle`] | High-throughput durable writes (WAL / ledger / queue). |
 //! | Multi-op transaction | [`Batch`] | Group N writes / deletes / copies under one durability barrier. |
 //! | One-shot helpers | [`mod@quick`] | Single-call file IO without holding a handle. |
-//! | Async layer | [`mod@async_io`] (feature `async`) | Tokio integration; `_async` siblings for every sync method. |
+//! | Async layer | `fsys::async_io` (feature `async`) | Tokio integration; `_async` siblings for every sync method. |
 //! | Telemetry hook | [`observer::FsysObserver`] | Per-op events (append / sync / write / read). |
 //! | Hardware introspection | [`mod@hardware`] | Probe PLP status, atomic-write unit, sector size. |
 //! | Errors | [`Error`] / [`Result`] | 21 variants with stable `FS-XXXXX` codes. |
