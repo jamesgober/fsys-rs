@@ -97,11 +97,11 @@ The following features are **internal** and not part of the stable surface. They
 - **`1.x.0` minor releases**: backward-compatible additions. New `pub fn`, new `pub struct`, new `pub enum` variants (under `#[non_exhaustive]`), new methods on existing types, new optional Cargo features. May bump MSRV (see [§4](#4-msrv-policy)).
 - **`2.0.0` major release**: any change that breaks any of the guarantees in [§1](#1-what-1x-guarantees). Will be announced with a migration guide.
 
-### 2.2 Pre-1.0 (`0.x.y`)
+### 2.2 Pre-1.0 history (`0.x.y`)
 
-Per Cargo's SemVer interpretation, `0.x.y` releases are allowed to break the API at every `0.x` bump. However, **`fsys` has practiced API stability since the `0.9.0` release-candidate**: every release from `0.9.0` through `0.9.8` is backward-compatible with the previous one. The few pre-1.0 lockdowns (`Lsn`/`BatchError` field privatisation at 0.9.6) replaced public fields with stable accessor methods.
+Per Cargo's SemVer interpretation, `0.x.y` releases were allowed to break the API at every `0.x` bump. However, **`fsys` practiced API stability from the `0.9.0` release-candidate onward**: every release from `0.9.0` through `0.9.8` was backward-compatible with the previous one. The two pre-1.0 lockdowns (`Lsn` and `BatchError` field privatisation at 0.9.6) replaced public fields with stable accessor methods — the last shape changes before the `1.0` freeze.
 
-The `1.0.0` tag carries the `0.9.x` surface forward verbatim — no breaking changes between `0.9.8` and `1.0.0`.
+`1.0.0` carries the `0.9.x` surface forward verbatim — no breaking changes between `0.9.8` and `1.0.0`.
 
 ### 2.3 Deprecation policy
 
@@ -161,7 +161,7 @@ The Minimum Supported Rust Version (MSRV) is declared in `Cargo.toml` (`rust-ver
 - **`1.x.y` patch releases never bump MSRV**.
 - **MSRV bumps require a corresponding minor-version bump** even when no other public-API change accompanies the MSRV move.
 
-The current MSRV at `0.9.x` is `1.75`. The 1.0 release inherits this MSRV. Subsequent 1.x bumps will conform to the policy above.
+The `1.0.0` MSRV is `1.75`. Subsequent 1.x bumps will conform to the policy above.
 
 ---
 
@@ -183,7 +183,7 @@ The `#[cfg(...)]` gates around platform-specific code are an implementation deta
 
 ## 6. Migration into `1.0`
 
-Callers already on `0.9.x` need no code changes for `1.0`. The two pre-1.0 lockdowns (Lsn and BatchError field privatisation) shipped at 0.9.6 and have been the public surface ever since.
+Callers already on `0.9.x` need no code changes for `1.0`. The two pre-1.0 lockdowns (`Lsn` and `BatchError` field privatisation) shipped at `0.9.6` and have been the public surface ever since.
 
 Specifically:
 

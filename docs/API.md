@@ -6,15 +6,15 @@
   API DOCS
 </h1>
 
-> **Coverage.** This document describes the public API surface of
-> the `fsys` crate. The API was **frozen at the `0.9.0`
-> release-candidate** — every name and signature documented at
-> 0.9.0 is preserved through the current release. Subsequent
-> minor versions (0.9.1 through 0.9.7) added new public items
-> backward-compatibly; those additions are captured in the
-> [API additions in 0.9.1–0.9.7](#api-additions-in-091097)
-> section. The 1.0 stable tag will carry the current surface
-> forward verbatim under SemVer guarantees.
+> **Coverage.** This document describes the public API surface
+> of the `fsys` crate. The `1.x` line is **API-stable**: every
+> name and signature documented here is preserved across the
+> `1.x` series per the SemVer contract in
+> [`STABILITY-1.0.md`](STABILITY-1.0.md). The original `0.9.0`
+> freeze established the surface; the `0.9.1` – `0.9.x`
+> additions are captured in the
+> [API additions in 0.9.1–0.9.x](#api-additions-in-091097)
+> section, and they all carry forward unchanged into `1.0.0`.
 >
 > If you are reading this against `master`, the rendered docs at
 > [docs.rs/fsys](https://docs.rs/fsys) are the source of truth.
@@ -498,13 +498,42 @@ without allocating.
 
 ### `fsys::path`
 
+The `path` module resolves OS-aware default directories per the
+current [`Mode`] (`Dev` / `Prod`). On Linux this follows XDG Base
+Directory; on macOS it follows `~/Library/...`; on Windows it
+follows `%LOCALAPPDATA%` / `%APPDATA%` / `%TEMP%` etc.
+
+**Ten directory accessors**, each available in two flavours:
+
+| Bare accessor | With suffix | Returns |
+|---|---|---|
+| `data()` | `data_for(s)` | Active data directory (XDG_DATA_HOME / `~/Library/Application Support` / `%LOCALAPPDATA%`). |
+| `bin()` | `bin_for(s)` | Active binary directory. |
+| `config()` | `config_for(s)` | Active configuration directory (XDG_CONFIG_HOME / `~/Library/Preferences` / `%APPDATA%`). |
+| `logs()` | `logs_for(s)` | Active log directory. |
+| `cache()` | `cache_for(s)` | Active cache directory (XDG_CACHE_HOME / `~/Library/Caches` / `%LOCALAPPDATA%\Cache`). |
+| `libs()` | `libs_for(s)` | Active shared-library directory. |
+| `runtime()` | `runtime_for(s)` | Active runtime directory (XDG_RUNTIME_DIR / per-user temp). |
+| `temp()` | `temp_for(s)` | Active temporary directory. |
+| `state()` | `state_for(s)` | Active persistent-state directory (XDG_STATE_HOME). |
+| `locks()` | `locks_for(s)` | Active lock-file directory. |
+
+The `_for(suffix)` variants join the base directory with a
+normalised relative suffix in one call — equivalent to
+`bare().join(normalize(suffix))` but rejects path-traversal
+segments (`..`, absolute paths).
+
+**Other module items:**
+
 | Item | Purpose |
 |---|---|
-| `default_data_dir()` / `default_cache_dir()` / `default_config_dir()` | OS-aware default paths (XDG on Linux, `~/Library/...` on macOS, `%APPDATA%` on Windows). |
 | `normalize(path)` | Collapse `..` / `.` segments without touching the FS. |
 | `sanitize_segment(s)` | Strip nul bytes, leading slashes, etc. from a single path component. |
+| `mode()` | Returns the active [`Mode`] (re-export of `Mode::current()`). |
+| `set()` | Returns the resolved [`PathSet`] for the active mode. |
 
-`Mode::resolve()` consults the environment.
+`Mode::resolve()` consults the environment (the `FSYS_MODE` env
+var, falling back to `Mode::Prod`).
 
 ---
 
@@ -530,26 +559,32 @@ match fs.active_durability_primitive() {
 
 ## Stability + breaking-change policy
 
-- The API surface as documented above is **frozen** at the
-  `0.9.0` release-candidate tag.
-- Cargo SemVer allows minor-bump breaks within `0.x.y`, but
-  the policy from `0.9.0` onward is **freeze and only break
-  for genuine bugs**. The 0.9.0 RC carries the 0.7.0 rename
-  audit forward verbatim and adds the journal substrate as
-  net-new public surface.
-- The `1.0.0` release will guarantee API stability per
-  standard SemVer once real-world testing validates the
-  current shape.
+- The API surface as documented above is **stable for the
+  `1.x` line**. Every `pub` item documented here keeps its
+  current signature and behaviour through `1.x.y`. New items
+  may be added in minor releases (`1.1`, `1.2`, …). Removing
+  or breaking-renaming any item requires a `2.0` bump.
+- `#[non_exhaustive]` enums (notably [`Error`], [`Method`],
+  [`Mode`]) may gain new variants in minor releases —
+  exhaustive matches over them are forbidden by the language,
+  so adding a variant is non-breaking by SemVer rules.
+- The on-disk journal frame format (`v1` wire format) is
+  frozen for `1.x`. Files written by any `1.x` release
+  reopen on any other `1.x` release without migration.
 
-The H.5 audit
-([`.dev/API-AUDIT-0.7.0.md`](../.dev/API-AUDIT-0.7.0.md))
-is the original cleanup pass behind the freeze. Of ~120
-public items reviewed at 0.7.0, the verdicts were ~117 Keep,
-3 Rename, **0 Remove**. The 0.9.0 additions
+The full `1.x` stability contract — including MSRV policy,
+deprecation policy, on-disk format guarantees, and yanked-
+release procedure — lives in
+[`docs/STABILITY-1.0.md`](STABILITY-1.0.md).
+
+The `1.0.0` surface is the cumulative result of the 0.7
+rename audit (~120 items reviewed: 117 Keep, 3 Rename, 0
+Remove), the 0.9.0 journal-substrate additions
 (`JournalHandle`, `JournalReader`, `JournalOptions`,
 `JournalRecord`, `JournalTailState`, `Lsn`, `Advice`,
-`Handle::journal`, `Handle::journal_with`) extend that
-surface without breaking it.
+`Handle::journal`, `Handle::journal_with`), and the 0.9.x
+hardening releases. It enters `1.0` unchanged from the
+`0.9.x` shape.
 
 ### What the freeze does NOT cover
 
@@ -679,10 +714,10 @@ detection — pinned empirically by an exhaustive
 
 ## API changes in 0.9.0
 
-The 0.9.0 release-candidate phase adds the journal substrate
-and the Direct-IO opt-in. No breaking changes vs. the 0.8.0
-alpha freeze; all additions are net-new public types and
-methods.
+The 0.9.0 release added the journal substrate and the Direct-IO
+opt-in, establishing the `1.x`-stable shape. No breaking changes
+vs. the 0.8.0 alpha freeze; all additions were net-new public
+types and methods.
 
 ### Additions (0.9.0)
 
@@ -703,13 +738,14 @@ methods.
 
 ---
 
-## API additions in 0.9.1–0.9.7
+## API additions in 0.9.1–0.9.x
 
-The 0.9.x minor releases added net-new public surface backward-
-compatibly. No removals, no breaking renames, no behavior
-changes to existing items. The two pre-1.0 lockdowns (Lsn and
-BatchError field privatisation) shipped at 0.9.6 with stable
-accessor methods.
+The `0.9.x` minor releases added net-new public surface
+backward-compatibly. No removals, no breaking renames, no
+behaviour changes to existing items. The two pre-1.0 lockdowns
+(`Lsn` and `BatchError` field privatisation) shipped at `0.9.6`
+with stable accessor methods — those are the last shape changes
+before the `1.0` freeze, and they carry into `1.x` unchanged.
 
 ### 0.9.1 — vectored journal append
 
