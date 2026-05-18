@@ -5,6 +5,91 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-05-18
+
+**Capability cache + SPDK eligibility + journal backend abstraction.** The first minor release in the `1.x` line. Every 1.0 public item is preserved unchanged; 1.1.0 is purely additive.
+
+### Highlights
+
+- **System-wide capability cache** at `$XDG_CACHE_HOME/fsys/capabilities.toml` (`%LOCALAPPDATA%\fsys\capabilities.toml` on Windows; overrideable via `FSYS_CACHE_DIR`). Probes expensive system state once, caches it to disk, returns sub-millisecond loads on subsequent runs. Invalidates on fsys-version, kernel-version, schema-version, or 30-day-age changes, or when `FSYS_REPROBE=1` is set.
+- **SPDK eligibility probe** — pure system-state inspection (`/proc/meminfo`, `/sys/bus/pci/devices/`, `/sys/kernel/iommu_groups/`, `CAP_SYS_ADMIN`, core count). Reports six specific [`SpdkSkipReason`] variants for any precondition that fails, so operators see exactly what to fix.
+- **`Method::Spdk`** — runtime-validated kernel-bypass backend selector. Without the `spdk` Cargo feature, returns `Error::FeatureNotEnabled`. With the feature on but the system ineligible, returns `Error::SpdkUnavailable { reason }`. The actual backend implementation lives in the companion `fsys-spdk` crate (scaffold state in 1.1.0; ships in a follow-up).
+- **`JournalBackend` trait + observability surface** — `JournalBackendKind`, `JournalBackendHealth`, `JournalBackendInfo`. Every `JournalHandle` now exposes `backend_kind()` / `backend_health()` / `backend_info()` so ops teams can verify which backend is live without ambiguity.
+- **`Builder::spdk_device` / `spdk_queue_depth` / `spdk_polling_threads` / `spdk_hugepage_size_mb`** — SPDK-specific configuration knobs with sensible HiveDB-class defaults.
+
+### Added
+
+- **`fsys::capability` module.** Public API:
+  - `capabilities() -> &'static Capabilities` — cached snapshot.
+  - `probe_capabilities_fresh() -> Capabilities` — force re-probe, rewriting the cache.
+  - `invalidate_capability_cache() -> io::Result<()>` — delete the cache file.
+  - Types: `Capabilities`, `HardwareSummary`, `IoUringFeature`, `PciAddress`, `SpdkEligibility`, `SpdkSkipReason`.
+- **`fsys::journal::backend` module.** Public API:
+  - `JournalBackend` trait — pluggable backend interface (provisional shape; will be refined when the kernel-path extraction completes).
+  - `JournalBackendKind` enum — `KernelIoUring` / `KernelDirect` / `KernelBuffered` / `Spdk`. `#[non_exhaustive]`.
+  - `JournalBackendHealth` struct — running counters (queue depth, IOPS, p99 latency, failed appends). `#[non_exhaustive]`.
+  - `JournalBackendInfo` struct — selection trail (chosen backend, reason, skipped fallbacks). `#[non_exhaustive]`.
+- **`JournalHandle::backend_kind()`** — returns the current `JournalBackendKind`.
+- **`JournalHandle::backend_health()`** — returns a `JournalBackendHealth` snapshot.
+- **`JournalHandle::backend_info()`** — returns a `JournalBackendInfo` selection trail.
+- **`Method::Spdk` variant** (discriminant 6) — runtime-validated. `Method` is `#[non_exhaustive]`; the addition is non-breaking.
+- **`Error::FeatureNotEnabled { feature: &'static str }`** (code `FS-00022`) — surfaced when a method that requires a Cargo feature flag is selected without it.
+- **`Error::SpdkUnavailable { reason: SpdkSkipReason }`** (code `FS-00023`) — surfaced when `Method::Spdk` is selected with the `spdk` feature on but the host fails the eligibility probe.
+- **`Builder::spdk_device(&str)`** — pin SPDK to a canonical PCI address.
+- **`Builder::spdk_queue_depth(u32)`** — override the per-namespace queue depth (default 256).
+- **`Builder::spdk_polling_threads(usize)`** — override polling-thread count; `0` means use the capability probe's default.
+- **`Builder::spdk_hugepage_size_mb(u64)`** — override the hugepage allocation (default 1024 MiB).
+- **`SpdkConfig` struct** — re-exported from the crate root; carries the SPDK builder configuration.
+- **Cargo feature `spdk`** — gates `Method::Spdk` activation. With the feature off (the default), the variant compiles but selecting it returns `Error::FeatureNotEnabled`. With the feature on, selecting it consults the capability probe.
+- **`docs/SPDK.md`** — system setup guide (hugepages, IOMMU, device binding) + per-`SpdkSkipReason` remediation steps.
+- **`.dev/DECISIONS-1.1.0.md`** — decisions captured during 1.1 design + unresolved decisions tracked for the follow-up sessions.
+
+### Changed
+
+- `Method::is_reserved()` continues to return `false` for `Method::Spdk` — Spdk is **runtime-validated**, not compile-time reserved, so it does not go through the `UnsupportedMethod` path. The dedicated `FeatureNotEnabled` / `SpdkUnavailable` errors carry the specific failure reason.
+- `lib.rs` re-exports now include `Capabilities`, `HardwareSummary`, `IoUringFeature`, `PciAddress`, `SpdkEligibility`, `SpdkSkipReason`, `SpdkConfig`, `JournalBackend`, `JournalBackendHealth`, `JournalBackendInfo`, `JournalBackendKind`. All other re-exports are unchanged.
+
+### Stability contract
+
+**Everything from `1.0.0` is preserved.** No method signatures change. No fields are removed. No error code is reassigned. The on-disk journal frame format (`v1` wire format) is unchanged. Users on `1.0.0` upgrade to `1.1.0` with no source-code changes; users on `1.1.0` cannot downgrade to `1.0.0` if they reference any of the new public items (this is intentional — minor-version-additive items are the normal `1.x` extension shape).
+
+The `JournalBackend` *trait shape itself* is marked **provisional** in 1.1.0. The trait's downstream types (`JournalBackendKind`, `JournalBackendHealth`, `JournalBackendInfo`) and the accessor methods on `JournalHandle` are **stable** 1.x surface — those are what consumers should depend on. The trait method signatures may be refined in 1.2 / 1.3 as additional backends land; we will use the deprecation cycle described in `docs/STABILITY-1.0.md` for any trait change.
+
+### Deferred to follow-up sessions
+
+- **`KernelJournalBackend` extraction.** The existing journal hot path moves behind `Box<dyn JournalBackend>` so the SPDK implementation can plug in at the type level. The refactor is mechanical but touches the load-bearing `JournalHandle` append/sync paths; it is split into its own session to preserve regression discipline against the production emdb workload.
+- **`fsys-spdk` companion crate.** Scaffolded in 1.1.0 (Cargo metadata only); the `SpdkJournalBackend` implementation, SPDK FFI bindings (or `spdk-sys` audit), polling-thread pool, DMA buffer allocator, and crash-safety recovery flow ship in follow-up `1.1.x` releases as the work completes against real Linux + NVMe hardware.
+- **Capability probe deep-probe lazy split.** 1.1.0 runs the light + deep probes together on every fresh probe. The brief specifies splitting them so the deep probe (PCI enumeration, IOMMU groups) only runs when an SPDK-related accessor is read. The optimisation is observable internally and lands when the SPDK backend is the consumer driving it.
+
+### Tests
+
+- 520 unit tests pass on default features.
+- All feature combos green: `--no-default-features`, `--features async`, `--features spdk`, `--features "async spdk"`, `--all-features`.
+- fmt clean.
+- clippy clean (`--all-features --all-targets -- -D warnings`).
+- All 1.0 error-variant tests carry forward unchanged. Six new test functions exercise the FS-00022 / FS-00023 variant codes, Display output, and `source()` behaviour.
+- The capability module ships with 54 dedicated tests covering: PCI address parse / canonical round-trips, IoUringFeature `from_str` round-trips, SpdkSkipReason Display content for every variant, the TOML mini-parser (escapes, comments, arrays, sections, negative integers, malformed inputs returning `None`), cache file round-trips, all five staleness invalidation triggers, corrupt-cache handling, and SPDK eligibility on synthetic sysfs roots covering empty / no-hugepages / no-privileges / insufficient-cores / boundary-threshold cases.
+
+### Breaking changes
+
+**None vs. `1.0.0`.** Every 1.0 public item works identically. New 1.1.0 items are additive.
+
+### Installation
+
+```toml
+[dependencies]
+fsys = "1.1"
+
+# With async layer
+fsys = { version = "1.1", features = ["async"] }
+
+# With SPDK gating wired through (the actual SPDK backend lives in
+# the companion `fsys-spdk` crate, shipping in a follow-up).
+fsys = { version = "1.1", features = ["spdk"] }
+```
+
+MSRV: Rust 1.75 (unchanged from `1.0.0`).
+
 ## [1.0.0] - 2026-05-14
 
 **First stable release.** The `1.x` line is **API-stable and on-disk-format-stable** per the contract in [`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md). Every `pub` item documented in [`docs/API.md`](docs/API.md) joins the SemVer commitment; the on-disk journal frame format (`v1` wire format) is frozen for the `1.x` line.

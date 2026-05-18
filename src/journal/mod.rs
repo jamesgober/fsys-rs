@@ -57,11 +57,13 @@
 //! LSNs are monotonic per-handle. They reset to `Lsn(0)` only
 //! when the underlying file is truncated or recreated.
 
+pub mod backend;
 pub(crate) mod format;
 pub(crate) mod log_buffer;
 pub mod options;
 pub mod reader;
 
+pub use backend::{JournalBackend, JournalBackendHealth, JournalBackendInfo, JournalBackendKind};
 pub use options::{JournalOptions, SyncMode, WriteLifetimeHint};
 pub use reader::{JournalIter, JournalReader, JournalRecord, JournalTailState};
 
@@ -1180,6 +1182,100 @@ impl JournalHandle {
     #[inline]
     pub fn next_lsn(&self) -> Lsn {
         Lsn(self.next_lsn.load(Ordering::Acquire))
+    }
+
+    /// Returns the [`JournalBackendKind`] currently serving this journal
+    /// (1.1.0).
+    ///
+    /// The classification reflects which platform IO primitive is in
+    /// use at the moment of the call:
+    ///
+    /// - [`JournalBackendKind::KernelIoUring`] — Linux + the `async`
+    ///   feature + the native io_uring substrate has been
+    ///   successfully constructed for this journal (typically after
+    ///   the first `append_async` / `sync_through_async` call).
+    /// - [`JournalBackendKind::KernelDirect`] — opened with
+    ///   [`JournalOptions::direct(true)`](JournalOptions::direct).
+    /// - [`JournalBackendKind::KernelBuffered`] — the default
+    ///   buffered path (lock-free `pwrite` + group-commit
+    ///   `fdatasync`).
+    /// - [`JournalBackendKind::Spdk`] — not selectable from
+    ///   [`Handle::journal`](crate::Handle::journal) in 1.1.0; SPDK
+    ///   journals are constructed through the companion `fsys-spdk`
+    ///   crate when it ships.
+    ///
+    /// Ops teams should use this accessor to verify which backend is
+    /// live — without it, a silent fallback (SPDK requested, kernel
+    /// path actually serving) invalidates downstream performance
+    /// expectations.
+    #[must_use]
+    #[inline]
+    pub fn backend_kind(&self) -> JournalBackendKind {
+        #[cfg(all(target_os = "linux", feature = "async"))]
+        {
+            if let Some(Some(_)) = self.native_ring.get() {
+                return JournalBackendKind::KernelIoUring;
+            }
+        }
+        if self.direct {
+            JournalBackendKind::KernelDirect
+        } else {
+            JournalBackendKind::KernelBuffered
+        }
+    }
+
+    /// Returns a snapshot of running health counters for this
+    /// journal (1.1.0).
+    ///
+    /// 1.1.0 ships the public counter shape ([`JournalBackendHealth`])
+    /// and an accessor on every [`JournalHandle`]. The kernel-path
+    /// implementation does not yet populate every counter — the
+    /// counter wiring lands in a follow-up release alongside the
+    /// internal trait extraction. Consumers can read the counters
+    /// today; fields that are not yet wired report `0`.
+    ///
+    /// Polling cost is sub-microsecond — safe to call from a
+    /// per-second health-check loop.
+    #[must_use]
+    #[inline]
+    pub fn backend_health(&self) -> JournalBackendHealth {
+        JournalBackendHealth::empty(self.backend_kind())
+    }
+
+    /// Returns the selection trail describing why this journal's
+    /// backend was chosen (1.1.0).
+    ///
+    /// In 1.1.0 the kernel path is the only available backend, so
+    /// the trail is always single-entry. When SPDK lands in
+    /// `fsys-spdk`, the trail will include both the SPDK path
+    /// (skipped, with reason) and the kernel path (selected).
+    ///
+    /// The [`SystemTime`](std::time::SystemTime) recorded here is
+    /// approximate — it reflects the call site, not the original
+    /// open time. A future refactor will plumb the actual open
+    /// time through; this is documented under "what we explicitly
+    /// don't promise" in `docs/STABILITY-1.0.md` (the field is
+    /// stable; the exact moment it captures is approximate
+    /// enough that operators should rely on the system journal,
+    /// not this field, for incident timelines).
+    #[must_use]
+    pub fn backend_info(&self) -> JournalBackendInfo {
+        let kind = self.backend_kind();
+        let reason = match kind {
+            JournalBackendKind::KernelIoUring => {
+                "Linux io_uring native substrate active for this journal"
+            }
+            JournalBackendKind::KernelDirect => {
+                "Direct-IO mode (JournalOptions::direct(true)) active"
+            }
+            JournalBackendKind::KernelBuffered => {
+                "default buffered-IO mode (lock-free pwrite + group-commit fdatasync)"
+            }
+            JournalBackendKind::Spdk => {
+                "SPDK backend in use (opened via fsys-spdk companion crate)"
+            }
+        };
+        JournalBackendInfo::single(kind, reason)
     }
 
     /// Pre-allocates `len` bytes of disk space for this journal

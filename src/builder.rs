@@ -56,6 +56,55 @@ pub struct Builder {
     /// Linux-only; ignored elsewhere.
     iouring_sqpoll_idle_ms: Option<u32>,
     observer: Option<Arc<dyn FsysObserver>>,
+    /// 1.1.0 — SPDK backend configuration. `None` (default) =
+    /// implicit selection via [`crate::capability::capabilities()`]
+    /// when `Method::Spdk` is chosen. `Some(_)` overrides individual
+    /// SPDK knobs (device, queue depth, polling threads, hugepage
+    /// size). Consumed by the SPDK backend in the `fsys-spdk`
+    /// companion crate; ignored when `Method::Spdk` is not
+    /// selected.
+    spdk: SpdkConfig,
+}
+
+/// SPDK-specific configuration carried by [`Builder`] (1.1.0).
+///
+/// Defaults are sized for HiveDB-class workloads on consumer-NVMe
+/// server hardware. The [`crate::capability::capabilities()`] probe
+/// supplies sensible defaults when no override is set; callers can
+/// override individual knobs via the `Builder::spdk_*` methods.
+#[derive(Debug, Clone)]
+pub struct SpdkConfig {
+    /// PCI device address (canonical `DDDD:BB:DD.F`) — when set,
+    /// pins the SPDK backend to this controller. Unset = the
+    /// `fsys-spdk` crate picks from
+    /// [`crate::capability::Capabilities::spdk_eligible_devices`].
+    pub device: Option<crate::capability::PciAddress>,
+    /// Per-namespace queue depth. `256` matches the
+    /// `Workload::Database` preset and is a sensible default for
+    /// most NVMe drives.
+    pub queue_depth: u32,
+    /// Number of polling threads dedicated to SPDK completion
+    /// processing. `None` (default) = the `fsys-spdk` crate picks
+    /// based on available cores (typically `cores / 4`, clamped
+    /// `[1, 8]`).
+    pub polling_threads: Option<usize>,
+    /// Hugepage allocation size in MiB. `1024` is the recommended
+    /// production floor for sustained workloads. The capability
+    /// probe also reports the *minimum*-viable floor (256 MiB) on
+    /// the [`crate::capability::SpdkSkipReason::HugepagesNotConfigured`]
+    /// variant so operators can size appropriately.
+    pub hugepage_size_mb: u64,
+}
+
+impl Default for SpdkConfig {
+    fn default() -> Self {
+        Self {
+            device: None,
+            queue_depth: 256,
+            polling_threads: None,
+            hugepage_size_mb: 1024,
+        }
+    }
 }
 
 impl Builder {
@@ -72,7 +121,70 @@ impl Builder {
             io_uring_queue_depth: 128,
             iouring_sqpoll_idle_ms: None,
             observer: None,
+            spdk: SpdkConfig::default(),
         }
+    }
+
+    /// Pins the SPDK backend to a specific PCI device address (1.1.0).
+    ///
+    /// Accepts the canonical Linux PCI naming `DDDD:BB:DD.F` (e.g.
+    /// `"0000:81:00.0"`). Returns the builder unchanged when the
+    /// address fails to parse — pass a valid address or do not call
+    /// this method.
+    ///
+    /// Has no effect unless [`Self::method`] is set to
+    /// [`Method::Spdk`] AND the system passes the
+    /// [`crate::capability::SpdkEligibility`] probe.
+    #[must_use]
+    pub fn spdk_device(mut self, pci_addr: &str) -> Self {
+        if let Some(addr) = crate::capability::PciAddress::parse(pci_addr) {
+            self.spdk.device = Some(addr);
+        }
+        self
+    }
+
+    /// Sets the SPDK per-namespace queue depth (1.1.0).
+    ///
+    /// Default: `256`. Realistic range is 64 - 1024; the kernel-bypass
+    /// path's throughput scales linearly with queue depth up to the
+    /// drive's saturation point.
+    ///
+    /// Has no effect unless [`Self::method`] is set to
+    /// [`Method::Spdk`].
+    #[must_use]
+    pub fn spdk_queue_depth(mut self, depth: u32) -> Self {
+        self.spdk.queue_depth = depth;
+        self
+    }
+
+    /// Sets the SPDK polling-thread count (1.1.0).
+    ///
+    /// `n = 0` is treated as "use the
+    /// [`crate::capability::capabilities()`] probe's default"
+    /// (typically `available_cores / 4`, clamped `[1, 8]`).
+    ///
+    /// Has no effect unless [`Self::method`] is set to
+    /// [`Method::Spdk`].
+    #[must_use]
+    pub fn spdk_polling_threads(mut self, n: usize) -> Self {
+        self.spdk.polling_threads = if n == 0 { None } else { Some(n) };
+        self
+    }
+
+    /// Sets the hugepage allocation size in MiB (1.1.0).
+    ///
+    /// Default: `1024` (the recommended production floor).
+    /// Minimum-viable floor: `256` (the SPDK probe's `eligible`
+    /// threshold). Lower values cause the probe to report
+    /// [`crate::capability::SpdkSkipReason::HugepagesNotConfigured`]
+    /// at startup.
+    ///
+    /// Has no effect unless [`Self::method`] is set to
+    /// [`Method::Spdk`].
+    #[must_use]
+    pub fn spdk_hugepage_size_mb(mut self, mb: u64) -> Self {
+        self.spdk.hugepage_size_mb = mb;
+        self
     }
 
     /// Sets the durability method.
@@ -417,6 +529,12 @@ impl Builder {
     ///
     /// - [`Error::UnsupportedMethod`] if a reserved method variant
     ///   ([`Method::Journal`]) was supplied via [`Self::method`].
+    /// - [`Error::FeatureNotEnabled`] (1.1.0) if [`Method::Spdk`] was
+    ///   selected without the `spdk` Cargo feature compiled in.
+    /// - [`Error::SpdkUnavailable`] (1.1.0) if [`Method::Spdk`] was
+    ///   selected with the feature on but the host fails the SPDK
+    ///   eligibility probe (off-Linux, missing hugepages, no NVMe,
+    ///   etc.).
     /// - [`Error::InvalidPath`] if [`Self::root`] was set and the path
     ///   canonicalisation fails (the path must exist and be a directory
     ///   — `Builder::root` does not `mkdir`).
@@ -425,6 +543,38 @@ impl Builder {
             return Err(Error::UnsupportedMethod {
                 method: self.method.as_str(),
             });
+        }
+
+        // 1.1.0 — SPDK gating. `Method::Spdk` is runtime-validated:
+        // the `spdk` Cargo feature must be enabled at compile time AND
+        // the capability probe must report `spdk_eligible = true`.
+        // The actual backend construction lives in the `fsys-spdk`
+        // companion crate; this is the gate that decides whether
+        // forwarding to that crate is even sensible.
+        if self.method == Method::Spdk {
+            #[cfg(not(feature = "spdk"))]
+            {
+                return Err(Error::FeatureNotEnabled { feature: "spdk" });
+            }
+            #[cfg(feature = "spdk")]
+            {
+                let caps = crate::capability::capabilities();
+                if !caps.spdk_eligible {
+                    let reason = caps
+                        .first_spdk_skip_reason()
+                        .cloned()
+                        .unwrap_or(crate::capability::SpdkSkipReason::NotLinux);
+                    return Err(Error::SpdkUnavailable { reason });
+                }
+                // Feature on + eligible — but the `fsys-spdk` companion
+                // crate is in scaffold state in 1.1.0. Surface a clear
+                // error here rather than constructing a half-wired
+                // handle. This branch goes away when the companion
+                // crate ships the real backend.
+                return Err(Error::SpdkUnavailable {
+                    reason: crate::capability::SpdkSkipReason::SpdkLibraryNotFound,
+                });
+            }
         }
 
         let resolved_method = self.method.resolve();
@@ -838,5 +988,102 @@ mod tests {
         let pool = h.buffer_pool().expect("buffer pool");
         assert_eq!(pool.capacity(), 1024);
         assert!(pool.block_size() >= 8192);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 1.1.0 — SPDK builder methods + Method::Spdk gating
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_spdk_config_defaults_match_specification() {
+        let b = Builder::new();
+        assert_eq!(b.spdk.queue_depth, 256);
+        assert!(b.spdk.device.is_none());
+        assert!(b.spdk.polling_threads.is_none());
+        assert_eq!(b.spdk.hugepage_size_mb, 1024);
+    }
+
+    #[test]
+    fn test_spdk_device_accepts_canonical_pci_address() {
+        let b = Builder::new().spdk_device("0000:81:00.0");
+        let addr = b.spdk.device.expect("address parsed");
+        assert_eq!(addr.domain, 0);
+        assert_eq!(addr.bus, 0x81);
+        assert_eq!(addr.device, 0);
+        assert_eq!(addr.function, 0);
+    }
+
+    #[test]
+    fn test_spdk_device_rejects_garbage_silently() {
+        // Per the rustdoc, an unparseable address leaves the field
+        // unchanged so callers can chain the builder fluently.
+        let b = Builder::new().spdk_device("not-a-pci-address");
+        assert!(b.spdk.device.is_none());
+    }
+
+    #[test]
+    fn test_spdk_queue_depth_override() {
+        let b = Builder::new().spdk_queue_depth(512);
+        assert_eq!(b.spdk.queue_depth, 512);
+    }
+
+    #[test]
+    fn test_spdk_polling_threads_zero_means_use_default() {
+        let b = Builder::new().spdk_polling_threads(0);
+        assert!(b.spdk.polling_threads.is_none());
+    }
+
+    #[test]
+    fn test_spdk_polling_threads_nonzero_value_persisted() {
+        let b = Builder::new().spdk_polling_threads(4);
+        assert_eq!(b.spdk.polling_threads, Some(4));
+    }
+
+    #[test]
+    fn test_spdk_hugepage_size_override() {
+        let b = Builder::new().spdk_hugepage_size_mb(2048);
+        assert_eq!(b.spdk.hugepage_size_mb, 2048);
+    }
+
+    #[test]
+    fn test_spdk_builder_methods_chain() {
+        let b = Builder::new()
+            .spdk_device("0000:01:00.0")
+            .spdk_queue_depth(128)
+            .spdk_polling_threads(2)
+            .spdk_hugepage_size_mb(512);
+        assert_eq!(b.spdk.queue_depth, 128);
+        assert_eq!(b.spdk.polling_threads, Some(2));
+        assert_eq!(b.spdk.hugepage_size_mb, 512);
+        assert!(b.spdk.device.is_some());
+    }
+
+    #[test]
+    #[cfg(not(feature = "spdk"))]
+    fn test_build_with_method_spdk_returns_feature_not_enabled_without_feature() {
+        // `Handle` does not implement `Debug` (intentional — it owns
+        // platform-specific resources whose debug representation
+        // would leak internals), so `expect_err` is unavailable and
+        // we destructure the `Result` directly.
+        match Builder::new().method(Method::Spdk).build() {
+            Err(Error::FeatureNotEnabled { feature }) => assert_eq!(feature, "spdk"),
+            Err(other) => panic!("expected FeatureNotEnabled, got {other:?}"),
+            Ok(_) => panic!("expected build to fail without spdk feature"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "spdk")]
+    fn test_build_with_method_spdk_returns_spdk_unavailable_when_feature_on() {
+        // With `spdk` feature on but the `fsys-spdk` companion crate
+        // in scaffold state, the gate produces `SpdkUnavailable` — the
+        // honest "feature wired through but backend not yet shipped"
+        // outcome. Once `fsys-spdk` lands, this test flips to expect
+        // a successful build on eligible hosts.
+        match Builder::new().method(Method::Spdk).build() {
+            Err(Error::SpdkUnavailable { .. }) => {}
+            Err(other) => panic!("expected SpdkUnavailable, got {other:?}"),
+            Ok(_) => panic!("expected build to fail in 1.1.0 with spdk feature on"),
+        }
     }
 }

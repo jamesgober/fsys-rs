@@ -4,7 +4,7 @@
 ######################################################
 [package]
 name    = "fsys"
-version = "1.0.0"
+version = "1.1.0"
 
 # METADATA
 readme  = "README.md"
@@ -131,6 +131,26 @@ tracing = ["dep:tracing"]
 # matrix entry with `--features oom_inject` and the production
 # matrix never sees it.
 oom_inject = []
+# 1.1.0 — SPDK (Storage Performance Development Kit) backend for the
+# journal substrate. Kernel-bypass NVMe access on Linux server
+# workloads with pre-allocated hugepages, IOMMU, and unbound NVMe
+# devices. The backend implementation lives in the companion crate
+# `fsys-spdk` (separate to keep DPDK / C-binding weight off users
+# who don't need it). With this feature OFF, `Method::Spdk` is
+# present in the public enum but selecting it returns
+# `Error::FeatureNotEnabled`. With this feature ON, fsys depends on
+# `fsys-spdk` and the SPDK backend becomes selectable on Linux when
+# the capability probe reports `spdk_eligible = true`.
+#
+# In 1.1.0 the `fsys-spdk` crate is in scaffold state — the feature
+# is wired through the public API surface (capability cache, error
+# variants, `Method::Spdk`, builder methods, observability
+# accessors) so 1.1 consumers can write code against the
+# 1.x-stable interface today, but selecting the backend on Linux
+# will return `Error::SpdkUnavailable` until the implementation
+# lands. The `fsys-spdk` companion crate is published separately;
+# see `docs/SPDK.md` for the setup requirements and rollout.
+spdk = []
 
 
 ###########################
@@ -355,6 +375,20 @@ required-features = ["async"]
 # delivers over the per-write atomic-replace primitive.
 [[bench]]
 name    = "journal_vs_atomic_replace"
+harness = false
+
+# 1.1.0 — Capability cache access latency. Warm-path floor target
+# is well under 1 µs (OnceLock pointer load). Fresh-probe floor is
+# 50-200 ms per the 1.1.0 brief.
+[[bench]]
+name    = "capability_access"
+harness = false
+
+# 1.1.0 — JournalHandle backend observability accessor latency.
+# Health-check-loop callers depend on sub-microsecond cost; this
+# bench catches regressions.
+[[bench]]
+name    = "backend_accessors"
 harness = false
 
 

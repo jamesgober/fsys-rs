@@ -10,6 +10,8 @@ The `1.0.0` release commits the public API to **SemVer-stable**. This document i
 
 This document supersedes the various per-version stability notes scattered across [`API.md`](API.md), `lib.rs`, and the release-note frontmatter. Read it once; it's authoritative.
 
+> **`1.1.0` honoured this contract in full.** The minor release added the `fsys::capability` module, the `fsys::journal::backend` module (`JournalBackend` trait + observability types), `Method::Spdk` (allowed under the existing `#[non_exhaustive]` policy in §1.3), `Error::FeatureNotEnabled` (FS-00022) and `Error::SpdkUnavailable` (FS-00023) (allowed under §1.4), and `Builder::spdk_device` / `spdk_queue_depth` / `spdk_polling_threads` / `spdk_hugepage_size_mb` plus `SpdkConfig`. No 1.0 item changed shape or behaviour. The on-disk journal frame format (`v1` wire format) is unchanged. Users on 1.0.0 upgrade to 1.1.0 with no source-code changes. The `JournalBackend` *trait* shape itself is marked *provisional* (see §3 "What 1.x does not guarantee") — its downstream types and the `JournalHandle` accessors that surface them **are** stable in the 1.x line.
+
 ---
 
 ## What 1.x guarantees

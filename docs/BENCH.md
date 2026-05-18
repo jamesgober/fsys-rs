@@ -21,6 +21,8 @@ cargo bench --bench journal_vs_atomic_replace  # 0.9.0 R-1 (journal substrate)
 cargo bench --bench batch_throughput           # batch dispatcher
 cargo bench --bench concurrent_batches         # multi-shard dispatcher (0.9.3)
 cargo bench --bench solo_vs_batch              # solo vs batched cost
+cargo bench --bench capability_access          # 1.1.0 — capability cache cold/warm
+cargo bench --bench backend_accessors          # 1.1.0 — backend_kind/health/info
 ```
 
 `cargo bench` (no `--bench`) runs the full Criterion suite. Build with `--features async` for the async-substrate benches.
@@ -342,6 +344,37 @@ for each row in this table. Until then, the regression-budget
 infrastructure (per-class baselines, ≤ 5–25% strictness gates
 in [`baselines.json`](../benches/baselines.json)) catches any
 regression even on the older bench shapes.
+
+---
+
+## 1.1.0 — capability cache + backend observability benches
+
+Two new benchmarks track the cost of the 1.1.0 public observability surface.
+
+### `cargo bench --bench capability_access`
+
+Measures three latencies that callers depend on:
+
+| Bench | Floor target | What it measures |
+|---|---|---|
+| `capability_access/capabilities_warm` | well under 1 µs | Steady-state `capabilities()` call after the first; pure `OnceLock` pointer load. |
+| `capability_access/probe_fresh` | 50&ndash;200 ms | `probe_capabilities_fresh()` — full sysfs + procfs walk + TOML serialise + atomic-replace rewrite. |
+| `pci_address/to_canonical` | < 200 ns | `PciAddress::to_canonical()` &mdash; `format!` of four hex fields. |
+| `pci_address/parse_four_segment` | < 200 ns | `PciAddress::parse("0000:1f:03.2")` &mdash; three `split_once` + `from_str_radix` calls. |
+
+These exist primarily to catch regressions; the warm path's < 1 µs floor is what makes per-second health-check polling safe. Any future change that pushes the warm call above ~1 µs is a 1.1.0 contract regression and must be flagged.
+
+### `cargo bench --bench backend_accessors`
+
+Measures the cost of the three `JournalHandle` observability accessors:
+
+| Bench | Floor target | What it measures |
+|---|---|---|
+| `backend_accessors/backend_kind` | well under 50 ns | `JournalHandle::backend_kind()` &mdash; plain field read + cfg-gated `OnceLock::get()` peek. |
+| `backend_accessors/backend_health` | well under 50 ns | `JournalHandle::backend_health()` &mdash; classification + `JournalBackendHealth::empty()` (const fn). |
+| `backend_accessors/backend_info` | < 1 µs | `JournalHandle::backend_info()` &mdash; allocates a `String` for `selection_reason` and captures `SystemTime::now()`. |
+
+The kind + health accessors are sub-50-ns by construction (no allocation, no syscall); the info accessor allocates one short string per call. Per-second monitoring of all three is comfortably under any sensible budget.
 
 ---
 

@@ -54,7 +54,7 @@ fsys::quick::write("/etc/myapp/config.toml", b"value = 42")?;
 let data = fsys::quick::read("/etc/myapp/config.toml")?;
 ```
 
-See [`examples/`](examples/) (17 runnable patterns) and [`docs/EXAMPLES.md`](docs/EXAMPLES.md) for the full catalogue.
+See [`examples/`](examples/) (33 runnable patterns) and [`docs/EXAMPLES.md`](docs/EXAMPLES.md) for the full catalogue.
 
 &nbsp;
 
@@ -68,6 +68,8 @@ See [`examples/`](examples/) (17 runnable patterns) and [`docs/EXAMPLES.md`](doc
 - **Cross-platform reflinks** &mdash; macOS `clonefile(2)` + Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE` give APFS / ReFS instant copy-on-write semantics. Multi-GiB checkpoint clones drop from seconds to microseconds.
 - **Optional async layer** (`async` feature) &mdash; every sync method gets an `_async` sibling. On Linux + `Method::Direct`, async ops submit directly to the per-handle io_uring ring (no `spawn_blocking` thread-pool hop).
 - **Hardware-aware tuning** &mdash; PLP detection, NAWUN/NAWUPF probe (atomic-write unit), `Builder::tune_for(Workload::Database)` preset, runtime CPU-feature detection for hardware CRC-32C.
+- **Capability cache + SPDK gating** *(1.1.0)* &mdash; `fsys::capability::capabilities()` probes the system once (50&ndash;200 ms), caches the result to disk, and returns sub-millisecond loads thereafter. `Method::Spdk` is wired through the public API; the kernel-bypass backend lives in the companion `fsys-spdk` crate.
+- **Journal backend observability** *(1.1.0)* &mdash; every `JournalHandle` exposes `backend_kind()` / `backend_health()` / `backend_info()` so ops teams can verify which IO path is live without ambiguity.
 
 &nbsp;
 
@@ -132,14 +134,14 @@ The read path is essentially `std::fs::read` plus handle bookkeeping &mdash; no 
 
 ```toml
 [dependencies]
-fsys = "1.0"
+fsys = "1.1"
 ```
 
 With the async layer:
 
 ```toml
 [dependencies]
-fsys = { version = "1.0", features = ["async"] }
+fsys = { version = "1.1", features = ["async"] }
 ```
 
 ### Cargo features
@@ -148,6 +150,7 @@ fsys = { version = "1.0", features = ["async"] }
 |---|---|---|---|
 | `async` | off | `tokio` (`rt`, `rt-multi-thread`, `sync`, `macros`) | `_async` siblings for every sync method; async batch via `tokio::sync::oneshot`. |
 | `tracing` | off | `tracing` | Structured spans + events on the write / read / journal hot paths. No-op when subscriber is absent. |
+| `spdk` *(1.1.0)* | off | (companion crate `fsys-spdk`) | Gates `Method::Spdk` activation. With the feature off, the variant compiles but selecting it returns `Error::FeatureNotEnabled`. The actual SPDK backend implementation ships in the `fsys-spdk` companion crate. See [`docs/SPDK.md`](docs/SPDK.md). |
 | `stress` | off | (none) | Switches `tests/stress.rs` from a 60-second validation run to the full 1-hour soak. CI nightly enables this; dev iteration leaves it off. |
 | `fuzz` | off | (none) | Compile-only flag for fuzz instrumentation. Actual targets live in `fuzz/` (cargo-fuzz workspace). |
 
@@ -163,6 +166,7 @@ The full per-version delta lives in [`CHANGELOG.md`](CHANGELOG.md). Headline cap
 
 | Release | Headline |
 |---|---|
+| **1.1.0** | Capability cache + SPDK eligibility surface + JournalBackend trait + observability accessors. New `Method::Spdk` variant runtime-validated through `Builder::build`. `Error::FeatureNotEnabled` (FS-00022) + `Error::SpdkUnavailable` (FS-00023). 100% additive vs. `1.0.0`; on-disk format unchanged. |
 | **1.0.0** | First stable release. SemVer + on-disk-format guarantees apply for the `1.x` line per [`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md). No source-logic changes vs. `0.9.8`. |
 | **0.9.8** | Final pre-1.0 polish: documentation refresh, examples expansion, canonical benchmarks, `STABILITY-1.0.md` commitment doc. |
 | **0.9.7** | GroupCommit wake-stampede fix (atomic `pending_followers`, ~5&times; lock-hold reduction under 100+ followers); `Builder::sqpoll(idle_ms)` opt-in kernel-side submission polling; `IORING_REGISTER_FILES` restored on both rings; OOM-injection test infrastructure; LSN atomic-ordering tightened to `Release`. |
@@ -179,12 +183,13 @@ The full per-version delta lives in [`CHANGELOG.md`](CHANGELOG.md). Headline cap
 ## Documentation
 
 - **API reference**: <https://docs.rs/fsys>
-- **17 runnable examples**: [`docs/EXAMPLES.md`](docs/EXAMPLES.md) &mdash; catalogues every example in [`examples/`](examples/) with a "when to use this pattern" guide.
+- **33 runnable examples**: [`docs/EXAMPLES.md`](docs/EXAMPLES.md) &mdash; catalogues every example in [`examples/`](examples/) with a "when to use this pattern" guide.
 - **Architecture overview**: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - **Method matrix + `Auto` decision ladder**: [`docs/METHODS.md`](docs/METHODS.md)
 - **Performance targets + tuning**: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)
 - **Crash-safety contract per method**: [`docs/CRASH-SAFETY.md`](docs/CRASH-SAFETY.md)
 - **Per-platform behavior + capability requirements**: [`docs/PLATFORM-NOTES.md`](docs/PLATFORM-NOTES.md)
+- **SPDK setup guide** *(1.1.0)*: [`docs/SPDK.md`](docs/SPDK.md) &mdash; hardware requirements, system setup, capability probe, and per-`SpdkSkipReason` remediation steps.
 - **Benchmark methodology + results**: [`docs/BENCH.md`](docs/BENCH.md)
 - **Public-API reference**: [`docs/API.md`](docs/API.md)
 - **Per-version migration deltas**: [`CHANGELOG.md`](CHANGELOG.md)
