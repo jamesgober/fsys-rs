@@ -338,6 +338,43 @@ pub enum Error {
     /// fully drained yet. Treat it as `HandlePoisoned` for
     /// recovery purposes. Construct a fresh handle.
     CompletionDriverDead,
+
+    /// A Cargo feature required to satisfy the request is not
+    /// enabled at compile time.
+    ///
+    /// **Code:** `FS-00022`. Caller action: rebuild the crate with
+    /// the named feature flag, or select an alternative method /
+    /// backend that does not require it. Most commonly emitted when
+    /// the caller selects [`crate::Method::Spdk`] without the
+    /// `spdk` feature compiled in (the SPDK backend lives in the
+    /// companion `fsys-spdk` crate, which is pulled in by the
+    /// feature flag — code paths that name `Method::Spdk` compile
+    /// with the feature off, but selecting that method at runtime
+    /// is rejected here rather than silently falling through to a
+    /// different backend).
+    FeatureNotEnabled {
+        /// The name of the required Cargo feature (e.g. `"spdk"`).
+        feature: &'static str,
+    },
+
+    /// The SPDK kernel-bypass backend was requested but the system
+    /// is not currently configured to host it.
+    ///
+    /// **Code:** `FS-00023`. Caller action: inspect `reason` to
+    /// identify which precondition failed (Linux only, hugepages
+    /// configured, `CAP_SYS_ADMIN` or `uid 0`, NVMe devices present
+    /// and not kernel-bound, IOMMU groups present, sufficient
+    /// cores). Fix the missing precondition (typically a sysadmin-
+    /// level operation — allocate hugepages, rebind an NVMe device
+    /// to `vfio-pci` / `uio_pci_generic`, enable IOMMU in the
+    /// kernel command line), or fall back to a kernel-path method.
+    /// The capability probe runs at startup and caches its result
+    /// to disk; setting `FSYS_REPROBE=1` forces a re-probe on the
+    /// next process start after configuration changes.
+    SpdkUnavailable {
+        /// Which precondition failed.
+        reason: crate::capability::SpdkSkipReason,
+    },
 }
 
 impl Error {
@@ -379,6 +416,8 @@ impl Error {
             Error::HandlePoisoned { .. } => "FS-00019",
             Error::IoUringSubmitFailed { .. } => "FS-00020",
             Error::CompletionDriverDead => "FS-00021",
+            Error::FeatureNotEnabled { .. } => "FS-00022",
+            Error::SpdkUnavailable { .. } => "FS-00023",
         }
     }
 }
@@ -506,6 +545,17 @@ impl fmt::Display for Error {
                     self.code()
                 )
             }
+            Error::FeatureNotEnabled { feature } => {
+                write!(
+                    f,
+                    "[{}] required Cargo feature '{}' is not enabled in this build",
+                    self.code(),
+                    feature
+                )
+            }
+            Error::SpdkUnavailable { reason } => {
+                write!(f, "[{}] SPDK backend unavailable: {}", self.code(), reason)
+            }
         }
     }
 }
@@ -533,7 +583,9 @@ impl std::error::Error for Error {
             | Error::GlobPatternInvalid { .. }
             | Error::HandlePoisoned { .. }
             | Error::IoUringSubmitFailed { .. }
-            | Error::CompletionDriverDead => None,
+            | Error::CompletionDriverDead
+            | Error::FeatureNotEnabled { .. }
+            | Error::SpdkUnavailable { .. } => None,
         }
     }
 }
@@ -1193,6 +1245,57 @@ mod tests {
     #[test]
     fn test_error_source_completion_driver_dead_returns_none() {
         let err = Error::CompletionDriverDead;
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    // ── 1.1.0 additions ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_error_code_feature_not_enabled_returns_fs00022() {
+        let err = Error::FeatureNotEnabled { feature: "spdk" };
+        assert_eq!(err.code(), "FS-00022");
+    }
+
+    #[test]
+    fn test_error_display_feature_not_enabled_includes_feature_name() {
+        let err = Error::FeatureNotEnabled { feature: "spdk" };
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00022]"));
+        assert!(s.contains("'spdk'"));
+        assert!(s.to_ascii_lowercase().contains("feature"));
+    }
+
+    #[test]
+    fn test_error_source_feature_not_enabled_returns_none() {
+        let err = Error::FeatureNotEnabled { feature: "test" };
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_error_code_spdk_unavailable_returns_fs00023() {
+        let err = Error::SpdkUnavailable {
+            reason: crate::capability::SpdkSkipReason::NotLinux,
+        };
+        assert_eq!(err.code(), "FS-00023");
+    }
+
+    #[test]
+    fn test_error_display_spdk_unavailable_includes_reason_text() {
+        let err = Error::SpdkUnavailable {
+            reason: crate::capability::SpdkSkipReason::NotLinux,
+        };
+        let s = err.to_string();
+        assert!(s.starts_with("[FS-00023]"));
+        assert!(s.to_ascii_lowercase().contains("spdk"));
+        // SpdkSkipReason::Display must produce non-empty user-facing text.
+        assert!(s.to_ascii_lowercase().contains("linux"));
+    }
+
+    #[test]
+    fn test_error_source_spdk_unavailable_returns_none() {
+        let err = Error::SpdkUnavailable {
+            reason: crate::capability::SpdkSkipReason::NotLinux,
+        };
         assert!(std::error::Error::source(&err).is_none());
     }
 }

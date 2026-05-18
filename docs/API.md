@@ -871,6 +871,131 @@ in healthy shape for alpha freeze.
 
 ---
 
+## API additions in 1.1.0
+
+The first minor release of the `1.x` line. Every 1.0 public item
+works identically; 1.1.0 is purely additive.
+
+### Capability cache + SPDK eligibility surface
+
+A new module — `fsys::capability` — probes expensive system state
+once at first use, caches the result to disk, and serves
+sub-millisecond loads on subsequent process starts.
+
+- `fn fsys::capability::capabilities() -> &'static Capabilities` —
+  cached snapshot. First call runs the full probe (50–200 ms);
+  subsequent calls return a borrowed reference (sub-microsecond).
+- `fn fsys::capability::probe_capabilities_fresh() -> Capabilities` —
+  forces a re-probe, rewrites the cache file. Does **not** update
+  the process-wide `OnceLock`.
+- `fn fsys::capability::invalidate_capability_cache() -> io::Result<()>` —
+  deletes the cache file so the next process re-probes.
+- `pub struct Capabilities` — `#[non_exhaustive]`. Carries every
+  field 1.1.0 backend selection depends on (io_uring availability +
+  feature flags, NVMe passthrough, Direct-IO, PLP detection, SPDK
+  eligibility + skip reasons + eligible device list, and a
+  `HardwareSummary` for tuning hints). Schema version 1; format
+  documented at the top of [`docs/SPDK.md`](SPDK.md).
+- `pub struct HardwareSummary` — `#[non_exhaustive]`. Subset of
+  `HardwareInfo` carried inline on `Capabilities`.
+- `pub struct PciAddress { domain: u16, bus: u8, device: u8, function: u8 }`
+  — canonical `DDDD:BB:DD.F` form via `to_canonical()`,
+  parse via `PciAddress::parse(&str) -> Option<Self>`.
+- `pub enum IoUringFeature` — `#[non_exhaustive]`. Variants:
+  `FastPoll`, `RegisterBuffers`, `RegisterFiles`, `UringCmd`,
+  `SubmitAll`, `CoopTaskrun`, `SingleIssuer`, `DeferTaskrun`,
+  `SqPoll`. `as_str()` + `from_str_canonical()` round-trip.
+- `pub struct SpdkEligibility { eligible: bool, reasons_failed:
+  Vec<SpdkSkipReason>, eligible_devices: Vec<PciAddress> }`.
+- `pub enum SpdkSkipReason` — `#[non_exhaustive]`. Variants:
+  `NotLinux`, `HugepagesNotConfigured { current_mb, recommended_mb }`,
+  `InsufficientPrivileges`, `NoNvmeDevices`,
+  `AllDevicesInUse { devices }`, `IommuNotConfigured`,
+  `InsufficientCores { available, recommended }`,
+  `SpdkLibraryNotFound`. Each variant's `Display` is the operator-
+  facing explanation.
+- Cache file location: `$XDG_CACHE_HOME/fsys/capabilities.toml`
+  (Linux/macOS), `%LOCALAPPDATA%\fsys\capabilities.toml`
+  (Windows), or override via `FSYS_CACHE_DIR`. Force re-probing
+  with `FSYS_REPROBE=1`.
+
+### `Method::Spdk` variant + gating errors
+
+- New variant `Method::Spdk` (discriminant 6). The `Method` enum
+  is `#[non_exhaustive]` since 1.0.0, so the addition is
+  non-breaking. **Selectability is runtime-validated** — see the
+  variant's rustdoc for the three gates (Cargo feature, OS,
+  capability probe).
+- New error `Error::FeatureNotEnabled { feature: &'static str }`
+  with stable code **FS-00022**. Returned by `Builder::build` when
+  `Method::Spdk` is selected without the `spdk` Cargo feature.
+- New error `Error::SpdkUnavailable { reason: SpdkSkipReason }`
+  with stable code **FS-00023**. Returned by `Builder::build` when
+  `Method::Spdk` is selected, the `spdk` feature is on, but the
+  host fails the capability probe.
+
+### Journal backend observability surface
+
+A new module — `fsys::journal::backend` — defines the trait + types
+the SPDK backend (and any future backend) plugs into.
+
+- `pub trait JournalBackend: Send + Sync` — provisional trait shape
+  (see [`docs/STABILITY-1.0.md`](STABILITY-1.0.md)). The trait's
+  downstream types **are** stable in the 1.x line.
+- `pub enum JournalBackendKind` — `#[non_exhaustive]`. Variants:
+  `KernelIoUring`, `KernelDirect`, `KernelBuffered`, `Spdk`.
+  `as_str()` returns the canonical lowercase identifier;
+  `is_kernel()` discriminates the kernel-path tier.
+- `pub struct JournalBackendHealth` — `#[non_exhaustive]`. Running
+  counter snapshot (queue depth, IOPS, p99 latency, failed
+  appends). `JournalBackendHealth::empty(kind)` is a `const fn`
+  for backends that haven't wired their counters yet.
+- `pub struct JournalBackendInfo` — `#[non_exhaustive]`. Selection
+  trail (chosen backend + reason + skipped fallbacks +
+  `opened_at: SystemTime`). `JournalBackendInfo::single(kind, reason)`
+  constructor for the no-fallback-trail case.
+- `fn JournalHandle::backend_kind(&self) -> JournalBackendKind` —
+  current backend identity. `#[inline]`; sub-50-ns.
+- `fn JournalHandle::backend_health(&self) -> JournalBackendHealth` —
+  running counter snapshot. `#[inline]`; sub-50-ns.
+- `fn JournalHandle::backend_info(&self) -> JournalBackendInfo` —
+  selection trail. Sub-microsecond (allocates the reason string).
+
+### Builder SPDK configuration
+
+- `fn Builder::spdk_device(&str) -> Self` — pin SPDK to a
+  canonical PCI address. Unparseable addresses leave the field
+  unchanged (fluent-builder safety).
+- `fn Builder::spdk_queue_depth(u32) -> Self` — override the
+  per-namespace queue depth (default 256).
+- `fn Builder::spdk_polling_threads(usize) -> Self` — override
+  polling-thread count. `0` means "use the capability probe's
+  default."
+- `fn Builder::spdk_hugepage_size_mb(u64) -> Self` — override the
+  hugepage allocation (default 1024 MiB; minimum-viable floor 256
+  MiB).
+- `pub struct SpdkConfig` — re-exported from the crate root;
+  carries the four SPDK configuration knobs.
+
+### Cargo features
+
+- New feature `spdk` (default off). Gates `Method::Spdk`
+  activation. With the feature off, the variant compiles but
+  selecting it returns `Error::FeatureNotEnabled`. With the feature
+  on, selecting it consults the capability probe and returns
+  `Error::SpdkUnavailable` until the `fsys-spdk` companion crate
+  ships the real backend implementation.
+
+### Not changed
+
+- Every 1.0 public item works identically.
+- The on-disk journal frame format (`v1` wire format) is unchanged.
+- MSRV remains Rust 1.75.
+- No method signature changes, no removals, no behaviour changes
+  on the journal hot path.
+
+---
+
 ## See also
 
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — internal

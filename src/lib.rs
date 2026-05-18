@@ -202,6 +202,7 @@ pub mod advice;
 pub mod batch;
 pub(crate) mod buffer;
 pub mod builder;
+pub mod capability;
 pub mod crud;
 pub mod error;
 pub mod handle;
@@ -309,11 +310,15 @@ pub mod __fuzz {
 
 pub use crate::advice::Advice;
 pub use crate::batch::Batch;
-pub use crate::builder::{Builder, Workload};
+pub use crate::builder::{Builder, SpdkConfig, Workload};
+pub use crate::capability::{
+    Capabilities, HardwareSummary, IoUringFeature, PciAddress, SpdkEligibility, SpdkSkipReason,
+};
 pub use crate::error::{BatchError, Error, Result};
 pub use crate::handle::Handle;
 pub use crate::journal::{
-    JournalHandle, JournalOptions, JournalReader, JournalRecord, JournalTailState, Lsn, SyncMode,
+    JournalBackend, JournalBackendHealth, JournalBackendInfo, JournalBackendKind, JournalHandle,
+    JournalOptions, JournalReader, JournalRecord, JournalTailState, Lsn, SyncMode,
     WriteLifetimeHint,
 };
 pub use crate::meta::{DirEntry, FileMeta, Permissions};

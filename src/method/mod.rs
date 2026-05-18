@@ -37,10 +37,17 @@ use std::fmt;
 /// Durability strategy for file IO operations.
 ///
 /// The variant controls which OS synchronisation primitive is invoked
-/// after every write. Five variants ship: `Sync`, `Data`, `Mmap`,
-/// `Direct`, and the hardware-aware `Auto`. `Journal` is a reserved
-/// forward-compatibility placeholder — for append-only / WAL workloads,
-/// use the [`JournalHandle`](crate::JournalHandle) substrate instead.
+/// after every write. Five variants ship today as default-feature
+/// backends: `Sync`, `Data`, `Mmap`, `Direct`, and the hardware-aware
+/// `Auto`. `Journal` is a reserved forward-compatibility placeholder —
+/// for append-only / WAL workloads, use the
+/// [`JournalHandle`](crate::JournalHandle) substrate instead. `Spdk`
+/// (1.1.0) selects the kernel-bypass SPDK backend on Linux when the
+/// `spdk` Cargo feature is enabled and the system passes the
+/// [`crate::capability::SpdkEligibility`] probe; otherwise selecting
+/// it returns [`Error::FeatureNotEnabled`](crate::Error::FeatureNotEnabled)
+/// or [`Error::SpdkUnavailable`](crate::Error::SpdkUnavailable)
+/// respectively.
 ///
 /// The enum is `#[non_exhaustive]` so the library can add new variants
 /// in patch releases without breaking external `match` arms (callers
@@ -204,6 +211,46 @@ pub enum Method {
     /// drives, skip torn-write detection on NAWUN-guaranteeing
     /// drives) rather than auto-resolution.
     Auto = 5,
+
+    /// Kernel-bypass SPDK backend (1.1.0).
+    ///
+    /// Selects the SPDK (Storage Performance Development Kit) backend
+    /// for the journal substrate on Linux server hardware. SPDK talks
+    /// directly to NVMe devices from user-space — no syscalls, no
+    /// kernel block layer, no interrupt-driven completion — delivering
+    /// 2-3× lower commit latency and 2-4× higher IOPS than the
+    /// kernel + io_uring path for WAL workloads.
+    ///
+    /// **Selectability has three gates that must all pass:**
+    ///
+    /// 1. The `spdk` Cargo feature must be enabled at compile time.
+    ///    Without it, selecting this variant returns
+    ///    [`Error::FeatureNotEnabled`](crate::Error::FeatureNotEnabled)
+    ///    from [`Builder::build`](crate::Builder::build).
+    /// 2. The host platform must be Linux. On macOS / Windows /
+    ///    other platforms, selecting this variant returns
+    ///    [`Error::SpdkUnavailable`](crate::Error::SpdkUnavailable)
+    ///    with reason
+    ///    [`SpdkSkipReason::NotLinux`](crate::capability::SpdkSkipReason::NotLinux).
+    /// 3. The system must pass the
+    ///    [`crate::capability::SpdkEligibility`] probe — hugepages
+    ///    configured, `CAP_SYS_ADMIN` / `uid 0`, at least one NVMe
+    ///    device not exclusively bound to the kernel `nvme` driver,
+    ///    IOMMU groups present, and at least four cores available.
+    ///    When any precondition fails, selecting this variant
+    ///    returns
+    ///    [`Error::SpdkUnavailable`](crate::Error::SpdkUnavailable)
+    ///    with the specific
+    ///    [`SpdkSkipReason`](crate::capability::SpdkSkipReason).
+    ///
+    /// The actual SPDK backend implementation lives in the companion
+    /// `fsys-spdk` crate. Setup requirements (hugepage allocation,
+    /// device binding, IOMMU enablement) are documented in
+    /// [`docs/SPDK.md`](https://github.com/jamesgober/fsys-rs/blob/main/docs/SPDK.md).
+    ///
+    /// See [`Method::Auto`] for how SPDK enters the auto-resolution
+    /// ladder when the feature is enabled and the system is eligible.
+    Spdk = 6,
 }
 
 impl Method {
@@ -228,6 +275,7 @@ impl Method {
             3 => Method::Mmap,
             4 => Method::Journal,
             5 => Method::Auto,
+            6 => Method::Spdk,
             _ => Method::Sync,
         }
     }
@@ -280,6 +328,7 @@ impl Method {
             Method::Mmap => "mmap",
             Method::Journal => "journal",
             Method::Auto => "auto",
+            Method::Spdk => "spdk",
         }
     }
 }
@@ -315,6 +364,7 @@ mod tests {
             Method::Mmap,
             Method::Journal,
             Method::Auto,
+            Method::Spdk,
         ] {
             assert_eq!(m.to_string(), m.as_str());
         }
@@ -329,6 +379,7 @@ mod tests {
             Method::Mmap,
             Method::Journal,
             Method::Auto,
+            Method::Spdk,
         ] {
             assert_eq!(Method::from_u8(m.to_u8()), m);
         }
@@ -342,8 +393,12 @@ mod tests {
     #[test]
     fn test_method_is_reserved_true_for_journal_only() {
         // 0.5.0: Mmap is no longer reserved.
+        // 1.1.0: Spdk is runtime-validated (feature flag + capability
+        //        probe), NOT compile-time reserved. `is_reserved` stays
+        //        false for `Spdk`; the gating lives in `Builder::build`.
         assert!(Method::Journal.is_reserved());
         assert!(!Method::Mmap.is_reserved());
+        assert!(!Method::Spdk.is_reserved());
     }
 
     #[test]
@@ -354,6 +409,7 @@ mod tests {
             Method::Direct,
             Method::Mmap,
             Method::Auto,
+            Method::Spdk,
         ] {
             assert!(!m.is_reserved(), "{} should not be reserved", m);
         }
@@ -365,6 +421,22 @@ mod tests {
         assert_eq!(Method::Data.resolve(), Method::Data);
         assert_eq!(Method::Direct.resolve(), Method::Direct);
         assert_eq!(Method::Mmap.resolve(), Method::Mmap);
+        // Spdk resolves to itself — Builder::build is responsible for
+        // gating (feature flag + capability probe). `resolve` is the
+        // "Auto → concrete" hook only.
+        assert_eq!(Method::Spdk.resolve(), Method::Spdk);
+    }
+
+    #[test]
+    fn test_method_spdk_discriminant_is_six() {
+        assert_eq!(Method::Spdk.to_u8(), 6);
+        assert_eq!(Method::from_u8(6), Method::Spdk);
+    }
+
+    #[test]
+    fn test_method_spdk_as_str_is_spdk() {
+        assert_eq!(Method::Spdk.as_str(), "spdk");
+        assert_eq!(Method::Spdk.to_string(), "spdk");
     }
 
     #[test]

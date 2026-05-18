@@ -6,7 +6,7 @@
   EXAMPLES
 </h1>
 
-The [`examples/`](../examples/) directory contains **29 runnable examples** covering every part of the public API. Each example is self-contained, comment-documented, and produces visible output so you can confirm the path you exercised. Examples 18–29 cover the 0.9.1–0.9.7 surface additions added in the 0.9.8 polish release.
+The [`examples/`](../examples/) directory contains **33 runnable examples** covering every part of the public API. Each example is self-contained, comment-documented, and produces visible output so you can confirm the path you exercised. Examples 18–29 cover the 0.9.1–0.9.7 surface additions added in the 0.9.8 polish release; examples 30–33 cover the 1.1.0 capability cache + journal backend observability + SPDK gating surface.
 
 ## Running
 
@@ -47,6 +47,12 @@ cargo run --example 26_plp_aware_skip_fsync
 cargo run --example 27_atomic_write_unit
 cargo run --example 28_write_lifetime_hint
 cargo run --example 29_reflink_aware_copy
+
+# 1.1.0 capability cache + journal backend observability + SPDK gating
+cargo run --example 30_capability_probe
+cargo run --example 31_capability_cache_lifecycle
+cargo run --example 32_journal_backend_info
+cargo run --example 33_method_spdk_gating
 ```
 
 For release-mode timings (closer to production), append `--release`. The dev profile is fine for "does it work?" validation; benches in [`benches/`](../benches/) are the right tool for actual perf numbers.
@@ -147,11 +153,21 @@ For release-mode timings (closer to production), append `--release`. The dev pro
 | **21** | [`21_punch_hole_wal_trim.rs`](../examples/21_punch_hole_wal_trim.rs) | `Handle::punch_hole` / `write_zeros` — cross-platform sparse-file primitives | Database WAL trim post-checkpoint; log compaction; sparse file production. *(0.9.5)* |
 | **29** | [`29_reflink_aware_copy.rs`](../examples/29_reflink_aware_copy.rs) | `Handle::copy` — instant CoW reflinks on APFS (clonefile) and ReFS (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`); silent fallback to bytewise elsewhere | Database checkpoint clones, container layering, backup tooling on APFS / ReFS. *(0.9.6)* |
 
+### Capability cache + backend observability + SPDK gating (1.1.0)
+
+| # | Example | What it shows | When to use this pattern |
+|---|---|---|---|
+| **30** | [`30_capability_probe.rs`](../examples/30_capability_probe.rs) | `fsys::capability::capabilities()` — full cached snapshot of io_uring features, NVMe passthrough, PLP, SPDK eligibility, and hardware tuning hints | Diagnostic / startup logging — confirm which backend tier the host can host. *(1.1.0)* |
+| **31** | [`31_capability_cache_lifecycle.rs`](../examples/31_capability_cache_lifecycle.rs) | `capabilities()` (cached) vs `probe_capabilities_fresh()` (forced re-probe) vs `invalidate_capability_cache()` — full cache lifecycle with timing delta | Ops tooling that needs to force re-probing after system reconfiguration (hugepages allocated, IOMMU enabled, device rebound). *(1.1.0)* |
+| **32** | [`32_journal_backend_info.rs`](../examples/32_journal_backend_info.rs) | `JournalHandle::backend_kind()` / `backend_health()` / `backend_info()` — the three observability accessors for verifying which IO path is live on every journal | Production journals — verify SPDK didn't silently fall through to the kernel path; expose counters to monitoring agents. *(1.1.0)* |
+| **33** | [`33_method_spdk_gating.rs`](../examples/33_method_spdk_gating.rs) | `Method::Spdk` runtime gate — observes `Error::FeatureNotEnabled` (compile-time gate) and `Error::SpdkUnavailable { reason }` (capability-probe gate) | Diagnostic tooling — surface the specific reason SPDK isn't selectable on a host so operators can fix the precondition. *(1.1.0)* |
+
 ## What's deliberately not included
 
 - **`Method::Journal`** — reserved variant; selecting it returns `Error::UnsupportedMethod`. No example because there's no behaviour to demonstrate. For append-only workloads, use the [journal substrate](../examples/17_journal_basics.rs) instead.
-- **A single "kitchen-sink" example** — reading 29 small focused examples is more useful than one large example that buries the concept under setup. If you want to see how the pieces fit together end-to-end, read `02_handle_basics.rs` then the one for the specific feature you need.
+- **A single "kitchen-sink" example** — reading 33 small focused examples is more useful than one large example that buries the concept under setup. If you want to see how the pieces fit together end-to-end, read `02_handle_basics.rs` then the one for the specific feature you need.
 - **Linux btrfs / XFS reflink** — `29_reflink_aware_copy.rs` demonstrates the fast-path on APFS / ReFS; the Linux equivalent (`ioctl_ficlone` / `copy_file_range`) is not yet wired into `Handle::copy`. Tracked for a future release.
+- **An end-to-end SPDK append demo** — the `fsys-spdk` companion crate is in scaffold state in 1.1.0; example 33 demonstrates the gating but cannot demonstrate a successful SPDK handle build until the backend implementation ships in a follow-up `1.1.x` release.
 
 ## See also
 
