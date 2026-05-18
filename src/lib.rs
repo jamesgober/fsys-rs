@@ -169,8 +169,9 @@
 //!
 //! Per-version deltas live in
 //! [`CHANGELOG.md`](https://github.com/jamesgober/fsys-rs/blob/main/CHANGELOG.md).
-//! 0.9.x is the release-candidate series for 1.0; the public API is the
-//! 1.0 target shape with additive enhancements between minor versions.
+//! `1.0.0` is the first stable release; the `1.x` line is API-stable
+//! and on-disk-format-stable per the contract in
+//! [`docs/STABILITY-1.0.md`](https://github.com/jamesgober/fsys-rs/blob/main/docs/STABILITY-1.0.md).
 
 // 0.9.6 audit H-12 — `html_root_url` was previously pinned to a
 // specific version string that drifted every release. docs.rs

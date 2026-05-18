@@ -132,14 +132,14 @@ The read path is essentially `std::fs::read` plus handle bookkeeping &mdash; no 
 
 ```toml
 [dependencies]
-fsys = "0.9.8"
+fsys = "1.0"
 ```
 
 With the async layer:
 
 ```toml
 [dependencies]
-fsys = { version = "0.9.8", features = ["async"] }
+fsys = { version = "1.0", features = ["async"] }
 ```
 
 ### Cargo features
@@ -153,7 +153,7 @@ fsys = { version = "0.9.8", features = ["async"] }
 
 ### Minimum supported Rust version
 
-`1.75`. MSRV may be raised in any minor version before `1.0.0`. After `1.0.0`, MSRV bumps require a minor version bump.
+`1.75`. Through the `1.x` line, MSRV bumps are allowed only in `1.x.0` minor releases (within the 12 most recent stable Rust versions at release time). Patch releases never bump MSRV. See [`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md) for the full policy.
 
 &nbsp;
 
@@ -163,6 +163,8 @@ The full per-version delta lives in [`CHANGELOG.md`](CHANGELOG.md). Headline cap
 
 | Release | Headline |
 |---|---|
+| **1.0.0** | First stable release. SemVer + on-disk-format guarantees apply for the `1.x` line per [`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md). No source-logic changes vs. `0.9.8`. |
+| **0.9.8** | Final pre-1.0 polish: documentation refresh, examples expansion, canonical benchmarks, `STABILITY-1.0.md` commitment doc. |
 | **0.9.7** | GroupCommit wake-stampede fix (atomic `pending_followers`, ~5&times; lock-hold reduction under 100+ followers); `Builder::sqpoll(idle_ms)` opt-in kernel-side submission polling; `IORING_REGISTER_FILES` restored on both rings; OOM-injection test infrastructure; LSN atomic-ordering tightened to `Release`. |
 | **0.9.6** | Full-codebase audit (38 findings); journal-on-io_uring via `IORING_OP_WRITE_FIXED`; APFS `clonefile(2)` + ReFS `FSCTL_DUPLICATE_EXTENTS_TO_FILE` reflinks for `copy_file`; real OS-version probes; `Lsn` + `BatchError` field lockdown for pre-1.0 stability. |
 | **0.9.5** | Dual-buffered Direct-mode log buffer (multi-core scalable journal appends); `Handle::punch_hole` + `Handle::write_zeros` cross-platform sparse-file primitives; `IORING_REGISTER_FILES` on both io_uring rings. |

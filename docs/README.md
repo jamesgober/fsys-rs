@@ -10,7 +10,7 @@ The `docs/` tree is the long-form companion to the rustdoc API reference at <htt
 
 ## Map
 
-- [`API.md`](API.md) &mdash; complete public-API surface. The API was frozen at the `0.9.0` release-candidate; backward-compatible additions in `0.9.1`&ndash;`0.9.7` are catalogued in [API additions in 0.9.1&ndash;0.9.7](API.md#api-additions-in-091097).
+- [`API.md`](API.md) &mdash; complete public-API surface, stable across `1.x` per [`STABILITY-1.0.md`](STABILITY-1.0.md). The initial freeze happened at `0.9.0`; backward-compatible additions through `0.9.x` are catalogued in [API additions in 0.9.1–0.9.x](API.md#api-additions-in-091097), all of which carry into `1.0` unchanged.
 - [`EXAMPLES.md`](EXAMPLES.md) &mdash; catalogue of the 17 runnable examples in [`../examples/`](../examples/), each with a "when to use this pattern" guide. Run any example with `cargo run --example NN_name`.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) &mdash; internal layering, concurrency model, the native io_uring async substrate vs. `spawn_blocking` fallback selection, the 0.9.3 N-shard batch dispatcher, and per-handle resource lifecycle.
 - [`METHODS.md`](METHODS.md) &mdash; durability-method matrix and how to choose between `Sync` / `Data` / `Direct` / `Mmap` / `Auto`. Includes the `Auto` decision ladder and the 0.9.x probe-input evolution.
@@ -21,14 +21,13 @@ The `docs/` tree is the long-form companion to the rustdoc API reference at <htt
 
 ## Status
 
-The `0.9.x` minor series is the **release-candidate phase for `1.0`**. The public API was frozen at the `0.9.0` RC tag (2026-05-05) and carries forward through every subsequent release backward-compatibly. Six minor releases (`0.9.1` through `0.9.7`) have shipped since the freeze, adding net-new public surface without breaking the existing one. The `0.9.8` release is the **final polish + 1.0-RC preparation** &mdash; documentation refresh, examples expansion, canonical Linux benchmarks, and the [`STABILITY-1.0.md`](STABILITY-1.0.md) commitment doc that will accompany the `1.0` stable tag.
+**`1.0.0` is the first stable release.** The `1.x` line is API-stable and on-disk-format-stable per the contract in [`STABILITY-1.0.md`](STABILITY-1.0.md). The surface was frozen at the `0.9.0` release-candidate (2026-05-05); the `0.9.x` series added net-new public items backward-compatibly without breaking the freeze, and the `0.9.8` polish release finalised the documentation + examples + benchmarks. `1.0.0` carries the `0.9.x` shape forward verbatim under SemVer guarantees.
 
-| Phase | Status |
+| Release | Phase |
 |---|---|
-| `0.9.0` RC | Shipped 2026-05-05 — API frozen |
-| `0.9.1`&ndash;`0.9.6` | Shipped — backward-compatible additions, performance / observability / platform expansion |
-| `0.9.7` | Shipped 2026-05-12 — completion + optimisation + stabilisation (every 0.9.6 audit carryover resolved) |
-| `0.9.8` | In progress — final polish, examples, benchmarks, stability commitment |
-| `1.0.0` | After `0.9.8` ships + real-world certification clears |
+| `0.9.0` RC | Shipped 2026-05-05 — initial API freeze |
+| `0.9.1` – `0.9.7` | Shipped — backward-compatible additions: performance, observability, platform expansion |
+| `0.9.8` | Shipped — polish, examples, benchmarks, `STABILITY-1.0.md` commitment doc |
+| **`1.0.0`** | **Shipped — first stable release. SemVer + on-disk-format guarantees apply for the `1.x` line.** |
 
 Per-version deltas live in [`../CHANGELOG.md`](../CHANGELOG.md).

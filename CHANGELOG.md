@@ -5,6 +5,90 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-05-14
+
+**First stable release.** The `1.x` line is **API-stable and on-disk-format-stable** per the contract in [`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md). Every `pub` item documented in [`docs/API.md`](docs/API.md) joins the SemVer commitment; the on-disk journal frame format (`v1` wire format) is frozen for the `1.x` line.
+
+**No source-logic changes vs. `0.9.8`.** `1.0.0` is the version-bump release that locks in the contract. Users on `0.9.8` upgrade with no code changes.
+
+### What's stable in `1.x`
+
+The full surface accumulated through `0.9.0` → `0.9.8`:
+
+- **`Handle`** — primary filesystem handle (46 public methods covering file/dir CRUD, batch, observability, durability primitive routing).
+- **`Builder`** — handle configuration (13 fluent methods: `method`, `root`, `mode`, `tune_for(Workload)`, `observer`, `dispatcher_shards`, `sqpoll`, etc.).
+- **`Batch`** — explicit multi-op batches with `commit` / `commit_grouped`.
+- **`JournalHandle`** — append-only WAL primitive with three throughput tiers (sync, lock-free concurrent, native io_uring async on Linux). Lock-free LSN reservation, group-commit fsync, CRC-32C framed records.
+- **`JournalReader`** — replay reader with 5-state tail-truncation taxonomy.
+- **`JournalOptions`** — journal tuning (direct, log_buffer_kib, group_commit_window, group_commit_max_batch, sync_mode, write_lifetime_hint).
+- **`Method` enum** — `Sync` / `Data` / `Mmap` / `Direct` / `Auto`. Every method is platform-honest; the actual primitive in use is observable via `Handle::active_durability_primitive()`.
+- **`Lsn`** — newtype wrapping a `u64` log sequence number (field privatised at `0.9.6` with stable `as_u64()` accessor + `ZERO` const).
+- **`BatchError`** — per-op failure container (fields privatised at `0.9.6` with stable `failed_at()` / `completed()` / `inner()` / `into_inner()` accessors).
+- **`FsysObserver` trait** — telemetry hook with four event callbacks.
+- **`quick::*` module** — one-shot helpers (`read`, `write`, `write_with`, `delete`, `exists`, `size`).
+- **`hardware::*`, `os::*`, `path::*`** — environment probing + OS-aware default directories (20 path accessors for data, bin, config, logs, cache, libs, runtime, temp, state, locks, each in bare + `_for(suffix)` flavours).
+- **`primitive::*`** — stable string constants for every durability primitive returned by `Handle::active_durability_primitive()`.
+- **`Error`** — `#[non_exhaustive]` error enum with stable `FS-XXXXX` error codes via `Error::code()`.
+- **Cargo features** — `async` (tokio + native io_uring async substrate on Linux + Direct), `tracing` (structured spans on hot paths).
+
+11 `#[non_exhaustive]` types reserve forward-compatibility for new variants / fields in `1.x` minor releases. See [`docs/STABILITY-1.0.md` §1.3](docs/STABILITY-1.0.md#13-non_exhaustive-types) for the full list.
+
+### What changed in this release
+
+This is a polish + freeze release. No source-logic changes. The visible work is documentation honesty:
+
+- **`docs/API.md` path-utilities section fixed.** The doc previously listed three non-existent function names (`default_data_dir()` / `default_cache_dir()` / `default_config_dir()`). The actual `fsys::path` module exports **20 generated accessors** (`data()`, `data_for()`, `bin()`, `bin_for()`, `config()`, `config_for()`, `logs()`, `logs_for()`, `cache()`, `cache_for()`, `libs()`, `libs_for()`, `runtime()`, `runtime_for()`, `temp()`, `temp_for()`, `state()`, `state_for()`, `locks()`, `locks_for()`) plus `normalize`, `sanitize_segment`, `mode`, and `set`. Section replaced with the actual surface.
+- **`docs/API.md` stability section reframed** from "frozen at the `0.9.0` release-candidate; `1.0` will guarantee SemVer" to "stable for the `1.x` line per `STABILITY-1.0.md`."
+- **`docs/STABILITY-1.0.md` reframed** from "pre-1.0 lockdowns ... will accompany the `1.0` stable tag" prose to present-tense "the `1.x` line is stable" prose.
+- **`docs/README.md` status section** updated: pre-1.0 RC phase table replaced with `1.0.0`-shipped table.
+- **`README.md` MSRV section** updated from "MSRV may be raised in any minor version before `1.0.0`" to the actual `1.x` MSRV policy (12-version sliding window, minor-bump-only).
+- **`README.md` highlights table** picks up a `1.0.0` row at the top.
+- **`README.md` install pins** → `fsys = "1.0"`.
+- **`src/lib.rs` version-history note** rewritten from "0.9.x is the release-candidate series for 1.0" to "1.0.0 is the first stable release."
+
+### Yanked / deprecated history
+
+| Version | Status | Reason |
+|---|---|---|
+| (none) | — | No `0.9.x` release has been yanked or deprecated. The `0.9.0` → `1.0.0` line is a clean cumulative-additive arc. |
+
+### Stability contract
+
+See [`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md) for the full text. Summary:
+
+- **API stable** for the `1.x` line — every documented `pub` item keeps its current signature / behaviour. New items may land in `1.x.0` minor releases. `#[non_exhaustive]` enums may gain variants in minor releases.
+- **On-disk format stable** for the `1.x` line — files written by any `1.x` reopen on any other `1.x` without migration.
+- **MSRV locked at Rust 1.75** for `1.0.0`. `1.x.0` minor releases may bump MSRV within the 12-most-recent-stable-Rust-versions window; `1.x.y` patches never bump MSRV.
+- **Deprecation policy**: APIs marked `#[deprecated]` keep working for at least one full minor cycle before removal in `2.0`.
+
+### Tests
+
+All `0.9.8` test infrastructure carries forward unchanged. Validation for `1.0.0`:
+
+- All test suites green under every feature combo (`--no-default-features`, `--features async`, `--features tracing`, `--all-features`).
+- fmt clean.
+- clippy clean (`--all-features --all-targets -- -D warnings`).
+- release build clean.
+- doc build clean.
+
+### Breaking changes
+
+**None vs. `0.9.8`.** `1.0.0` is the version-bump release that locks in the SemVer contract; no source-logic changes since `0.9.8`.
+
+### Installation
+
+```toml
+[dependencies]
+fsys = "1.0"
+
+# With async layer
+fsys = { version = "1.0", features = ["async"] }
+```
+
+MSRV: Rust 1.75.
+
+---
+
 ## [0.9.8] - 2026-05-12
 
 > **The polish + 1.0-RC-prep release.** No new public API. No

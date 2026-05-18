@@ -4,7 +4,7 @@
 ######################################################
 [package]
 name    = "fsys"
-version = "0.9.8"
+version = "1.0.0"
 
 # METADATA
 readme  = "README.md"
