@@ -143,13 +143,6 @@ impl Lcg {
     fn next_byte(&mut self) -> u8 {
         (self.next_u64() & 0xff) as u8
     }
-    fn next_in(&mut self, n: usize) -> usize {
-        if n == 0 {
-            0
-        } else {
-            (self.next_u64() as usize) % n
-        }
-    }
 }
 
 fn random_pci(rng: &mut Lcg) -> PciAddress {
