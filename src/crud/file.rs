@@ -26,7 +26,8 @@ impl Handle {
     /// Atomically writes `data` to `path`, replacing any existing file.
     ///
     /// The write follows the temp-file + atomic-rename pattern: a new
-    /// file is created at `<path>.fsys-tmp-<n>`, `data` is written and
+    /// file is created next to the target as
+    /// `.fsys-tmp-<pid>-<nonce>.<name>`, `data` is written and
     /// flushed at the handle's durability level, then a single
     /// `rename(2)` / `MoveFileExW` swaps it into place. After this
     /// method returns successfully, the target file is durably on

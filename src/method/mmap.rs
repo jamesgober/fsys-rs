@@ -32,7 +32,6 @@ use std::path::Path;
 
 use memmap2::{Mmap, MmapMut};
 
-use crate::handle::Handle;
 use crate::{Error, Result};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -98,18 +97,20 @@ pub(crate) fn write(path: &Path, data: &[u8]) -> Result<()> {
         });
     }
 
-    let temp = Handle::gen_temp_path(path);
-
-    // Step 1 — create + size the temp file.
-    let temp_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map_err(|e| Error::AtomicReplaceFailed {
-            step: "open_temp",
-            source: e,
-        })?;
+    // Step 1 — create + size the temp file. The name carries the pid
+    // and a nonce; an exclusive create retries on the rare collision.
+    let (temp, temp_file) = crate::crud::atomic::with_unique_temp(path, |temp| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(temp)
+            .map_err(Error::Io)
+    })
+    .map_err(|e| Error::AtomicReplaceFailed {
+        step: "open_temp",
+        source: crate::crud::atomic::as_io_error(e),
+    })?;
     if let Err(e) = temp_file.set_len(data.len() as u64) {
         let _ = std::fs::remove_file(&temp);
         return Err(Error::AtomicReplaceFailed {

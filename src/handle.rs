@@ -121,14 +121,22 @@ pub(crate) struct HandleBufferPoolConfig {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Write-counter for unique temp-file names
+// Temp-file naming
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Process-global monotonic counter for generating unique temp-file names.
-///
-/// Using a global counter (rather than per-handle) ensures uniqueness even
-/// when multiple handles share the same root directory.
+/// Process-global counter mixed into every temp-file nonce so two
+/// writes from the same process never derive the same name, even when
+/// the clock does not advance between them.
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Longest single path component accepted by the common filesystems
+/// (ext4, XFS, btrfs, APFS and NTFS all cap a name at 255 bytes or
+/// UTF-16 units).
+const MAX_NAME_LEN: usize = 255;
+
+/// Prefix shared by every temp file fsys creates. Stable so recovery
+/// tooling can find orphans left behind by a crash.
+const TEMP_PREFIX: &str = ".fsys-tmp-";
 
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -1285,35 +1293,53 @@ impl Handle {
         }
     }
 
-    /// Generates a unique temp-file path adjacent to `path`.
+    /// Generates a temp-file path adjacent to `path`.
     ///
-    /// The temp name is `.fsys-tmp-<counter>.<filename>` so it sorts near
-    /// the target and is identifiable in crash recovery. If the target has
-    /// no file name the counter alone is used.
+    /// The name is `.fsys-tmp-<pid>-<nonce>.<filename>` (pid and nonce
+    /// in hex). The pid keeps concurrent processes writing into the
+    /// same directory apart; the nonce mixes a per-process counter,
+    /// the wall clock and per-thread random keys, so a fresh process
+    /// does not regenerate the names of temp files orphaned by an
+    /// earlier crash. The prefix keeps temp files identifiable for
+    /// crash recovery and sorts them next to each other.
+    ///
+    /// When the target's file name is so long that the temp name would
+    /// exceed the 255-byte component limit, the file name part is
+    /// replaced by a 64-bit hash of it.
+    ///
+    /// Collisions remain theoretically possible, so callers create the
+    /// file with an exclusive open and retry with a fresh name on
+    /// `AlreadyExists` (see `crud::atomic::with_unique_temp`).
     pub(crate) fn gen_temp_path(path: &Path) -> PathBuf {
-        let n = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        use std::ffi::OsString;
+        use std::hash::{BuildHasher, Hash, Hasher};
+
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
 
-        // Build the temp name as an `OsString` directly, without
-        // routing through `String`/`format!`. This stays in
-        // `OsStr`-land for non-UTF-8 filenames (Linux can have
-        // those) and avoids the `to_string_lossy` -> `into_owned`
-        // -> `format!` -> `parent.join` chain that allocated 3
-        // strings + 1 PathBuf per call. Now: 1 OsString + 1
-        // PathBuf (from `parent.join`).
-        //
-        // The format `.fsys-tmp-<n>.<original_filename>` is
-        // preserved exactly so crash-recovery scripts that match
-        // on the prefix continue to work.
-        use std::ffi::OsString;
-        let mut temp_name = OsString::with_capacity(32);
-        temp_name.push(".fsys-tmp-");
-        // `n.to_string()` allocates a small String — itoa would
-        // avoid it but adding a dep for one site isn't justified.
-        temp_name.push(n.to_string());
-        temp_name.push(".");
-        if let Some(stem) = path.file_name() {
-            temp_name.push(stem);
+        let counter = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(counter);
+        hasher.write_u128(nanos);
+        let nonce = hasher.finish();
+
+        let mut temp_name = OsString::with_capacity(64);
+        temp_name.push(TEMP_PREFIX);
+        temp_name.push(format!("{:x}-{nonce:016x}.", std::process::id()));
+        if let Some(name) = path.file_name() {
+            // `as_encoded_bytes().len()` is an upper bound on the
+            // UTF-16 length on Windows, so the check is conservative
+            // on every platform.
+            if temp_name.len() + name.as_encoded_bytes().len() <= MAX_NAME_LEN {
+                temp_name.push(name);
+            } else {
+                let mut name_hasher = std::collections::hash_map::DefaultHasher::new();
+                name.hash(&mut name_hasher);
+                temp_name.push(format!("{:016x}", name_hasher.finish()));
+            }
         }
         parent.join(temp_name)
     }
@@ -1672,6 +1698,56 @@ mod tests {
         let tmp = Handle::gen_temp_path(&path);
         let name = tmp.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with(".fsys-tmp-"), "got: {}", name);
+        assert!(name.ends_with(".myfile.db"), "got: {}", name);
+        assert_eq!(tmp.parent(), path.parent());
+    }
+
+    #[test]
+    fn test_gen_temp_path_includes_pid_and_differs_per_call() {
+        let path = PathBuf::from("/tmp/myfile.db");
+        let a = Handle::gen_temp_path(&path);
+        let b = Handle::gen_temp_path(&path);
+        assert_ne!(a, b);
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        let pid = format!(".fsys-tmp-{:x}-", std::process::id());
+        assert!(name.starts_with(&pid), "pid missing from {name}");
+    }
+
+    #[test]
+    fn test_gen_temp_path_does_not_reuse_the_pre_1_1_1_counter_names() {
+        // Before 1.1.1 the first temp name of every process was
+        // `.fsys-tmp-0.<name>`, so a temp file orphaned by a crash
+        // blocked the first write after every restart.
+        let path = PathBuf::from("/tmp/myfile.db");
+        for _ in 0..64 {
+            let name = Handle::gen_temp_path(&path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let rest = name.trim_start_matches(".fsys-tmp-");
+            let first = rest.split('.').next().unwrap_or("");
+            assert!(first.contains('-'), "counter-only temp name: {name}");
+        }
+    }
+
+    #[test]
+    fn test_gen_temp_path_stays_within_name_limit_for_long_names() {
+        for len in [1usize, 200, 215, 216, 240, 255] {
+            let long = "n".repeat(len);
+            let path = PathBuf::from("/tmp").join(&long);
+            let tmp = Handle::gen_temp_path(&path);
+            let name = tmp.file_name().unwrap();
+            assert!(
+                name.len() <= MAX_NAME_LEN,
+                "temp name of {} bytes for a {len}-byte target",
+                name.len()
+            );
+            assert!(name.to_string_lossy().starts_with(TEMP_PREFIX));
+        }
+        // Short names are kept verbatim.
+        let tmp = Handle::gen_temp_path(Path::new("/tmp/short.db"));
+        assert!(tmp.to_string_lossy().ends_with(".short.db"));
     }
 
     #[test]

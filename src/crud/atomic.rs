@@ -21,7 +21,7 @@
 //! hook shape around its own write step.
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::handle::Handle;
 use crate::method::Method;
@@ -106,9 +106,12 @@ impl ReplaceHooks for PlatformHooks {
     }
 }
 
-/// Removes the temp file when dropped while armed. Declared before the
-/// temp `File` so that, on unwind, the file handle closes first (a
-/// still-open file cannot be removed on Windows).
+/// Removes the temp file when dropped while armed.
+///
+/// The temp `File` itself is owned by [`write_temp`], whose frame
+/// unwinds before the guard drops, so the handle is always closed
+/// before the removal (an open file without `FILE_SHARE_DELETE` cannot
+/// be removed on Windows).
 struct TempGuard<'a> {
     path: &'a Path,
     armed: bool,
@@ -139,29 +142,16 @@ pub(crate) fn atomic_replace<H: ReplaceHooks>(
     plan: &ReplacePlan,
     hooks: &H,
 ) -> Result<()> {
-    let temp = Handle::gen_temp_path(target);
+    let (temp, (file, direct_ok)) = with_unique_temp(target, |temp| {
+        platform::open_write_new(temp, plan.use_direct)
+    })
+    .map_err(|e| step_err("open_temp", e))?;
     let mut guard = TempGuard {
         path: &temp,
-        armed: false,
+        armed: true,
     };
 
-    let (file, direct_ok) =
-        platform::open_write_new(&temp, plan.use_direct).map_err(|e| step_err("open_temp", e))?;
-    guard.armed = true;
-
-    if plan.use_direct && !direct_ok {
-        hooks.direct_refused();
-    }
-
-    if direct_ok {
-        let result = hooks.write_direct_durable(&file, data);
-        drop(file);
-        result.map_err(|(step, e)| step_err(step, e))?;
-    } else {
-        platform::write_all(&file, data).map_err(|e| step_err("write", e))?;
-        plan.flush.run(&file).map_err(|e| step_err("flush", e))?;
-        drop(file);
-    }
+    write_temp(file, direct_ok, data, plan, hooks).map_err(|(step, e)| step_err(step, e))?;
 
     hooks.before_rename(&temp);
 
@@ -175,6 +165,58 @@ pub(crate) fn atomic_replace<H: ReplaceHooks>(
         let _ = platform::sync_parent_dir(target);
     }
     Ok(())
+}
+
+/// Writes and fences the temp file, then closes it (`file` is consumed
+/// and dropped when this function returns or unwinds).
+fn write_temp<H: ReplaceHooks>(
+    file: File,
+    direct_ok: bool,
+    data: &[u8],
+    plan: &ReplacePlan,
+    hooks: &H,
+) -> StepResult {
+    if plan.use_direct && !direct_ok {
+        hooks.direct_refused();
+    }
+    if direct_ok {
+        hooks.write_direct_durable(&file, data)
+    } else {
+        platform::write_all(&file, data).map_err(|e| ("write", e))?;
+        plan.flush.run(&file).map_err(|e| ("flush", e))
+    }
+}
+
+/// Maximum number of temp names tried before giving up on
+/// `AlreadyExists`. Names carry a pid and a 64-bit nonce, so more than
+/// one retry indicates something other than chance (for example a
+/// directory flooded with fsys-shaped names).
+const TEMP_CREATE_ATTEMPTS: usize = 8;
+
+/// Creates a temp file next to `target` through `open`, which must
+/// perform an exclusive create (`O_EXCL` / `CREATE_NEW`). Retries with
+/// a fresh name when the chosen name already exists.
+///
+/// # Errors
+///
+/// The last error from `open`: any non-`AlreadyExists` error at once,
+/// or `AlreadyExists` after [`TEMP_CREATE_ATTEMPTS`] attempts.
+pub(crate) fn with_unique_temp<T>(
+    target: &Path,
+    mut open: impl FnMut(&Path) -> Result<T>,
+) -> Result<(PathBuf, T)> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let temp = Handle::gen_temp_path(target);
+        match open(&temp) {
+            Ok(v) => return Ok((temp, v)),
+            Err(Error::Io(e))
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    && attempt < TEMP_CREATE_ATTEMPTS => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn step_err(step: &'static str, e: Error) -> Error {
@@ -196,7 +238,6 @@ pub(crate) fn as_io_error(e: Error) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -286,6 +327,86 @@ mod tests {
         };
         // The display string of the original error is embedded.
         assert!(as_io_error(err).to_string().contains("FS-00003"));
+    }
+
+    #[test]
+    fn test_with_unique_temp_retries_on_already_exists() {
+        let target = Path::new("/nonexistent-dir/target.bin");
+        let mut calls = 0;
+        let (temp, value) = with_unique_temp(target, |_| {
+            calls += 1;
+            if calls < 3 {
+                Err(Error::Io(std::io::ErrorKind::AlreadyExists.into()))
+            } else {
+                Ok(42)
+            }
+        })
+        .expect("third attempt succeeds");
+        assert_eq!(value, 42);
+        assert_eq!(calls, 3);
+        assert_eq!(temp.parent(), target.parent());
+    }
+
+    #[test]
+    fn test_with_unique_temp_gives_up_after_bounded_attempts() {
+        let mut calls = 0;
+        let err = with_unique_temp(Path::new("t.bin"), |_| -> Result<()> {
+            calls += 1;
+            Err(Error::Io(std::io::ErrorKind::AlreadyExists.into()))
+        })
+        .expect_err("persistent collisions must surface");
+        assert_eq!(calls, TEMP_CREATE_ATTEMPTS);
+        assert!(matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists));
+    }
+
+    #[test]
+    fn test_with_unique_temp_does_not_retry_other_errors() {
+        let mut calls = 0;
+        let _ = with_unique_temp(Path::new("t.bin"), |_| -> Result<()> {
+            calls += 1;
+            Err(Error::Io(std::io::ErrorKind::PermissionDenied.into()))
+        })
+        .expect_err("permission errors are not retried");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn test_atomic_replace_succeeds_next_to_orphaned_pre_1_1_1_temp_files() {
+        // A crash in an earlier process leaves `.fsys-tmp-<n>.<name>`
+        // behind. Every later write must still succeed.
+        let dir = tmp_dir("orphans");
+        let _g = DirGuard(dir.clone());
+        let target = dir.join("t.bin");
+        for n in 0..32 {
+            std::fs::write(dir.join(format!(".fsys-tmp-{n}.t.bin")), b"orphan").expect("seed");
+        }
+        atomic_replace(
+            &target,
+            b"fresh",
+            &plan(),
+            &PlatformHooks { sector_size: 512 },
+        )
+        .expect("write next to orphans");
+        assert_eq!(std::fs::read(&target).expect("read"), b"fresh");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_replace_handles_maximum_length_file_names() {
+        // A 255-byte target name is legal; the temp name must not push
+        // past the component limit (ENAMETOOLONG before 1.1.1).
+        let dir = tmp_dir("long_name");
+        let _g = DirGuard(dir.clone());
+        let target = dir.join("x".repeat(255));
+        atomic_replace(
+            &target,
+            b"long",
+            &plan(),
+            &PlatformHooks { sector_size: 512 },
+        )
+        .expect("write to a 255-byte name");
+        assert_eq!(std::fs::read(&target).expect("read"), b"long");
+        assert_eq!(entries(&dir).len(), 1, "temp file leaked");
     }
 
     #[test]
