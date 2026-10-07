@@ -1126,8 +1126,12 @@ impl Handle {
     /// For paths whose target does not yet exist (e.g. `write` to a
     /// new file), only the existing prefix is canonicalised; the
     /// not-yet-existing tail components are joined back lexically.
-    /// This is sound because `open(O_CREAT|O_EXCL)` and
-    /// `atomic_rename` operate within the just-canonicalised parent.
+    /// A component is treated as "not yet existing" only when
+    /// `lstat` reports it missing. A symlink that cannot be resolved
+    /// (dangling or looping) is rejected with [`Error::InvalidPath`]:
+    /// creating opens such as [`Handle::append`] follow the link, so
+    /// accepting it would let a link inside the root create files
+    /// wherever it points.
     ///
     /// If the handle has no root, the path is returned as-is.
     ///
@@ -1261,6 +1265,32 @@ impl Handle {
                     return Ok(out);
                 }
                 Err(_) => {
+                    // `canonicalize` failed at this depth. Only a
+                    // component that genuinely does not exist may be
+                    // popped and re-attached lexically. A symlink here
+                    // (dangling, looping, or otherwise unresolvable)
+                    // must be rejected: popping it would hand the
+                    // caller `root/link/...`, and a creating open
+                    // (`append`, `write_at`, `sync`, `journal`) would
+                    // then follow the link and create its target
+                    // wherever it points, including outside the root.
+                    match std::fs::symlink_metadata(&existing_prefix) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Ok(meta) if meta.file_type().is_symlink() => {
+                            return Err(Error::InvalidPath {
+                                path: path.to_owned(),
+                                reason: "path contains a symlink that cannot be resolved inside the handle root (dangling or looping link)"
+                                    .into(),
+                            });
+                        }
+                        _ => {
+                            return Err(Error::InvalidPath {
+                                path: path.to_owned(),
+                                reason: "path component exists but cannot be canonicalised for the root check"
+                                    .into(),
+                            });
+                        }
+                    }
                     // The path doesn't exist at this depth; pop one
                     // component and retry. If we've popped past the
                     // root, the path is unreachable.
@@ -1748,6 +1778,158 @@ mod tests {
         // Short names are kept verbatim.
         let tmp = Handle::gen_temp_path(Path::new("/tmp/short.db"));
         assert!(tmp.to_string_lossy().ends_with(".short.db"));
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 1.1.1 — root jail vs. dangling symlinks
+    // ─────────────────────────────────────────────────────────
+
+    struct DirCleanup(PathBuf);
+    impl Drop for DirCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn jail_dirs(tag: &str) -> (PathBuf, PathBuf, DirCleanup) {
+        let base = std::env::temp_dir().join(format!(
+            "fsys_jail_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        (root, outside, DirCleanup(base))
+    }
+
+    #[cfg(unix)]
+    fn make_link(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    // Creating symlinks on Windows needs the SeCreateSymbolicLink
+    // privilege (admin or Developer Mode). Without it the symlink
+    // tests return early; the junction test below still covers the
+    // dangling-link branch on Windows.
+    #[cfg(windows)]
+    fn make_link(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn make_dir_link(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
+    #[cfg(unix)]
+    fn make_dir_link(target: &Path, link: &Path) -> bool {
+        make_link(target, link)
+    }
+
+    #[test]
+    fn test_dangling_leaf_symlink_out_of_root_is_rejected_for_creating_ops() {
+        let (root, outside, _g) = jail_dirs("leaf");
+        let victim = outside.join("created_through_link");
+        if !make_link(&victim, &root.join("evil")) {
+            return;
+        }
+        let h = crate::Builder::new()
+            .method(Method::Sync)
+            .root(&root)
+            .build()
+            .expect("build");
+
+        assert!(matches!(
+            h.append("evil", b"x"),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            h.write_at("evil", 0, b"x"),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(matches!(h.sync("evil"), Err(Error::InvalidPath { .. })));
+        assert!(matches!(
+            h.write("evil", b"x"),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(!victim.exists(), "a file was created outside the root");
+    }
+
+    #[test]
+    fn test_dangling_dir_symlink_out_of_root_is_rejected() {
+        let (root, outside, _g) = jail_dirs("dir");
+        let missing_dir = outside.join("missing_dir");
+        if !make_dir_link(&missing_dir, &root.join("evil_dir")) {
+            return;
+        }
+        let h = crate::Builder::new()
+            .method(Method::Sync)
+            .root(&root)
+            .build()
+            .expect("build");
+        assert!(matches!(
+            h.resolve_path(Path::new("evil_dir/sub/file.bin")),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            h.append("evil_dir/file.bin", b"x"),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(!missing_dir.exists());
+    }
+
+    // Directory junctions need no privilege on Windows, so this test
+    // covers the dangling-link branch there even without symlink
+    // rights.
+    #[cfg(windows)]
+    #[test]
+    fn test_dangling_junction_out_of_root_is_rejected() {
+        let (root, outside, _g) = jail_dirs("junction");
+        let missing_dir = outside.join("missing_dir");
+        let link = root.join("evil_junction");
+        let created = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(&missing_dir)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !created || std::fs::symlink_metadata(&link).is_err() {
+            // `mklink /J` unavailable on this host; nothing to test.
+            return;
+        }
+        let h = crate::Builder::new()
+            .method(Method::Sync)
+            .root(&root)
+            .build()
+            .expect("build");
+        assert!(matches!(
+            h.resolve_path(Path::new("evil_junction/file.bin")),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(!missing_dir.exists());
+    }
+
+    #[test]
+    fn test_missing_components_inside_root_still_resolve() {
+        let (root, _outside, _g) = jail_dirs("missing_ok");
+        let h = crate::Builder::new()
+            .method(Method::Sync)
+            .root(&root)
+            .build()
+            .expect("build");
+        let resolved = h
+            .resolve_path(Path::new("not/yet/created.bin"))
+            .expect("non-existent tail is allowed");
+        assert!(resolved.starts_with(h.root().expect("root")));
+        assert!(resolved.ends_with("not/yet/created.bin"));
     }
 
     #[test]
