@@ -388,34 +388,80 @@ pub(crate) fn read_all(file: &File) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn read_all_direct(file: &File, file_size: u64, sector_size: u32) -> Result<Vec<u8>> {
-    use super::{round_up, AlignedBuf};
+    read_all_direct_chunked(file, file_size, sector_size, MAX_IO_CHUNK)
+}
+
+/// Positioned `ReadFile` loop for `FILE_FLAG_NO_BUFFERING` handles.
+///
+/// Reads from offset 0 into one sector-aligned buffer until `file_size`
+/// bytes have arrived, at most `max_chunk` bytes per call (rounded down
+/// to a sector multiple so every request stays legal). End of file before
+/// `file_size` bytes is an `ErrorKind::UnexpectedEof` error rather than a
+/// silently short result.
+fn read_all_direct_chunked(
+    file: &File,
+    file_size: u64,
+    sector_size: u32,
+    max_chunk: usize,
+) -> Result<Vec<u8>> {
+    use super::AlignedBuf;
 
     if file_size == 0 {
         return Ok(Vec::new());
     }
 
+    let size = usize::try_from(file_size).map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file is larger than the address space",
+        ))
+    })?;
     let ss = sector_size as usize;
-    let aligned_len = round_up(file_size as usize, ss);
+    let aligned_len = checked_round_up(size, ss)?;
+    // Largest sector multiple not above `max_chunk`, and at least one
+    // sector so the loop always makes progress.
+    let chunk_cap = (max_chunk & !(ss - 1)).max(ss);
     let mut buf = AlignedBuf::new(aligned_len, ss)?;
 
     let handle = file.as_raw_handle() as HANDLE;
-    let mut bytes_read: u32 = 0;
-    // SAFETY: handle is valid; buf is aligned and has aligned_len bytes.
-    let ok: BOOL = unsafe {
-        ReadFile(
-            handle,
-            buf.as_mut_slice().as_mut_ptr().cast(),
-            aligned_len as u32,
-            &mut bytes_read,
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == FALSE {
-        return Err(Error::Io(std::io::Error::last_os_error()));
+    let mut total = 0usize;
+    while total < size {
+        let chunk_len = io_chunk_len(aligned_len - total, chunk_cap);
+        let mut overlapped = overlapped_at(total as u64);
+        let mut got: u32 = 0;
+        // SAFETY: handle is valid for the call; `buf` owns `aligned_len`
+        // writable bytes and `total + chunk_len <= aligned_len`, so the
+        // kernel writes only inside the allocation; `total` is a sector
+        // multiple here (every earlier chunk was a full sector multiple,
+        // otherwise the loop already ended at EOF), keeping the pointer
+        // and the offset sector-aligned; `got` and `overlapped` are live.
+        let ok: BOOL = unsafe {
+            ReadFile(
+                handle,
+                buf.as_mut_slice()[total..].as_mut_ptr().cast(),
+                chunk_len,
+                &mut got,
+                &mut overlapped,
+            )
+        };
+        if ok == FALSE {
+            let err = std::io::Error::last_os_error();
+            // ERROR_HANDLE_EOF: a positioned read starting at or past EOF.
+            if err.raw_os_error() != Some(38) {
+                return Err(Error::Io(err));
+            }
+            got = 0;
+        }
+        if got == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "file ended before the expected size during a Direct IO read",
+            )));
+        }
+        total += got as usize;
     }
 
-    let trimmed = usize::min(bytes_read as usize, file_size as usize);
-    Ok(buf.as_slice()[..trimmed].to_vec())
+    Ok(buf.as_slice()[..size].to_vec())
 }
 
 pub(crate) fn read_range(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
@@ -1139,6 +1185,63 @@ mod tests {
         assert_eq!(checked_round_up(512, 512).expect("ok"), 512);
         assert!(checked_round_up(usize::MAX, 512).is_err());
         assert!(checked_round_up(10, 3).is_err());
+    }
+
+    /// Writes `len` patterned bytes with a buffered handle and returns
+    /// the payload.
+    fn seed_pattern(path: &Path, len: usize) -> Vec<u8> {
+        let data: Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
+        std::fs::write(path, &data).expect("seed");
+        data
+    }
+
+    #[test]
+    fn test_read_all_direct_chunked_reads_every_chunk() {
+        let path = tmp_path("rad_chunks");
+        let _g = TmpFile(path.clone());
+        let ss = probe_sector_size(&path);
+        let len = ss as usize * 5 + 123;
+        let data = seed_pattern(&path, len);
+        let (f, direct) = open_read(&path, true).expect("open");
+        // One sector per ReadFile call: six calls, the last one short.
+        let got = read_all_direct_chunked(&f, len as u64, ss, ss as usize).expect("read");
+        assert_eq!(got, data, "direct={direct}");
+    }
+
+    #[test]
+    fn test_read_all_direct_chunked_rounds_cap_down_to_sector() {
+        let path = tmp_path("rad_cap");
+        let _g = TmpFile(path.clone());
+        let ss = probe_sector_size(&path);
+        let len = ss as usize * 3;
+        let data = seed_pattern(&path, len);
+        let (f, _) = open_read(&path, true).expect("open");
+        // A cap that is not a sector multiple must still produce legal
+        // NO_BUFFERING requests.
+        let got = read_all_direct_chunked(&f, len as u64, ss, ss as usize + 7).expect("read");
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn test_read_all_direct_errors_when_file_shorter_than_expected() {
+        let path = tmp_path("rad_short");
+        let _g = TmpFile(path.clone());
+        let ss = probe_sector_size(&path);
+        let len = ss as usize * 2;
+        let _data = seed_pattern(&path, len);
+        let (f, _) = open_read(&path, true).expect("open");
+        let err = read_all_direct_chunked(&f, (len * 2) as u64, ss, ss as usize)
+            .expect_err("premature EOF must error");
+        assert!(matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn test_read_all_direct_empty_file() {
+        let path = tmp_path("rad_empty");
+        let _g = TmpFile(path.clone());
+        std::fs::write(&path, b"").expect("seed");
+        let (f, _) = open_read(&path, true).expect("open");
+        assert!(read_all_direct(&f, 0, 512).expect("read").is_empty());
     }
 
     #[test]
