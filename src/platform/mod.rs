@@ -438,9 +438,12 @@ pub(crate) fn zero_range(file: &std::fs::File, offset: u64, len: u64) -> crate::
 ///   Apple Silicon NVMe.
 /// - **Linux:** `fdatasync(2)` — already barrier-grade by
 ///   default; same as `sync_data`.
-/// - **Windows:** no-op. `FILE_FLAG_WRITE_THROUGH` already
-///   provides durable-on-return semantics for every write;
-///   there is no separate barrier primitive to call.
+/// - **Windows:** returns immediately when the handle was opened
+///   with `FILE_FLAG_WRITE_THROUGH` (every write on it was already
+///   durable when `WriteFile` returned); otherwise calls
+///   `FlushFileBuffers`, the same as [`sync_full`]. The default
+///   buffered journal handle is not write-through, so on Windows
+///   `SyncMode::Barrier` costs the same as `SyncMode::Full` there.
 /// - **Unknown:** falls back to `sync_data`.
 ///
 /// **Used internally** by [`crate::JournalHandle::sync_through`]
@@ -461,10 +464,7 @@ pub(crate) fn sync_barrier(file: &std::fs::File) -> crate::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        // WRITE_THROUGH already made every write durable on
-        // return; the per-handle file has nothing pending.
-        let _ = file;
-        Ok(())
+        imp::sync_barrier(file)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
