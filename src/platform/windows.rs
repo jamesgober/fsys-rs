@@ -432,8 +432,6 @@ pub(crate) fn sync_parent_dir(_path: &Path) -> Result<()> {
 /// (16 bytes: two `LARGE_INTEGER`s for the inclusive start +
 /// exclusive end byte offsets of the range to zero).
 pub(crate) fn punch_hole(file: &File, offset: u64, len: u64) -> Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::IO::DeviceIoControl;
 
     if len == 0 {
@@ -515,7 +513,6 @@ pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
 /// (non-ReFS volume, cross-volume copy, ineligible source range).
 /// The caller falls back to a byte-copy on `Err`.
 fn try_reflink_refs(src: &Path, dst: &Path) -> Result<u64> {
-    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Storage::FileSystem::{
         FileEndOfFileInfo, GetFileSizeEx, SetFileInformationByHandle, FILE_END_OF_FILE_INFO,
         FILE_SHARE_DELETE,

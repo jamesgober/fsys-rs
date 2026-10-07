@@ -44,8 +44,12 @@ pub(super) fn probe_version() -> String {
 
     // ntdll's `RtlGetVersion` — NTSTATUS RtlGetVersion(PRTL_OSVERSIONINFOW).
     // NTSTATUS 0 = STATUS_SUCCESS.
+    //
+    // Plain `extern` (not `unsafe extern`): the crate's MSRV is 1.75
+    // and `unsafe extern` blocks are only accepted from Rust 1.82.
+    // Every call through this block is still `unsafe`.
     #[link(name = "ntdll")]
-    unsafe extern "system" {
+    extern "system" {
         fn RtlGetVersion(lp_version_information: *mut OsVersionInfoExW) -> i32;
     }
 

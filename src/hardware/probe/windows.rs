@@ -126,7 +126,6 @@ pub(crate) fn probe_drive() -> DriveInfo {
 /// strings. Returns [`PlpStatus::Unknown`] on any error or table
 /// miss.
 fn probe_plp_windows(volume: &OsString) -> PlpStatus {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
