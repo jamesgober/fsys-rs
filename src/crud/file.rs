@@ -101,44 +101,35 @@ impl Handle {
             self.update_active_method(Method::Data);
         }
 
-        // Step 2: write data.
-        let write_result = if direct_ok {
-            self.direct_write(&file, &path, data)
-        } else {
-            platform::write_all(&file, data)
-        };
-        if let Err(e) = write_result {
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "write",
-                source: as_io_error(e),
-            });
-        }
-
         if direct_ok {
-            // Step 3 (Direct IO path): FILE_FLAG_NO_BUFFERING /
-            // O_DIRECT writes are sector-padded. Truncate to the
-            // actual data length on the SAME open file handle —
-            // `set_len` on the original `file` calls `ftruncate`
-            // (Unix) or `SetFilePointerEx + SetEndOfFile` (Windows).
-            // Both work regardless of the open flags. Earlier
-            // versions dropped the file and reopened buffered just
-            // to call `set_len` — that wasted two syscalls
-            // (close + open) per Direct write. (0.8.0 I-checkpoint
-            // perf fix.)
-            if let Err(e) = file.set_len(data.len() as u64) {
+            // Steps 2-3 (Direct IO path): padded write, trim to the
+            // real length on the same handle, then fence. The fence
+            // runs after the trim so the length that the rename
+            // publishes is the one on stable storage.
+            let result = self.direct_write_durable(&file, &path, data);
+            drop(file);
+            if let Err((step, e)) = result {
+                let _ = std::fs::remove_file(&temp);
+                return Err(Error::AtomicReplaceFailed {
+                    step,
+                    source: as_io_error(e),
+                });
+            }
+        } else {
+            // Step 2 (Buffered path): write data.
+            if let Err(e) = platform::write_all(&file, data) {
                 drop(file);
                 let _ = std::fs::remove_file(&temp);
                 return Err(Error::AtomicReplaceFailed {
-                    step: "truncate",
-                    source: e,
+                    step: "write",
+                    source: as_io_error(e),
                 });
             }
-            drop(file);
-        } else {
+
             // Step 3 (Buffered path): explicit flush for durability.
-            let flush_result = self.flush_file(&file, false);
+            let flush_result = self.flush_file(&file);
             if let Err(e) = flush_result {
+                drop(file);
                 let _ = std::fs::remove_file(&temp);
                 return Err(Error::AtomicReplaceFailed {
                     step: "flush",
@@ -264,35 +255,28 @@ impl Handle {
             self.update_active_method(Method::Data);
         }
 
-        let write_result = if direct_ok {
-            self.direct_write(&file, &path, data)
-        } else {
-            platform::write_all(&file, data)
-        };
-        if let Err(e) = write_result {
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "write",
-                source: as_io_error(e),
-            });
-        }
-
         if direct_ok {
+            let result = self.direct_write_durable(&file, &path, data);
             drop(file);
-            if let Err(e) = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&temp)
-                .and_then(|f| f.set_len(data.len() as u64))
-            {
+            if let Err((step, e)) = result {
                 let _ = std::fs::remove_file(&temp);
                 return Err(Error::AtomicReplaceFailed {
-                    step: "truncate",
-                    source: e,
+                    step,
+                    source: as_io_error(e),
                 });
             }
         } else {
-            let flush_result = self.flush_file(&file, false);
+            if let Err(e) = platform::write_all(&file, data) {
+                drop(file);
+                let _ = std::fs::remove_file(&temp);
+                return Err(Error::AtomicReplaceFailed {
+                    step: "write",
+                    source: as_io_error(e),
+                });
+            }
+            let flush_result = self.flush_file(&file);
             if let Err(e) = flush_result {
+                drop(file);
                 let _ = std::fs::remove_file(&temp);
                 return Err(Error::AtomicReplaceFailed {
                     step: "flush",
@@ -540,45 +524,54 @@ impl Handle {
     pub fn sync(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = self.resolve_path(path.as_ref())?;
         let (file, _) = platform::open_write_at(&path).map(|f| (f, false))?;
-        self.flush_file(&file, false)
+        match self.active_method() {
+            Method::Data => platform::sync_data(&file),
+            _ => platform::sync_full(&file),
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
     // Internal
     // ──────────────────────────────────────────────────────────────────────────
 
-    fn flush_file(&self, file: &std::fs::File, is_direct: bool) -> Result<()> {
+    /// Flushes a file written through the buffered path, picking the
+    /// primitive from the handle's active method.
+    ///
+    /// `Data` and `Direct` map to the data-level fence (`fdatasync` /
+    /// `F_FULLFSYNC` / `FlushFileBuffers`); a `Direct` handle only
+    /// reaches this function when the filesystem refused Direct IO for
+    /// this file, so the buffered bytes still need a real flush.
+    /// Every other method maps to the full `fsync`.
+    fn flush_file(&self, file: &std::fs::File) -> Result<()> {
         match self.active_method() {
-            Method::Direct if is_direct => {
-                // On Windows, FILE_FLAG_WRITE_THROUGH already flushed on each
-                // write. On Linux/macOS, issue fdatasync / F_FULLFSYNC.
-                #[cfg(not(target_os = "windows"))]
-                {
-                    platform::sync_data(file)
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    Ok(())
-                }
-            }
-            Method::Data => platform::sync_data(file),
+            Method::Data | Method::Direct => super::fence_data(file),
             _ => platform::sync_full(file),
         }
     }
 
-    /// Direct-IO write helper.
+    /// Direct-IO write of a fresh temp file, leaving it durable at
+    /// exactly `data.len()` bytes.
     ///
-    /// On Linux, routes through the per-handle `io_uring` ring when
-    /// available. On `io_uring_setup(2)` rejection (cached on the
-    /// Handle as `Disabled`), or when the ring path errors at
-    /// runtime, falls through to the existing `O_DIRECT`+`pwrite`
-    /// path. On macOS / Windows / unknown, always uses the existing
-    /// platform `write_all_direct`.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(clippy::needless_pass_by_value, unused_imports)
-    )]
-    fn direct_write(&self, file: &std::fs::File, path: &Path, data: &[u8]) -> Result<()> {
+    /// Sequence: sector-padded write, trim to the real length on the
+    /// same handle, then the durability fence. `O_DIRECT` and
+    /// `F_NOCACHE` only bypass the page cache; neither makes the bytes
+    /// durable, so the fence is required before the caller renames the
+    /// temp file into place. The fence runs after the trim so the
+    /// length that the rename publishes is the one on stable storage.
+    ///
+    /// On Linux the per-handle `io_uring` ring is used when available
+    /// (linked write + `fdatasync`, or NVMe passthrough flush). When
+    /// the ring is unavailable or fails at runtime, the platform
+    /// `pwrite` path runs and rewrites the file from offset 0.
+    ///
+    /// On error, returns the atomic-replace step name that failed
+    /// together with the underlying error.
+    fn direct_write_durable(
+        &self,
+        file: &std::fs::File,
+        path: &Path,
+        data: &[u8],
+    ) -> std::result::Result<(), (&'static str, Error)> {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
@@ -589,36 +582,43 @@ impl Handle {
                 // FSYS_DISABLE_NVME_PASSTHROUGH=1 is set.
                 let nvme = self.nvme_access(file.as_raw_fd());
                 let nvme_ref = nvme.as_deref();
-                if iouring_write_direct(&ring, file, data, self.sector_size(), nvme_ref).is_ok() {
+                let sector = self.sector_size();
+                let needs_trim = needs_trim(data.len(), sector);
+                if let Ok(fenced) =
+                    iouring_write_direct(&ring, file, data, sector, nvme_ref, !needs_trim)
+                {
+                    if needs_trim {
+                        file.set_len(data.len() as u64)
+                            .map_err(|e| ("truncate", Error::Io(e)))?;
+                    }
+                    if !fenced {
+                        iouring_fence(&ring, file, nvme_ref).map_err(|e| ("flush", e))?;
+                    }
                     return Ok(());
                 }
-                // Ring submit failed at runtime — surface the
-                // `pwrite` path's error so the caller observes a
-                // single, comparable error class regardless of which
-                // path produced it.
+                // Ring submit failed at runtime. Fall through to the
+                // `pwrite` path so the caller observes a single,
+                // comparable error class regardless of which path
+                // produced it.
             }
         }
-        let result = platform::write_all_direct(file, data, self.sector_size());
+
+        write_direct_durable_platform(file, data, self.sector_size())?;
 
         // Windows: when NVMe passthrough is available, issue a
         // controller-level FLUSH after the WRITE_THROUGH write. This
         // is redundant durability (WRITE_THROUGH already flushes per
         // write) but exercises the IOCTL path and surfaces it via
-        // `active_durability_primitive()`. Performance certification
-        // (F-9) decides whether to drop WRITE_THROUGH when the
-        // IOCTL is active.
+        // `active_durability_primitive()`.
         #[cfg(target_os = "windows")]
-        if result.is_ok() {
-            if let Some(access) = self.nvme_access_win(path) {
-                // Best-effort: ignore NVMe FLUSH errors at runtime —
-                // WRITE_THROUGH already provided durability. We log
-                // at the metrics placeholder later (F-1) if/when the
-                // metrics layer lands.
-                let _ = crate::platform::windows_nvme::nvme_flush(&access);
-            }
+        if let Some(access) = self.nvme_access_win(path) {
+            // Best-effort: WRITE_THROUGH already provided durability,
+            // so a failed controller flush does not fail the write.
+            let _ = crate::platform::windows_nvme::nvme_flush(&access);
         }
-        let _ = path; // path is unused on Linux; consumed on Windows above.
-        result
+        #[cfg(not(target_os = "windows"))]
+        let _ = path;
+        Ok(())
     }
 
     /// Direct-IO read helper. Mirror of [`direct_write`].
@@ -639,6 +639,57 @@ impl Handle {
     }
 }
 
+/// Returns `true` when a payload of `len` bytes does not end on a
+/// sector boundary, so the sector-padded Direct write leaves trailing
+/// padding that must be trimmed before the file is published.
+#[inline]
+fn needs_trim(len: usize, sector_size: u32) -> bool {
+    let ss = sector_size.max(1) as usize;
+    len % ss != 0
+}
+
+/// Platform (non-`io_uring`) Direct write of a fresh temp file, leaving
+/// it durable at exactly `data.len()` bytes.
+///
+/// Used by the solo lane when no ring is available and by the group
+/// lane for every Direct op. Sequence: padded `pwrite` / `WriteFile`,
+/// trim to the real length on the same handle, then fence.
+///
+/// - Linux / macOS / other Unix: the fence is [`super::fence_data`]
+///   (`fdatasync` / `F_FULLFSYNC`). `O_DIRECT` and `F_NOCACHE` do not
+///   make data durable on their own.
+/// - Windows: the handle was opened with `FILE_FLAG_WRITE_THROUGH`,
+///   which completes each write (and the end-of-file update made
+///   through the same handle) to stable storage before returning, so
+///   no separate `FlushFileBuffers` is issued.
+///
+/// On error, returns the atomic-replace step name that failed.
+pub(crate) fn write_direct_durable_platform(
+    file: &std::fs::File,
+    data: &[u8],
+    sector_size: u32,
+) -> std::result::Result<(), (&'static str, Error)> {
+    platform::write_all_direct(file, data, sector_size).map_err(|e| ("write", e))?;
+    if needs_trim(data.len(), sector_size) {
+        file.set_len(data.len() as u64)
+            .map_err(|e| ("truncate", Error::Io(e)))?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        super::fence_data(file).map_err(|e| ("flush", e))?;
+    }
+    Ok(())
+}
+
+/// Writes `data` (sector-padded) at offset 0 through the `io_uring`
+/// ring.
+///
+/// When `fuse_fence` is `true` the durability fence is issued as part
+/// of the same submission (linked write + `fdatasync`) or right after
+/// it (NVMe passthrough flush) and the function returns `Ok(true)`.
+/// When `fuse_fence` is `false` (the caller still has to trim padding
+/// before fencing) only the write is issued and the function returns
+/// `Ok(false)`; the caller then runs [`iouring_fence`].
 #[cfg(target_os = "linux")]
 fn iouring_write_direct(
     ring: &crate::platform::linux_iouring::IoUringRing,
@@ -646,22 +697,17 @@ fn iouring_write_direct(
     data: &[u8],
     sector_size: u32,
     nvme: Option<&crate::platform::linux_iouring::NvmeAccess>,
-) -> Result<()> {
+    fuse_fence: bool,
+) -> Result<bool> {
     use std::os::fd::AsRawFd;
 
-    // Empty input — skip the buffer-pool allocation entirely. The
-    // file is already created at size 0 by the caller's `open()`;
-    // we only need the durability fence below.
+    // Empty input: nothing to write. The file was created at size 0
+    // by the caller's `open()`; only the fence remains.
     if data.is_empty() {
-        if let Some(access) = nvme {
-            crate::platform::linux_iouring::nvme_flush_ioctl(
-                access.char_dev.as_raw_fd(),
-                access.nsid,
-            )?;
-        } else {
-            ring.fdatasync(file.as_raw_fd())?;
+        if fuse_fence {
+            iouring_fence(ring, file, nvme)?;
         }
-        return Ok(());
+        return Ok(fuse_fence);
     }
 
     let ss = sector_size as usize;
@@ -671,47 +717,59 @@ fn iouring_write_direct(
 
     // O_DIRECT minimises cache effects but does not imply durability.
     // The atomic-replace contract requires the bytes to be on stable
-    // storage before the rename. Three paths:
+    // storage before the rename. Fence options:
     //
     // 1. NVMe passthrough flush (locked decision D-2). Sends NVMe
     //    FLUSH (opcode 0x00) directly to the controller via the
-    //    legacy `NVME_IOCTL_IO_CMD` ioctl. Bypasses the kernel's
-    //    fsync path entirely — the controller flushes its volatile
-    //    write cache and acknowledges. Requires NVMe hardware +
-    //    `CAP_SYS_ADMIN`-level access. Write and flush are
-    //    submitted as separate calls because the NVMe FLUSH is an
-    //    ioctl on a different fd (`/dev/nvmeX`), not an io_uring
-    //    SQE — linking is not applicable.
-    // 2. **0.9.4 linked write+fsync (`IOSQE_IO_LINK`).** When NVMe
-    //    passthrough is unavailable, submit Write + Fsync(DATASYNC)
-    //    as a linked SQE chain in one `io_uring_enter(2)` round-
-    //    trip instead of two. Halves the syscall-entry cost of the
-    //    durable-write path; kernel batches both completions in a
-    //    single submit-and-wait.
-    // 3. Standard fallback when the linked submission cannot be
-    //    used (e.g. SQ queue full at link time): write + fdatasync
-    //    as separate calls (the 0.5.1 path).
-    if let Some(access) = nvme {
-        let n = ring.write_at(file.as_raw_fd(), buf.as_slice(), 0)?;
-        if n != aligned_len {
-            return Err(Error::Io(std::io::Error::other(
-                "io_uring short write on Direct path",
-            )));
-        }
-        crate::platform::linux_iouring::nvme_flush_ioctl(access.char_dev.as_raw_fd(), access.nsid)?;
-    } else {
-        // 0.9.4: linked write + fsync. The owner thread pushes
-        // both SQEs with IOSQE_IO_LINK and waits for both CQEs;
-        // halves the durability syscall round-trip vs the
-        // pre-0.9.4 two-submit path.
+    //    legacy `NVME_IOCTL_IO_CMD` ioctl. The flush is an ioctl on a
+    //    different fd (`/dev/nvmeX`), so it cannot be linked to the
+    //    write SQE. It flushes the device cache only; filesystem
+    //    metadata for the new file (extents, length) is committed by
+    //    the parent-directory fsync that follows the rename.
+    // 2. Linked write + Fsync(DATASYNC) (`IOSQE_IO_LINK`, 0.9.4) in
+    //    one `io_uring_enter(2)` round-trip.
+    // 3. Unfused: write now, fence after the caller trims padding.
+    if fuse_fence && nvme.is_none() {
         let n = ring.write_at_linked_fsync(file.as_raw_fd(), buf.as_slice(), 0)?;
         if n != aligned_len {
             return Err(Error::Io(std::io::Error::other(
                 "io_uring short write on Direct path (linked write+fsync)",
             )));
         }
+        #[cfg(test)]
+        super::fence_probe::record();
+        return Ok(true);
     }
-    Ok(())
+    let n = ring.write_at(file.as_raw_fd(), buf.as_slice(), 0)?;
+    if n != aligned_len {
+        return Err(Error::Io(std::io::Error::other(
+            "io_uring short write on Direct path",
+        )));
+    }
+    if fuse_fence {
+        iouring_fence(ring, file, nvme)?;
+    }
+    Ok(fuse_fence)
+}
+
+/// Durability fence for the `io_uring` Direct path: NVMe passthrough
+/// flush when available, otherwise `fdatasync` through the ring.
+#[cfg(target_os = "linux")]
+fn iouring_fence(
+    ring: &crate::platform::linux_iouring::IoUringRing,
+    file: &std::fs::File,
+    nvme: Option<&crate::platform::linux_iouring::NvmeAccess>,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    #[cfg(test)]
+    super::fence_probe::record();
+    match nvme {
+        Some(access) => crate::platform::linux_iouring::nvme_flush_ioctl(
+            access.char_dev.as_raw_fd(),
+            access.nsid,
+        ),
+        None => ring.fdatasync(file.as_raw_fd()),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1073,6 +1131,89 @@ mod tests {
         h.write(&src, b"copy content").expect("write src");
         let _bytes = h.copy(&src, &dst).expect("copy");
         assert_eq!(std::fs::read(&dst).expect("read dst"), b"copy content");
+    }
+
+    fn direct_handle() -> crate::handle::Handle {
+        Builder::new()
+            .method(Method::Direct)
+            .build()
+            .expect("build direct handle")
+    }
+
+    fn patterned(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn test_direct_write_unaligned_length_reads_back_exactly() {
+        // A payload that does not end on a sector boundary is padded
+        // for the Direct write and must be trimmed back before the
+        // rename publishes it.
+        for len in [0usize, 1, 511, 1000, 4097] {
+            let path = tmp_path("direct_unaligned");
+            let _g = TmpFile(path.clone());
+            let h = direct_handle();
+            let payload = patterned(len);
+            h.write(&path, &payload).expect("direct write");
+            assert_eq!(
+                std::fs::read(&path).expect("read back"),
+                payload,
+                "len {len}"
+            );
+        }
+    }
+
+    // Windows Direct writes use FILE_FLAG_WRITE_THROUGH, which makes
+    // each write durable on return; no separate fence is issued there.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_direct_write_fences_before_rename() {
+        let path = tmp_path("direct_fence");
+        let _g = TmpFile(path.clone());
+        let h = direct_handle();
+        let payload = patterned(1000);
+        let before = super::super::fence_probe::count();
+        h.write(&path, &payload).expect("direct write");
+        assert!(
+            super::super::fence_probe::count() > before,
+            "a Direct write must fence the temp file before the rename"
+        );
+        assert_eq!(std::fs::read(&path).expect("read back"), payload);
+    }
+
+    // Exercises the platform `pwrite` path that runs when the kernel
+    // has no usable `io_uring` (old kernels, seccomp, containers).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_direct_write_without_io_uring_fences_before_rename() {
+        let path = tmp_path("direct_fence_no_ring");
+        let _g = TmpFile(path.clone());
+        let h = direct_handle();
+        h.disable_io_uring_for_test();
+        for len in [4096usize, 1000] {
+            let payload = patterned(len);
+            let before = super::super::fence_probe::count();
+            h.write(&path, &payload).expect("direct write");
+            assert!(
+                super::super::fence_probe::count() > before,
+                "pwrite-path Direct write of {len} bytes must fence"
+            );
+            assert_eq!(std::fs::read(&path).expect("read back"), payload);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_write_copy_direct_fences_before_rename() {
+        let path = tmp_path("direct_copy_fence");
+        let _g = TmpFile(path.clone());
+        std::fs::write(&path, b"old").expect("seed");
+        let h = direct_handle();
+        let payload = patterned(700);
+        let before = super::super::fence_probe::count();
+        h.write_copy(&path, &payload).expect("write_copy");
+        assert!(super::super::fence_probe::count() > before);
+        assert_eq!(std::fs::read(&path).expect("read back"), payload);
     }
 
     #[test]

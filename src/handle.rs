@@ -633,6 +633,18 @@ impl Handle {
         }
     }
 
+    /// Test-only: marks the `io_uring` ring as unavailable so Direct
+    /// ops take the platform `pwrite` path, the same path a kernel
+    /// without `io_uring` (or a restricted container) would take.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn disable_io_uring_for_test(&self) {
+        let mut guard = match self.iouring_slot.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *guard = IoUringState::Disabled;
+    }
+
     /// Returns a clone of the per-handle aligned buffer pool,
     /// allocating it on first call.
     ///

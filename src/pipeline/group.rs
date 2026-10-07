@@ -421,43 +421,38 @@ fn execute_write(path: &Path, data: &[u8], snapshot: &HandleSnapshot, grouped: b
         }
     })?;
 
-    // Step 2: write data. Direct IO uses sector-aligned write; buffered
-    // path is the fallback.
-    let write_result = if direct_ok {
-        platform::write_all_direct(&file, data, snapshot.sector_size)
-    } else {
-        platform::write_all(&file, data)
-    };
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&temp);
-        return Err(Error::AtomicReplaceFailed {
-            step: "write",
-            source: as_io_error(e),
-        });
-    }
-
     if direct_ok {
-        // Step 3 (Direct IO): NO_BUFFERING writes are sector-padded.
-        // Drop the NO_BUFFERING handle (WRITE_THROUGH already flushed
-        // bytes to disk on Windows; on Linux/macOS the file was just
-        // written) and reopen buffered to truncate to the actual data
-        // length. Mirrors crud/file.rs:71-84.
+        // Steps 2-3 (Direct IO): sector-padded write, trim to the real
+        // length on the same handle, then fence. `O_DIRECT` /
+        // `F_NOCACHE` do not make data durable, so the fence is
+        // required before the rename publishes the file.
+        let result =
+            crate::crud::file::write_direct_durable_platform(&file, data, snapshot.sector_size);
         drop(file);
-        if let Err(e) = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&temp)
-            .and_then(|f| f.set_len(data.len() as u64))
-        {
+        if let Err((step, e)) = result {
             let _ = std::fs::remove_file(&temp);
             return Err(Error::AtomicReplaceFailed {
-                step: "truncate",
-                source: e,
+                step,
+                source: as_io_error(e),
             });
         }
     } else {
-        // Step 3 (Buffered path): explicit flush per snapshot.method.
+        // Step 2 (Buffered path): write data.
+        if let Err(e) = platform::write_all(&file, data) {
+            drop(file);
+            let _ = std::fs::remove_file(&temp);
+            return Err(Error::AtomicReplaceFailed {
+                step: "write",
+                source: as_io_error(e),
+            });
+        }
+        // Step 3 (Buffered path): explicit flush. The primitive is
+        // chosen from the mode the file was actually opened in: a
+        // Direct request that the filesystem refused lands here and
+        // still needs a real flush.
         let flush_result = flush_for_method(&file, snapshot.method);
         if let Err(e) = flush_result {
+            drop(file);
             let _ = std::fs::remove_file(&temp);
             return Err(Error::AtomicReplaceFailed {
                 step: "flush",
@@ -508,24 +503,17 @@ fn execute_copy(src: &Path, dst: &Path, snapshot: &HandleSnapshot, grouped: bool
     execute_write(dst, &data, snapshot, grouped)
 }
 
-/// Selects the flush primitive based on method. Mirrors the
-/// `Handle::flush_file` decision tree in `crud/file.rs`.
+/// Selects the flush primitive for a file written through the buffered
+/// path. Mirrors `Handle::flush_file` in `crud/file.rs`.
+///
+/// `Direct` only reaches the buffered path when the filesystem refused
+/// Direct IO for this file (for example `FILE_FLAG_NO_BUFFERING`
+/// rejected on Windows, `O_DIRECT` rejected on tmpfs). The buffered
+/// bytes then sit in the page cache, so `Direct` maps to the same
+/// data-level fence as `Data` on every platform.
 fn flush_for_method(file: &std::fs::File, method: Method) -> Result<()> {
     match method {
-        Method::Direct => {
-            // On Windows, FILE_FLAG_WRITE_THROUGH already flushed each
-            // write. On Linux/macOS, we still need a fence — fdatasync
-            // (Linux) or F_FULLFSYNC (macOS, via sync_data).
-            #[cfg(target_os = "windows")]
-            {
-                Ok(())
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                platform::sync_data(file)
-            }
-        }
-        Method::Data => platform::sync_data(file),
+        Method::Direct | Method::Data => crate::crud::fence_data(file),
         // Sync, Auto (resolved), Mmap (reserved), Journal (reserved):
         // full fsync.
         _ => platform::sync_full(file),
@@ -716,6 +704,53 @@ mod tests {
         let _g = TmpFile(path.clone());
         let f = std::fs::File::create(&path).unwrap();
         flush_for_method(&f, Method::Data).expect("data flush");
+    }
+
+    fn direct_snapshot() -> HandleSnapshot {
+        HandleSnapshot {
+            method: Method::Direct,
+            sector_size: crate::platform::probe_sector_size(&std::env::temp_dir()),
+            use_direct: true,
+        }
+    }
+
+    #[test]
+    fn test_execute_write_direct_unaligned_reads_back_exactly() {
+        for len in [0usize, 1, 1000, 4096, 5000] {
+            let path = tmp_path("direct_unaligned");
+            let _g = TmpFile(path.clone());
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            execute_write(&path, &payload, &direct_snapshot(), false).expect("direct write");
+            assert_eq!(std::fs::read(&path).unwrap(), payload, "len {len}");
+        }
+    }
+
+    // Windows Direct writes use FILE_FLAG_WRITE_THROUGH; no separate
+    // fence is issued there.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_execute_write_direct_fences_before_rename() {
+        let path = tmp_path("direct_fence");
+        let _g = TmpFile(path.clone());
+        let before = crate::crud::fence_probe::count();
+        execute_write(&path, &[7u8; 1000], &direct_snapshot(), false).expect("direct write");
+        assert!(
+            crate::crud::fence_probe::count() > before,
+            "group-lane Direct write must fence the temp file before the rename"
+        );
+    }
+
+    #[test]
+    fn test_flush_for_method_direct_on_buffered_file_flushes() {
+        // A Direct request whose open fell back to buffered IO (e.g.
+        // NO_BUFFERING rejected) leaves dirty pages behind; the flush
+        // must be real on every platform, Windows included.
+        let path = tmp_path("flush_direct_fallback");
+        let _g = TmpFile(path.clone());
+        let f = std::fs::File::create(&path).unwrap();
+        let before = crate::crud::fence_probe::count();
+        flush_for_method(&f, Method::Direct).expect("direct fallback flush");
+        assert_eq!(crate::crud::fence_probe::count(), before + 1);
     }
 
     // ── Panic safety (decision D-6) ──────────────────────────────────────
