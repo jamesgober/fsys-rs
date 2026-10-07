@@ -183,14 +183,33 @@ pub(crate) fn open_write_at(path: &Path) -> Result<File> {
 // Writing
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Largest byte count handed to a single `ReadFile` / `WriteFile` call.
+///
+/// The Win32 calls take a `u32` length, so payloads of 4 GiB or more must
+/// be split. 2 GiB is a multiple of every power-of-two sector size, which
+/// keeps each chunk legal on `FILE_FLAG_NO_BUFFERING` handles (`u32::MAX`
+/// itself is not a sector multiple and would be rejected).
+const MAX_IO_CHUNK: usize = 1 << 31;
+
 pub(crate) fn write_all(file: &File, data: &[u8]) -> Result<()> {
+    write_all_chunked(file, data, MAX_IO_CHUNK)
+}
+
+/// Cursor-based `WriteFile` loop, at most `max_chunk` bytes per call.
+///
+/// A call that reports success with zero bytes written is an
+/// `ErrorKind::WriteZero` error rather than an endless retry.
+fn write_all_chunked(file: &File, data: &[u8], max_chunk: usize) -> Result<()> {
     let handle = file.as_raw_handle() as HANDLE;
-    let mut written = 0u32;
     let mut offset = 0usize;
 
     while offset < data.len() {
-        let chunk_len = u32::try_from(data.len() - offset).unwrap_or(u32::MAX);
-        // SAFETY: handle is valid; slice is valid for the duration.
+        let chunk_len = io_chunk_len(data.len() - offset, max_chunk);
+        let mut written = 0u32;
+        // SAFETY: handle is valid for the duration of the call;
+        // `data[offset..]` has at least `chunk_len` readable bytes;
+        // `written` is a valid out-pointer; a null OVERLAPPED selects
+        // synchronous cursor-based IO.
         let ok: BOOL = unsafe {
             WriteFile(
                 handle,
@@ -203,13 +222,37 @@ pub(crate) fn write_all(file: &File, data: &[u8]) -> Result<()> {
         if ok == FALSE {
             return Err(Error::Io(std::io::Error::last_os_error()));
         }
+        if written == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "WriteFile reported success with 0 bytes written",
+            )));
+        }
         offset += written as usize;
     }
     Ok(())
 }
 
+/// Length of the next IO chunk: `remaining` capped at `max_chunk` and at
+/// `u32::MAX` (the Win32 length type).
+fn io_chunk_len(remaining: usize, max_chunk: usize) -> u32 {
+    let capped = remaining.min(max_chunk);
+    u32::try_from(capped).unwrap_or(u32::MAX)
+}
+
+/// Builds a synchronous-IO `OVERLAPPED` that carries `offset`.
+fn overlapped_at(offset: u64) -> OVERLAPPED {
+    // SAFETY: OVERLAPPED is a repr(C) plain-old-data struct; the all-zero
+    // bit pattern (no event, zero offset) is its documented initial value.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    // Writing a union field is safe; only reads need `unsafe`.
+    overlapped.Anonymous.Anonymous.Offset = (offset & 0xFFFF_FFFF) as u32;
+    overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+    overlapped
+}
+
 pub(crate) fn write_all_direct(file: &File, data: &[u8], sector_size: u32) -> Result<()> {
-    use super::{round_up, AlignedBuf};
+    use super::AlignedBuf;
 
     // Empty input — no-op. See linux.rs::write_all_direct for the
     // rationale (AlignedBuf::new rejects size=0).
@@ -218,15 +261,40 @@ pub(crate) fn write_all_direct(file: &File, data: &[u8], sector_size: u32) -> Re
     }
 
     let ss = sector_size as usize;
-    let aligned_len = round_up(data.len(), ss);
+    let aligned_len = checked_round_up(data.len(), ss)?;
     let mut buf = AlignedBuf::new(aligned_len, ss)?;
     buf.as_mut_slice()[..data.len()].copy_from_slice(data);
     // Remainder is already zero from alloc_zeroed.
 
-    write_all(file, buf.as_slice())
+    // MAX_IO_CHUNK is a sector multiple, so every chunk stays legal on a
+    // FILE_FLAG_NO_BUFFERING handle.
+    write_all_chunked(file, buf.as_slice(), MAX_IO_CHUNK)
+}
+
+/// Rounds `n` up to a multiple of the power-of-two `align`, failing
+/// instead of overflowing.
+fn checked_round_up(n: usize, align: usize) -> Result<usize> {
+    if !align.is_power_of_two() {
+        return Err(Error::AlignmentRequired {
+            detail: "sector size is not a power of two",
+        });
+    }
+    n.checked_add(align - 1)
+        .map(|v| v & !(align - 1))
+        .ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Direct IO length overflows when rounded up to the sector size",
+            ))
+        })
 }
 
 pub(crate) fn write_at(file: &File, offset: u64, data: &[u8]) -> Result<()> {
+    write_at_chunked(file, offset, data, MAX_IO_CHUNK)
+}
+
+/// Positioned `WriteFile` loop, at most `max_chunk` bytes per call.
+fn write_at_chunked(file: &File, offset: u64, data: &[u8], max_chunk: usize) -> Result<()> {
     // Concurrent-safe positioned write — Windows' equivalent of
     // POSIX `pwrite`. We pass the offset via an `OVERLAPPED`
     // struct rather than `SetFilePointerEx`-then-`WriteFile`,
@@ -248,44 +316,50 @@ pub(crate) fn write_at(file: &File, offset: u64, data: &[u8]) -> Result<()> {
     // not race on the cursor for the *write* itself.
     let handle = file.as_raw_handle() as HANDLE;
 
-    let mut written_total: u32 = 0;
-    while (written_total as usize) < data.len() {
-        let remaining = data.len() - written_total as usize;
-        // WriteFile takes a u32 length; cap at u32::MAX.
-        let chunk_len: u32 = remaining.min(u32::MAX as usize) as u32;
-        let chunk_offset = offset + written_total as u64;
-
-        // Build the OVERLAPPED struct. Only the offset fields
-        // need to be set; hEvent stays zero (we're synchronous).
-        // Zeroing via std::mem::zeroed is sound — OVERLAPPED is
-        // a plain old struct with no invalid bit patterns.
-        // SAFETY: OVERLAPPED is repr(C), all-zero bit pattern
-        // is a valid initial value per Windows API contract.
-        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-        // `Anonymous` is a union {Anonymous: { Offset, OffsetHigh }, Pointer }.
-        // Writing to a union variant is safe (only reading is
-        // unsafe because the active variant might not match).
-        overlapped.Anonymous.Anonymous.Offset = (chunk_offset & 0xFFFF_FFFF) as u32;
-        overlapped.Anonymous.Anonymous.OffsetHigh = (chunk_offset >> 32) as u32;
+    let mut written_total = 0usize;
+    while written_total < data.len() {
+        let chunk_len = io_chunk_len(data.len() - written_total, max_chunk);
+        let chunk_offset = offset_plus(offset, written_total)?;
+        let mut overlapped = overlapped_at(chunk_offset);
 
         let mut written: u32 = 0;
-        let buf_ptr = data[written_total as usize..].as_ptr();
-        // SAFETY: handle is valid; buf_ptr points to chunk_len
-        // valid bytes; written is a valid out-pointer; overlapped
-        // is a valid OVERLAPPED struct with offset fields set.
-        let ok: BOOL =
-            unsafe { WriteFile(handle, buf_ptr, chunk_len, &mut written, &mut overlapped) };
+        // SAFETY: handle is valid; `data[written_total..]` has at least
+        // `chunk_len` readable bytes; `written` is a valid out-pointer;
+        // `overlapped` is a live OVERLAPPED carrying the offset.
+        let ok: BOOL = unsafe {
+            WriteFile(
+                handle,
+                data[written_total..].as_ptr(),
+                chunk_len,
+                &mut written,
+                &mut overlapped,
+            )
+        };
         if ok == FALSE {
             return Err(Error::Io(std::io::Error::last_os_error()));
         }
         if written == 0 {
-            return Err(Error::Io(std::io::Error::other(
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
                 "WriteFile returned 0 bytes written in write_at",
             )));
         }
-        written_total += written;
+        written_total += written as usize;
     }
     Ok(())
+}
+
+/// `base + delta` as a file offset, or an `InvalidInput` error when the
+/// sum does not fit in the signed 64-bit range Windows accepts.
+fn offset_plus(base: u64, delta: usize) -> Result<u64> {
+    base.checked_add(delta as u64)
+        .filter(|v| i64::try_from(*v).is_ok())
+        .ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file offset overflow",
+            ))
+        })
 }
 
 /// Sector-aligned positioned write for `FILE_FLAG_NO_BUFFERING` files.
@@ -1009,6 +1083,62 @@ mod tests {
         drop(f);
         let content = std::fs::read(&path).expect("read");
         assert_eq!(&content[3..6], b"XXX");
+    }
+
+    #[test]
+    fn test_write_all_chunked_splits_large_payload() {
+        let path = tmp_path("chunked_all");
+        let _g = TmpFile(path.clone());
+        let (f, _) = open_write_new(&path, false).expect("open");
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        // 7-byte chunks force ~1430 WriteFile calls.
+        write_all_chunked(&f, &data, 7).expect("write");
+        drop(f);
+        assert_eq!(std::fs::read(&path).expect("read"), data);
+    }
+
+    #[test]
+    fn test_write_at_chunked_splits_and_offsets_each_chunk() {
+        let path = tmp_path("chunked_at");
+        let _g = TmpFile(path.clone());
+        std::fs::write(&path, vec![b'.'; 64]).expect("seed");
+        let f = open_write_at(&path).expect("open");
+        write_at_chunked(&f, 10, b"abcdefghijklmnopqrstuvwxyz", 5).expect("write");
+        drop(f);
+        let got = std::fs::read(&path).expect("read");
+        assert_eq!(&got[..10], &[b'.'; 10]);
+        assert_eq!(&got[10..36], b"abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(&got[36..], &[b'.'; 28]);
+    }
+
+    #[test]
+    fn test_write_at_rejects_offset_overflow() {
+        let path = tmp_path("ovf");
+        let _g = TmpFile(path.clone());
+        std::fs::write(&path, b"x").expect("seed");
+        let f = open_write_at(&path).expect("open");
+        let err = write_at(&f, u64::MAX - 1, b"abc").expect_err("must fail");
+        assert!(matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput));
+    }
+
+    #[test]
+    fn test_io_chunk_len_caps_at_u32_and_max_chunk() {
+        assert_eq!(io_chunk_len(10, 4), 4);
+        assert_eq!(io_chunk_len(3, 4), 3);
+        assert_eq!(io_chunk_len(usize::MAX, usize::MAX), u32::MAX);
+        assert_eq!(io_chunk_len(usize::MAX, MAX_IO_CHUNK), 1 << 31);
+        // The production cap is a multiple of every sector size up to 2 GiB.
+        for shift in 9..=31 {
+            assert_eq!(MAX_IO_CHUNK % (1usize << shift), 0);
+        }
+    }
+
+    #[test]
+    fn test_checked_round_up_rejects_overflow_and_bad_align() {
+        assert_eq!(checked_round_up(1, 512).expect("ok"), 512);
+        assert_eq!(checked_round_up(512, 512).expect("ok"), 512);
+        assert!(checked_round_up(usize::MAX, 512).is_err());
+        assert!(checked_round_up(10, 3).is_err());
     }
 
     #[test]
