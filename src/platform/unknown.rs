@@ -97,10 +97,9 @@ pub(crate) fn read_all_direct(file: &File, file_size: u64, _sector_size: u32) ->
 }
 
 pub(crate) fn read_range(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; len];
-    let total = positioned::read_at_most(file, offset, &mut buf).map_err(Error::Io)?;
-    buf.truncate(total);
-    Ok(buf)
+    super::read_range_with(file, offset, len, |buf, pos| {
+        positioned::read_at(file, buf, pos)
+    })
 }
 
 /// Positioned IO that does not race on a shared file cursor.
@@ -116,25 +115,9 @@ mod positioned {
         file.write_all_at(data, offset)
     }
 
-    /// `pread(2)` loop that fills `buf` or stops at end of file. Returns
-    /// the number of bytes read.
-    pub(super) fn read_at_most(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut total = 0usize;
-        while total < buf.len() {
-            let pos = offset.checked_add(total as u64).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "read_range: offset overflow",
-                )
-            })?;
-            match file.read_at(&mut buf[total..], pos) {
-                Ok(0) => break,
-                Ok(n) => total += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(total)
+    /// One `pread(2)`; leaves the file cursor untouched.
+    pub(super) fn read_at(file: &File, buf: &mut [u8], pos: u64) -> std::io::Result<usize> {
+        file.read_at(buf, pos)
     }
 }
 
@@ -176,19 +159,8 @@ mod positioned {
         with_cursor_at(file, offset, |f| f.write_all(data))
     }
 
-    pub(super) fn read_at_most(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
-        with_cursor_at(file, offset, |f| {
-            let mut total = 0usize;
-            while total < buf.len() {
-                match f.read(&mut buf[total..]) {
-                    Ok(0) => break,
-                    Ok(n) => total += n,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok(total)
-        })
+    pub(super) fn read_at(file: &File, buf: &mut [u8], pos: u64) -> std::io::Result<usize> {
+        with_cursor_at(file, pos, |f| f.read(buf))
     }
 }
 

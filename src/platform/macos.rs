@@ -287,41 +287,22 @@ pub(crate) fn read_all_direct(file: &File, file_size: u64, sector_size: u32) -> 
 
 pub(crate) fn read_range(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
     let fd = file.as_raw_fd();
-    let mut buf = vec![0u8; len];
-    let mut total_read = 0usize;
-    while total_read < len {
-        let off = (offset as i64)
-            .checked_add(total_read as i64)
-            .ok_or_else(|| {
-                Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "read_range: offset overflow",
-                ))
-            })?;
-        // SAFETY: fd is valid; the slice is valid.
-        let n = unsafe {
-            libc::pread(
-                fd,
-                buf[total_read..].as_mut_ptr().cast::<libc::c_void>(),
-                len - total_read,
-                off as libc::off_t,
+    super::read_range_with(file, offset, len, |buf, pos| {
+        let off = libc::off_t::try_from(pos).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "read_range: offset exceeds off_t",
             )
-        };
+        })?;
+        // SAFETY: fd is valid for the call; `buf` is a live, writable
+        // slice of `buf.len()` bytes and pread writes at most that many.
+        let n = unsafe { libc::pread(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len(), off) };
         if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(Error::Io(err));
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
         }
-        if n == 0 {
-            buf.truncate(total_read);
-            break;
-        }
-        total_read += n as usize;
-    }
-    buf.truncate(total_read);
-    Ok(buf)
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -301,10 +301,76 @@ pub(crate) fn read_all_direct(
     imp::read_all_direct(file, file_size, sector_size)
 }
 
-/// Reads `len` bytes from `file` starting at `offset`.
+/// Reads up to `len` bytes from `file` starting at `offset`.
+///
+/// Returns fewer bytes when the file ends first, and an empty buffer when
+/// `offset` is at or past the end. The read position comes from the call
+/// (`pread(2)` on Unix, `OVERLAPPED` offsets on Windows), so concurrent
+/// callers on the same handle do not race on a shared cursor.
+///
+/// The buffer is never larger than the file can supply: see
+/// [`read_range_with`].
+///
+/// Not suitable for `O_DIRECT` / `FILE_FLAG_NO_BUFFERING` handles: the
+/// returned `Vec` is not sector-aligned and the clamped length need not be
+/// a sector multiple.
 #[inline]
 pub(crate) fn read_range(file: &std::fs::File, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
     imp::read_range(file, offset, len)
+}
+
+/// Buffer growth step for range reads on files whose size is not known
+/// up front (pipes, character devices, procfs entries).
+const RANGE_READ_GROW_STEP: usize = 64 * 1024;
+
+/// Shared body of every platform's `read_range`.
+///
+/// `read_at(buf, pos)` is the platform's positioned read: it fills a
+/// prefix of `buf` from file offset `pos` and returns the byte count
+/// (`0` at end of file). `ErrorKind::Interrupted` is retried.
+///
+/// Allocation is bounded by what the file can supply, never by `len`
+/// alone: for a regular file the request is clamped to `size - offset`
+/// from one `fstat` (an `offset` at or past the end returns an empty
+/// buffer without reading); for other file types the buffer grows in
+/// 64 KiB steps as data arrives.
+pub(crate) fn read_range_with(
+    file: &std::fs::File,
+    offset: u64,
+    len: usize,
+    mut read_at: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> crate::Result<Vec<u8>> {
+    let meta = file.metadata().map_err(crate::Error::Io)?;
+    let (limit, initial) = if meta.is_file() {
+        let available = meta.len().saturating_sub(offset);
+        let limit = usize::try_from(available).map_or(len, |a| a.min(len));
+        (limit, limit)
+    } else {
+        (len, len.min(RANGE_READ_GROW_STEP))
+    };
+
+    let mut buf = vec![0u8; initial];
+    let mut total = 0usize;
+    while total < limit {
+        if total == buf.len() {
+            let grow = (limit - total).min(RANGE_READ_GROW_STEP.max(buf.len()));
+            buf.resize(total + grow, 0);
+        }
+        let pos = offset.checked_add(total as u64).ok_or_else(|| {
+            crate::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "read_range: offset overflow",
+            ))
+        })?;
+        match read_at(&mut buf[total..], pos) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(crate::Error::Io(e)),
+        }
+    }
+    buf.truncate(total);
+    Ok(buf)
 }
 
 /// Flushes data-only (equivalent of `fdatasync`).
@@ -640,6 +706,84 @@ mod tests {
             "sector size must be at least 512, got {}",
             size
         );
+    }
+
+    fn range_tmp(tag: &str, contents: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "fsys_platform_range_{}_{}",
+            std::process::id(),
+            tag
+        ));
+        std::fs::write(&path, contents).expect("seed");
+        path
+    }
+
+    #[test]
+    fn test_read_range_returns_requested_bytes() {
+        let path = range_tmp("mid", b"0123456789");
+        let f = std::fs::File::open(&path).expect("open");
+        assert_eq!(read_range(&f, 2, 4).expect("read"), b"2345");
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_range_short_at_eof_and_empty_past_eof() {
+        let path = range_tmp("eof", b"hello");
+        let f = std::fs::File::open(&path).expect("open");
+        assert_eq!(read_range(&f, 3, 100).expect("tail"), b"lo");
+        assert!(read_range(&f, 5, 10).expect("at eof").is_empty());
+        assert!(read_range(&f, u64::MAX, 10)
+            .expect("far past eof")
+            .is_empty());
+        assert!(read_range(&f, 0, 0).expect("zero len").is_empty());
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_range_huge_len_does_not_allocate_len() {
+        // usize::MAX would abort the process if it were allocated.
+        let path = range_tmp("huge", b"abc");
+        let f = std::fs::File::open(&path).expect("open");
+        assert_eq!(read_range(&f, 0, usize::MAX).expect("read"), b"abc");
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_range_with_retries_interrupted_and_stops_at_zero() {
+        let path = range_tmp("interrupt", b"abcdef");
+        let f = std::fs::File::open(&path).expect("open");
+        let mut calls = 0;
+        let got = read_range_with(&f, 0, 6, |buf, pos| {
+            calls += 1;
+            if calls == 1 {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            // Two bytes per call.
+            let src = b"abcdef";
+            let start = pos as usize;
+            let n = buf.len().min(2).min(src.len() - start);
+            buf[..n].copy_from_slice(&src[start..start + n]);
+            Ok(n)
+        })
+        .expect("read");
+        assert_eq!(got, b"abcdef");
+        assert_eq!(calls, 4);
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_range_with_propagates_errors() {
+        let path = range_tmp("err", b"abc");
+        let f = std::fs::File::open(&path).expect("open");
+        let err = read_range_with(&f, 0, 3, |_, _| Err(std::io::Error::other("boom")))
+            .expect_err("must fail");
+        assert!(matches!(err, crate::Error::Io(_)));
+        drop(f);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

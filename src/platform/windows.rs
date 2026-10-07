@@ -26,7 +26,7 @@
 
 use crate::{Error, Result};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::Path;
 
@@ -465,21 +465,17 @@ fn read_all_direct_chunked(
 }
 
 pub(crate) fn read_range(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
-    // Clone the handle so we get an independent file cursor to seek.
-    let mut seekable = file.try_clone().map_err(Error::Io)?;
-    let _pos = seekable.seek(SeekFrom::Start(offset)).map_err(Error::Io)?;
-
-    let mut buf = vec![0u8; len];
-    let mut total = 0usize;
-    while total < len {
-        let n = seekable.read(&mut buf[total..]).map_err(Error::Io)?;
-        if n == 0 {
-            break;
-        }
-        total += n;
-    }
-    buf.truncate(total);
-    Ok(buf)
+    // `FileExt::seek_read` passes the offset in an OVERLAPPED struct, so
+    // concurrent callers on one handle each read their own range. As with
+    // `write_at`, Windows still moves the handle's cursor after the call;
+    // nothing in fsys reads through the cursor of a handle it range-reads.
+    // A read starting at or past EOF comes back as `Ok(0)`.
+    use std::os::windows::fs::FileExt;
+    super::read_range_with(file, offset, len, |buf, pos| {
+        // ReadFile takes a u32 length; a short read just loops.
+        let cap = buf.len().min(MAX_IO_CHUNK);
+        file.seek_read(&mut buf[..cap], pos)
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
