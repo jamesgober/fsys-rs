@@ -230,7 +230,7 @@ parking_lot = "0.12"
 # `memmap2` is the maintained successor, widely vetted in production
 # Rust storage projects (RocksDB-rs bindings, sled, etc.). Minimal
 # transitive deps.
-memmap2 = "0.9"
+memmap2 = "0.9.11"
 
 # Glob-pattern matching for `Handle::find`. Standard syntax (`*`,
 # `**`, `?`, `[abc]`, `{foo,bar}`) — the de-facto pattern crate in
