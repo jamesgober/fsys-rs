@@ -566,11 +566,39 @@ pub(crate) fn atomic_rename(from: &std::path::Path, to: &std::path::Path) -> cra
 /// Opens the parent directory and calls `fsync` on it.
 ///
 /// Required on Linux and macOS after an atomic rename to guarantee that the
-/// directory entry update is durable. No-op on Windows (directory durability
-/// is implicit with `WRITE_THROUGH`) and on unknown platforms.
+/// directory entry update is durable. A bare file name (`"file"`, whose
+/// `parent()` is the empty path) syncs the current directory.
+///
+/// # Platform-specific behavior
+///
+/// - Linux: `fsync(2)` on the directory.
+/// - macOS: `fcntl(F_FULLFSYNC)` on the directory, `fsync(2)` where the
+///   file system rejects `F_FULLFSYNC`.
+/// - Windows: opens the directory with `FILE_FLAG_BACKUP_SEMANTICS` and
+///   `FILE_WRITE_DATA` access (no administrator rights needed) and calls
+///   `FlushFileBuffers`, which commits the rename's directory-entry
+///   change. File systems that cannot flush a directory handle
+///   (`ERROR_INVALID_FUNCTION`, `ERROR_NOT_SUPPORTED`,
+///   `ERROR_INVALID_PARAMETER`) are treated as success, which is what this
+///   function did unconditionally before 1.1.1.
+/// - Other Unix (the BSDs): `fsync(2)` on the directory.
+/// - Other targets: no-op.
 #[inline]
 pub(crate) fn sync_parent_dir(path: &std::path::Path) -> crate::Result<()> {
     imp::sync_parent_dir(path)
+}
+
+/// Directory that holds `path`: its parent, or `"."` when `path` is a
+/// bare file name (whose `parent()` is the empty path, which no OS can
+/// open) or has no parent at all.
+// Unused only on non-Unix, non-Windows fallback targets, whose
+// `sync_parent_dir` is a no-op.
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+pub(crate) fn parent_or_current_dir(path: &std::path::Path) -> &std::path::Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    }
 }
 
 /// Copies `src` to `dst` using the best available platform primitive.
@@ -784,6 +812,30 @@ mod tests {
         assert!(matches!(err, crate::Error::Io(_)));
         drop(f);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_parent_or_current_dir_maps_bare_name_to_dot() {
+        use std::path::Path;
+        assert_eq!(parent_or_current_dir(Path::new("file")), Path::new("."));
+        assert_eq!(parent_or_current_dir(Path::new("")), Path::new("."));
+        assert_eq!(parent_or_current_dir(Path::new("a/b")), Path::new("a"));
+    }
+
+    #[test]
+    fn test_sync_parent_dir_accepts_bare_file_name() {
+        // `Path::new("x").parent()` is `Some("")`; opening "" fails with
+        // ENOENT, so this used to error on Linux and macOS.
+        sync_parent_dir(std::path::Path::new("fsys-bare-name-that-need-not-exist"))
+            .expect("bare file name syncs the current directory");
+    }
+
+    #[test]
+    fn test_sync_parent_dir_errors_for_missing_directory() {
+        let missing = std::env::temp_dir()
+            .join(format!("fsys_no_such_dir_{}", std::process::id()))
+            .join("file");
+        assert!(sync_parent_dir(&missing).is_err());
     }
 
     #[test]

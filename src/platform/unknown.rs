@@ -184,8 +184,17 @@ pub(crate) fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
     std::fs::rename(from, to).map_err(Error::Io)
 }
 
+/// Unix-family targets (the BSDs) can `fsync(2)` a directory descriptor,
+/// which `File::sync_all` does.
+#[cfg(unix)]
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
+    let dir = File::open(super::parent_or_current_dir(path)).map_err(Error::Io)?;
+    dir.sync_all().map_err(Error::Io)
+}
+
+/// No portable way to sync a directory on non-Unix targets; no-op.
+#[cfg(not(unix))]
 pub(crate) fn sync_parent_dir(_path: &Path) -> Result<()> {
-    // No portable way to sync a directory; no-op on unknown platforms.
     Ok(())
 }
 

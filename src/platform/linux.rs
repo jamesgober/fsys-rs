@@ -420,8 +420,7 @@ pub(crate) fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
 }
 
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let dir = File::open(parent).map_err(Error::Io)?;
+    let dir = File::open(super::parent_or_current_dir(path)).map_err(Error::Io)?;
     let fd = dir.as_raw_fd();
     // SAFETY: fd is a valid open directory file descriptor.
     let ret = unsafe { libc::fsync(fd) };

@@ -589,9 +589,11 @@ pub(crate) fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
     let to_wide = to_wide(to);
 
     // MOVEFILE_REPLACE_EXISTING: replace `to` if it exists.
-    // MOVEFILE_WRITE_THROUGH: do not return until the rename is flushed to
-    // stable media, matching the durability guarantee of the write that
-    // preceded this rename.
+    // MOVEFILE_WRITE_THROUGH: per the MoveFileExW documentation this only
+    // waits for the flush when the move is carried out as copy + delete
+    // (a cross-volume move). A same-volume rename returns once NTFS has
+    // logged it, not once the log is on stable media; callers that need
+    // the new name to survive a crash follow up with `sync_parent_dir`.
     //
     // SAFETY: both wide strings are valid NUL-terminated UTF-16.
     let ok: BOOL = unsafe {
@@ -608,10 +610,54 @@ pub(crate) fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
     }
 }
 
-pub(crate) fn sync_parent_dir(_path: &Path) -> Result<()> {
-    // Directory durability on Windows is implicit when using WRITE_THROUGH
-    // on the file rename. No separate directory fsync is needed.
-    Ok(())
+/// Flushes the directory that holds `path` so a preceding rename into it
+/// is durable.
+///
+/// Opens the directory with `FILE_FLAG_BACKUP_SEMANTICS` (required for
+/// directory handles) and `FILE_WRITE_DATA` access, the minimum
+/// `FlushFileBuffers` accepts on a directory; no administrator rights or
+/// backup privilege are needed. File systems that cannot flush a
+/// directory handle report `ERROR_INVALID_FUNCTION`,
+/// `ERROR_NOT_SUPPORTED` or `ERROR_INVALID_PARAMETER`; those are treated
+/// as success (the pre-1.1.1 behaviour on every volume). Any other open
+/// or flush error is returned.
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_WRITE_DATA,
+    };
+
+    let wide = to_wide(super::parent_or_current_dir(path));
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the
+    // call; the flags are valid CreateFileW arguments; the result is
+    // checked against INVALID_HANDLE_VALUE before use.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_WRITE_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: `handle` is a valid directory handle we own; wrapping it in
+    // a File closes it on every return path.
+    let dir = unsafe { File::from_raw_handle(handle as RawHandle) };
+    match sync_full(&dir) {
+        Err(Error::Io(e)) if directory_flush_unsupported(e.raw_os_error()) => Ok(()),
+        other => other,
+    }
+}
+
+/// `true` for the Win32 errors a file system returns when it cannot flush
+/// a directory handle: ERROR_INVALID_FUNCTION (1), ERROR_NOT_SUPPORTED
+/// (50), ERROR_INVALID_PARAMETER (87).
+fn directory_flush_unsupported(code: Option<i32>) -> bool {
+    matches!(code, Some(1) | Some(50) | Some(87))
 }
 
 /// 0.9.5 — Punches a hole at `[offset, offset + len)` via
@@ -1100,6 +1146,23 @@ mod tests {
         // really calls FlushFileBuffers instead of returning early.
         let (ro, _) = open_read(&path, false).expect("open ro");
         assert!(sync_barrier(&ro).is_err());
+    }
+
+    #[test]
+    fn test_sync_parent_dir_flushes_real_directory() {
+        let path = tmp_path("dirsync");
+        let _g = TmpFile(path.clone());
+        std::fs::write(&path, b"x").expect("seed");
+        sync_parent_dir(&path).expect("flush temp dir");
+    }
+
+    #[test]
+    fn test_directory_flush_unsupported_classification() {
+        assert!(directory_flush_unsupported(Some(1)));
+        assert!(directory_flush_unsupported(Some(50)));
+        assert!(directory_flush_unsupported(Some(87)));
+        assert!(!directory_flush_unsupported(Some(5)));
+        assert!(!directory_flush_unsupported(None));
     }
 
     #[test]

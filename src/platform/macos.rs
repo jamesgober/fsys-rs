@@ -476,8 +476,7 @@ pub(crate) fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
 }
 
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let dir = File::open(parent).map_err(Error::Io)?;
+    let dir = File::open(super::parent_or_current_dir(path)).map_err(Error::Io)?;
     // Use F_FULLFSYNC on the directory as well for full durability, with
     // the same fsync(2) fallback as `sync_full`.
     full_fsync_fd(dir.as_raw_fd())
