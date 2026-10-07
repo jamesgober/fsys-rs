@@ -312,12 +312,25 @@ pub(crate) fn read_range(file: &std::fs::File, offset: u64, len: usize) -> crate
 /// On platforms without `fdatasync` (macOS, Windows), falls back to a
 /// full flush. The caller is responsible for updating `active_method()`
 /// when this fallback occurs.
+///
+/// # Platform-specific behavior
+///
+/// - Linux: `fdatasync(2)`.
+/// - macOS: `fcntl(F_FULLFSYNC)`, which also flushes the drive's write
+///   cache. File systems that reject `F_FULLFSYNC` (`ENOTSUP`,
+///   `EOPNOTSUPP`, `EINVAL`) get `fsync(2)` instead. This is the call
+///   that makes a `Method::Direct` (`F_NOCACHE`) write durable on macOS.
+/// - Windows: `FlushFileBuffers`.
+/// - Unknown: `File::sync_all`.
 #[inline]
 pub(crate) fn sync_data(file: &std::fs::File) -> crate::Result<()> {
     imp::sync_data(file)
 }
 
 /// Full file flush (equivalent of `fsync` / `F_FULLFSYNC`).
+///
+/// Same per-platform primitives as [`sync_data`] except on Linux, where
+/// this is `fsync(2)`.
 #[inline]
 pub(crate) fn sync_full(file: &std::fs::File) -> crate::Result<()> {
     imp::sync_full(file)

@@ -325,11 +325,17 @@ pub(crate) fn read_range(file: &File, offset: u64, len: usize) -> Result<Vec<u8>
 // Durability
 //
 // On macOS, regular fsync(2) only flushes to the drive's write cache and does
-// NOT guarantee media durability. F_FULLFSYNC is the only correct primitive
-// for crash-safe writes. This applies to ALL methods on macOS:
-//   - Method::Sync:   F_FULLFSYNC
-//   - Method::Data:   F_FULLFSYNC (no fdatasync on macOS)
-//   - Method::Direct: F_FULLFSYNC (F_NOCACHE + F_FULLFSYNC)
+// NOT guarantee media durability. `sync_data` and `sync_full` therefore both
+// issue F_FULLFSYNC, which asks the drive to flush its cache to stable media.
+//
+// F_NOCACHE (the `Method::Direct` open flag) only bypasses the unified buffer
+// cache; it does not flush the drive's write cache. A Direct write is durable
+// only once the caller follows it with `sync_data` / `sync_full`.
+//
+// Fallback: file systems that do not implement F_FULLFSYNC (some network and
+// FUSE mounts) reject it with ENOTSUP / EOPNOTSUPP / EINVAL. On those errors
+// the call falls back to fsync(2), which is the strongest flush such a file
+// system offers. Any other error is returned to the caller.
 // ──────────────────────────────────────────────────────────────────────────────
 
 pub(crate) fn sync_data(file: &File) -> Result<()> {
@@ -338,16 +344,48 @@ pub(crate) fn sync_data(file: &File) -> Result<()> {
 }
 
 pub(crate) fn sync_full(file: &File) -> Result<()> {
-    let fd = file.as_raw_fd();
-    // F_FULLFSYNC forces the drive to flush its write cache to stable media.
-    // This is the only durable sync primitive on macOS.
-    //
-    // SAFETY: fd is a valid open file descriptor.
-    let ret = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC, 0_i32) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(Error::Io(std::io::Error::last_os_error()))
+    full_fsync_fd(file.as_raw_fd())
+}
+
+/// Issues `fcntl(fd, F_FULLFSYNC)`, retrying on `EINTR` and falling back
+/// to `fsync(2)` when the file system does not support the fcntl.
+fn full_fsync_fd(fd: libc::c_int) -> Result<()> {
+    loop {
+        // SAFETY: `fd` is a valid open descriptor borrowed from a live
+        // `File` for the duration of the call; F_FULLFSYNC takes no
+        // pointer argument.
+        let ret = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC, 0_i32) };
+        if ret != -1 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(code) if full_fsync_unsupported(code) => return fsync_fd(fd),
+            _ => return Err(Error::Io(err)),
+        }
+    }
+}
+
+/// `true` for the errno values a file system without F_FULLFSYNC support
+/// returns.
+fn full_fsync_unsupported(code: libc::c_int) -> bool {
+    code == libc::ENOTSUP || code == libc::EOPNOTSUPP || code == libc::EINVAL
+}
+
+/// Plain `fsync(2)`, retrying on `EINTR`.
+fn fsync_fd(fd: libc::c_int) -> Result<()> {
+    loop {
+        // SAFETY: `fd` is a valid open descriptor borrowed from a live
+        // `File` for the duration of the call.
+        let ret = unsafe { libc::fsync(fd) };
+        if ret == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(Error::Io(err));
+        }
     }
 }
 
@@ -456,15 +494,9 @@ pub(crate) fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let dir = File::open(parent).map_err(Error::Io)?;
-    let fd = dir.as_raw_fd();
-    // Use F_FULLFSYNC on the directory as well for full durability.
-    // SAFETY: fd is a valid open directory file descriptor.
-    let ret = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC, 0_i32) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(Error::Io(std::io::Error::last_os_error()))
-    }
+    // Use F_FULLFSYNC on the directory as well for full durability, with
+    // the same fsync(2) fallback as `sync_full`.
+    full_fsync_fd(dir.as_raw_fd())
 }
 
 pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
@@ -713,6 +745,29 @@ mod tests {
         let (f, _) = open_write_new(&path, false).expect("open");
         write_all(&f, b"sync test").expect("write");
         sync_full(&f).expect("sync_full");
+    }
+
+    #[test]
+    fn test_sync_data_succeeds_after_direct_write() {
+        let path = tmp_path("direct_sync");
+        let _g = TmpFile(path.clone());
+        let (f, _) = open_write_new(&path, true).expect("open");
+        write_all_direct(&f, b"direct then sync", 4096).expect("write");
+        sync_data(&f).expect("sync_data");
+    }
+
+    #[test]
+    fn test_full_fsync_unsupported_classification() {
+        assert!(full_fsync_unsupported(libc::ENOTSUP));
+        assert!(full_fsync_unsupported(libc::EOPNOTSUPP));
+        assert!(full_fsync_unsupported(libc::EINVAL));
+        assert!(!full_fsync_unsupported(libc::EIO));
+        assert!(!full_fsync_unsupported(libc::EBADF));
+    }
+
+    #[test]
+    fn test_sync_full_on_bad_fd_errors() {
+        assert!(full_fsync_fd(-1).is_err());
     }
 
     #[test]
