@@ -4,6 +4,7 @@
 //! - `file`: file write, read, append, delete, copy, exists, size, metadata.
 //! - `dir`: directory create, remove, list, exists.
 
+pub(crate) mod atomic;
 pub(crate) mod dir;
 pub(crate) mod file;
 

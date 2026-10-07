@@ -10,16 +10,14 @@
 //! the Handle before being placed in [`BatchOp`]s; the dispatcher does
 //! not perform path resolution or root-jail enforcement.
 //!
-//! [`execute_write`] is a leaner extraction of
-//! [`crate::crud::file`]'s atomic-replace flow. It mirrors solo-lane
-//! semantics — temp file → write → flush → atomic rename → best-effort
-//! parent-dir sync — except for the one piece that requires Handle
-//! state: when `O_DIRECT` is rejected at open time on a per-op basis,
-//! the dispatcher falls back locally for that op but does **not**
-//! propagate the fallback back to [`crate::Handle::active_method`].
-//! Per-op failure is still observable via [`BatchError::source`]. This
-//! is decision D-5 in `.dev/DECISIONS-0.4.0.md`; full cross-lane
-//! consistency arrives in `0.5.0`.
+//! [`execute_write`] runs the same atomic-replace sequence as the solo
+//! lane ([`crate::crud::atomic`]): temp file, write, fence, rename,
+//! parent-directory sync. The one piece that requires Handle state is
+//! not available here: when Direct IO is rejected at open time for a
+//! particular op, the dispatcher falls back locally for that op but
+//! does **not** propagate the fallback back to
+//! [`crate::Handle::active_method`] (decision D-5 in
+//! `.dev/DECISIONS-0.4.0.md`).
 //!
 //! ## Panic safety
 //!
@@ -36,8 +34,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{select, Receiver, Sender};
 
+use crate::crud::atomic::{atomic_replace, BufferedFlush, PlatformHooks, ReplacePlan};
 use crate::error::BatchError;
-use crate::handle::Handle;
 use crate::method::Method;
 use crate::platform;
 use crate::{Error, Result};
@@ -406,82 +404,29 @@ fn execute_op(op: BatchOp, snapshot: &HandleSnapshot, grouped: bool) -> Result<(
     }
 }
 
-/// Atomic-replace write. Mirrors [`crate::crud::file`]'s `Handle::write`
-/// minus the `update_active_method` callback. See decisions D-1 and
-/// D-4(c) in `.dev/DECISIONS-0.4.0.md` for why this duplication exists
-/// and where it folds back together in `0.5.0`.
+/// Atomic-replace write through the shared sequence in
+/// [`crate::crud::atomic`]. Direct writes use the platform path (the
+/// dispatcher has no handle, so no `io_uring` ring); a Direct request
+/// that the filesystem refuses falls back to a buffered write for this
+/// op only, without changing [`crate::Handle::active_method`]
+/// (decision D-5 in `.dev/DECISIONS-0.4.0.md`).
+///
+/// In grouped mode the parent-directory sync is skipped here and
+/// issued once per unique directory by [`process_jobs_with`].
 fn execute_write(path: &Path, data: &[u8], snapshot: &HandleSnapshot, grouped: bool) -> Result<()> {
-    let temp = Handle::gen_temp_path(path);
-
-    // Step 1: open the temp file (Direct IO if requested).
-    let (file, direct_ok) = platform::open_write_new(&temp, snapshot.use_direct).map_err(|e| {
-        Error::AtomicReplaceFailed {
-            step: "open_temp",
-            source: as_io_error(e),
-        }
-    })?;
-
-    if direct_ok {
-        // Steps 2-3 (Direct IO): sector-padded write, trim to the real
-        // length on the same handle, then fence. `O_DIRECT` /
-        // `F_NOCACHE` do not make data durable, so the fence is
-        // required before the rename publishes the file.
-        let result =
-            crate::crud::file::write_direct_durable_platform(&file, data, snapshot.sector_size);
-        drop(file);
-        if let Err((step, e)) = result {
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step,
-                source: as_io_error(e),
-            });
-        }
-    } else {
-        // Step 2 (Buffered path): write data.
-        if let Err(e) = platform::write_all(&file, data) {
-            drop(file);
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "write",
-                source: as_io_error(e),
-            });
-        }
-        // Step 3 (Buffered path): explicit flush. The primitive is
-        // chosen from the mode the file was actually opened in: a
-        // Direct request that the filesystem refused lands here and
-        // still needs a real flush.
-        let flush_result = flush_for_method(&file, snapshot.method);
-        if let Err(e) = flush_result {
-            drop(file);
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "flush",
-                source: as_io_error(e),
-            });
-        }
-        drop(file);
-    }
-
-    // Step 5: atomic rename.
-    if let Err(e) = platform::atomic_rename(&temp, path) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(Error::AtomicReplaceFailed {
-            step: "rename",
-            source: as_io_error(e),
-        });
-    }
-
-    // Step 6: best-effort parent-dir sync (no-op on Windows).
-    // 0.9.3: in grouped mode, the dispatcher amortises this
-    // call across the whole batch — it accumulates unique
-    // parent directories and issues one `sync_parent_dir` per
-    // unique parent after the entire batch succeeds, instead
-    // of paying per-op.
-    if !grouped {
-        let _ = platform::sync_parent_dir(path);
-    }
-
-    Ok(())
+    let plan = ReplacePlan {
+        use_direct: snapshot.use_direct,
+        flush: BufferedFlush::for_method(snapshot.method),
+        sync_parent: !grouped,
+    };
+    atomic_replace(
+        path,
+        data,
+        &plan,
+        &PlatformHooks {
+            sector_size: snapshot.sector_size,
+        },
+    )
 }
 
 /// Idempotent delete: missing-file is `Ok(())`.
@@ -501,33 +446,6 @@ fn execute_copy(src: &Path, dst: &Path, snapshot: &HandleSnapshot, grouped: bool
     // chooses the atomic-replace path for consistency with `Handle::write`.
     let data = std::fs::read(src).map_err(Error::Io)?;
     execute_write(dst, &data, snapshot, grouped)
-}
-
-/// Selects the flush primitive for a file written through the buffered
-/// path. Mirrors `Handle::flush_file` in `crud/file.rs`.
-///
-/// `Direct` only reaches the buffered path when the filesystem refused
-/// Direct IO for this file (for example `FILE_FLAG_NO_BUFFERING`
-/// rejected on Windows, `O_DIRECT` rejected on tmpfs). The buffered
-/// bytes then sit in the page cache, so `Direct` maps to the same
-/// data-level fence as `Data` on every platform.
-fn flush_for_method(file: &std::fs::File, method: Method) -> Result<()> {
-    match method {
-        Method::Direct | Method::Data => crate::crud::fence_data(file),
-        // Sync, Auto (resolved), Mmap (reserved), Journal (reserved):
-        // full fsync.
-        _ => platform::sync_full(file),
-    }
-}
-
-/// Converts a `crate::Error` into a `std::io::Error` for embedding in
-/// `Error::AtomicReplaceFailed { source: std::io::Error }`. Mirrors the
-/// helper of the same name in `crud/file.rs`.
-fn as_io_error(e: Error) -> std::io::Error {
-    match e {
-        Error::Io(io_err) => io_err,
-        other => std::io::Error::other(other.to_string()),
-    }
 }
 
 #[cfg(test)]
@@ -671,41 +589,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_as_io_error_passes_through_io_variant() {
-        let inner = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        let err = Error::Io(inner);
-        let io = as_io_error(err);
-        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
-    }
-
-    #[test]
-    fn test_as_io_error_wraps_non_io_variant() {
-        let err = Error::HardwareProbeFailed {
-            detail: "stub".into(),
-        };
-        let io = as_io_error(err);
-        // The display string of the original error is embedded.
-        assert!(io.to_string().contains("FS-00003"));
-    }
-
-    #[test]
-    fn test_flush_for_method_sync_calls_full_sync() {
-        // Smoke test: open a file, flush with Method::Sync.
-        let path = tmp_path("flush_sync");
-        let _g = TmpFile(path.clone());
-        let f = std::fs::File::create(&path).unwrap();
-        flush_for_method(&f, Method::Sync).expect("sync flush");
-    }
-
-    #[test]
-    fn test_flush_for_method_data_calls_data_sync() {
-        let path = tmp_path("flush_data");
-        let _g = TmpFile(path.clone());
-        let f = std::fs::File::create(&path).unwrap();
-        flush_for_method(&f, Method::Data).expect("data flush");
-    }
-
     fn direct_snapshot() -> HandleSnapshot {
         HandleSnapshot {
             method: Method::Direct,
@@ -738,19 +621,6 @@ mod tests {
             crate::crud::fence_probe::count() > before,
             "group-lane Direct write must fence the temp file before the rename"
         );
-    }
-
-    #[test]
-    fn test_flush_for_method_direct_on_buffered_file_flushes() {
-        // A Direct request whose open fell back to buffered IO (e.g.
-        // NO_BUFFERING rejected) leaves dirty pages behind; the flush
-        // must be real on every platform, Windows included.
-        let path = tmp_path("flush_direct_fallback");
-        let _g = TmpFile(path.clone());
-        let f = std::fs::File::create(&path).unwrap();
-        let before = crate::crud::fence_probe::count();
-        flush_for_method(&f, Method::Direct).expect("direct fallback flush");
-        assert_eq!(crate::crud::fence_probe::count(), before + 1);
     }
 
     // ── Panic safety (decision D-6) ──────────────────────────────────────

@@ -1,15 +1,16 @@
 //! File CRUD operations implemented as `impl Handle`.
 //!
-//! All writes use an atomic temp-rename pattern:
-//! 1. Write to a temp file (`.fsys-tmp-<n>.<target>`).
-//! 2. Flush to the requested durability level.
-//! 3. `rename(temp, target)` — atomic on POSIX; `MoveFileExW` on Windows.
+//! Whole-file writes (`write`, `write_copy`) use the atomic temp-rename
+//! sequence in [`super::atomic`]:
+//! 1. Write to a fresh temp file next to the target.
+//! 2. Make it durable at the handle's durability level.
+//! 3. `rename(temp, target)`: atomic on POSIX; `MoveFileExW` on Windows.
 //! 4. Sync the parent directory (Linux/macOS; no-op on Windows).
 //!
-//! On any failure after temp creation, the temp file is removed with a
-//! best-effort delete (failure to clean up is not reported back to the
-//! caller because the primary error has already been set).
+//! On any failure after temp creation the temp file is removed; the
+//! primary error is what the caller sees.
 
+use super::atomic::{atomic_replace, BufferedFlush, ReplaceHooks, ReplacePlan, StepResult};
 use crate::handle::Handle;
 use crate::meta::FileMeta;
 use crate::method::Method;
@@ -86,74 +87,15 @@ impl Handle {
             self.update_active_method(Method::Sync);
         }
 
-        let temp = Self::gen_temp_path(&path);
-
-        // Step 1: open the temp file.
-        let (file, direct_ok) =
-            platform::open_write_new(&temp, self.use_direct()).map_err(|e| {
-                Error::AtomicReplaceFailed {
-                    step: "open_temp",
-                    source: as_io_error(e),
-                }
-            })?;
-
-        if self.use_direct() && !direct_ok {
-            self.update_active_method(Method::Data);
-        }
-
-        if direct_ok {
-            // Steps 2-3 (Direct IO path): padded write, trim to the
-            // real length on the same handle, then fence. The fence
-            // runs after the trim so the length that the rename
-            // publishes is the one on stable storage.
-            let result = self.direct_write_durable(&file, &path, data);
-            drop(file);
-            if let Err((step, e)) = result {
-                let _ = std::fs::remove_file(&temp);
-                return Err(Error::AtomicReplaceFailed {
-                    step,
-                    source: as_io_error(e),
-                });
-            }
-        } else {
-            // Step 2 (Buffered path): write data.
-            if let Err(e) = platform::write_all(&file, data) {
-                drop(file);
-                let _ = std::fs::remove_file(&temp);
-                return Err(Error::AtomicReplaceFailed {
-                    step: "write",
-                    source: as_io_error(e),
-                });
-            }
-
-            // Step 3 (Buffered path): explicit flush for durability.
-            let flush_result = self.flush_file(&file);
-            if let Err(e) = flush_result {
-                drop(file);
-                let _ = std::fs::remove_file(&temp);
-                return Err(Error::AtomicReplaceFailed {
-                    step: "flush",
-                    source: as_io_error(e),
-                });
-            }
-
-            // Step 4: close before rename.
-            drop(file);
-        }
-
-        // Step 5: atomic rename.
-        if let Err(e) = platform::atomic_rename(&temp, &path) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "rename",
-                source: as_io_error(e),
-            });
-        }
-
-        // Step 6: sync parent dir (no-op on Windows; best-effort on others).
-        let _ = platform::sync_parent_dir(&path);
-
-        Ok(())
+        atomic_replace(
+            &path,
+            data,
+            &self.replace_plan(),
+            &SoloHooks {
+                handle: self,
+                target: &path,
+            },
+        )
     }
 
     /// Appends `data` to `path`, creating the file if it does not exist.
@@ -238,72 +180,22 @@ impl Handle {
         //    with default permissions (the same as `write`).
         let existing_meta = std::fs::metadata(&path).ok();
 
-        // 2. Build the staging file via the same atomic-replace
-        //    primitives as `write`. We do not call `self.write`
-        //    directly because we need access to the staging path
-        //    before the rename in order to apply metadata.
-        let temp = Self::gen_temp_path(&path);
-        let (file, direct_ok) =
-            platform::open_write_new(&temp, self.use_direct()).map_err(|e| {
-                Error::AtomicReplaceFailed {
-                    step: "open_temp",
-                    source: as_io_error(e),
-                }
-            })?;
-
-        if self.use_direct() && !direct_ok {
-            self.update_active_method(Method::Data);
-        }
-
-        if direct_ok {
-            let result = self.direct_write_durable(&file, &path, data);
-            drop(file);
-            if let Err((step, e)) = result {
-                let _ = std::fs::remove_file(&temp);
-                return Err(Error::AtomicReplaceFailed {
-                    step,
-                    source: as_io_error(e),
-                });
-            }
-        } else {
-            if let Err(e) = platform::write_all(&file, data) {
-                drop(file);
-                let _ = std::fs::remove_file(&temp);
-                return Err(Error::AtomicReplaceFailed {
-                    step: "write",
-                    source: as_io_error(e),
-                });
-            }
-            let flush_result = self.flush_file(&file);
-            if let Err(e) = flush_result {
-                drop(file);
-                let _ = std::fs::remove_file(&temp);
-                return Err(Error::AtomicReplaceFailed {
-                    step: "flush",
-                    source: as_io_error(e),
-                });
-            }
-            drop(file);
-        }
-
-        // 3. Apply preserved metadata to the staging file BEFORE
-        //    the rename, so that the rename is the single
-        //    observable transition.
-        if let Some(meta) = existing_meta.as_ref() {
-            apply_preserved_metadata(&temp, &path, meta);
-        }
-
-        // 4. Atomic rename.
-        if let Err(e) = platform::atomic_rename(&temp, &path) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "rename",
-                source: as_io_error(e),
-            });
-        }
-
-        let _ = platform::sync_parent_dir(&path);
-        Ok(())
+        // 2. Run the shared atomic-replace sequence; the preserved
+        //    metadata is applied to the staging file before the
+        //    rename, so that the rename is the single observable
+        //    transition.
+        atomic_replace(
+            &path,
+            data,
+            &self.replace_plan(),
+            &WriteCopyHooks {
+                solo: SoloHooks {
+                    handle: self,
+                    target: &path,
+                },
+                existing: existing_meta.as_ref(),
+            },
+        )
     }
 
     /// Writes `data` at byte `offset` in `path`.
@@ -534,18 +426,13 @@ impl Handle {
     // Internal
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// Flushes a file written through the buffered path, picking the
-    /// primitive from the handle's active method.
-    ///
-    /// `Data` and `Direct` map to the data-level fence (`fdatasync` /
-    /// `F_FULLFSYNC` / `FlushFileBuffers`); a `Direct` handle only
-    /// reaches this function when the filesystem refused Direct IO for
-    /// this file, so the buffered bytes still need a real flush.
-    /// Every other method maps to the full `fsync`.
-    fn flush_file(&self, file: &std::fs::File) -> Result<()> {
-        match self.active_method() {
-            Method::Data | Method::Direct => super::fence_data(file),
-            _ => platform::sync_full(file),
+    /// Builds the atomic-replace plan for this handle's current
+    /// method.
+    fn replace_plan(&self) -> ReplacePlan {
+        ReplacePlan {
+            use_direct: self.use_direct(),
+            flush: BufferedFlush::for_method(self.active_method()),
+            sync_parent: true,
         }
     }
 
@@ -566,12 +453,7 @@ impl Handle {
     ///
     /// On error, returns the atomic-replace step name that failed
     /// together with the underlying error.
-    fn direct_write_durable(
-        &self,
-        file: &std::fs::File,
-        path: &Path,
-        data: &[u8],
-    ) -> std::result::Result<(), (&'static str, Error)> {
+    fn direct_write_durable(&self, file: &std::fs::File, path: &Path, data: &[u8]) -> StepResult {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
@@ -639,6 +521,46 @@ impl Handle {
     }
 }
 
+/// Atomic-replace hooks for solo-lane writes: Direct writes use the
+/// handle's `io_uring` ring and NVMe passthrough state, and a refused
+/// Direct open downgrades the handle's active method to `Data`.
+struct SoloHooks<'a> {
+    handle: &'a Handle,
+    target: &'a Path,
+}
+
+impl ReplaceHooks for SoloHooks<'_> {
+    fn direct_refused(&self) {
+        self.handle.update_active_method(Method::Data);
+    }
+
+    fn write_direct_durable(&self, file: &std::fs::File, data: &[u8]) -> StepResult {
+        self.handle.direct_write_durable(file, self.target, data)
+    }
+}
+
+/// [`SoloHooks`] plus the `write_copy` metadata step.
+struct WriteCopyHooks<'a> {
+    solo: SoloHooks<'a>,
+    existing: Option<&'a std::fs::Metadata>,
+}
+
+impl ReplaceHooks for WriteCopyHooks<'_> {
+    fn direct_refused(&self) {
+        self.solo.direct_refused();
+    }
+
+    fn write_direct_durable(&self, file: &std::fs::File, data: &[u8]) -> StepResult {
+        self.solo.write_direct_durable(file, data)
+    }
+
+    fn before_rename(&self, temp: &Path) {
+        if let Some(meta) = self.existing {
+            apply_preserved_metadata(temp, self.solo.target, meta);
+        }
+    }
+}
+
 /// Returns `true` when a payload of `len` bytes does not end on a
 /// sector boundary, so the sector-padded Direct write leaves trailing
 /// padding that must be trimmed before the file is published.
@@ -668,7 +590,7 @@ pub(crate) fn write_direct_durable_platform(
     file: &std::fs::File,
     data: &[u8],
     sector_size: u32,
-) -> std::result::Result<(), (&'static str, Error)> {
+) -> StepResult {
     platform::write_all_direct(file, data, sector_size).map_err(|e| ("write", e))?;
     if needs_trim(data.len(), sector_size) {
         file.set_len(data.len() as u64)
@@ -798,15 +720,6 @@ fn iouring_read_direct(
     let mut out = Vec::with_capacity(len);
     out.extend_from_slice(&buf.as_slice()[..len]);
     Ok(out)
-}
-
-// Convert a `crate::Error` to a `std::io::Error` for use in
-// `AtomicReplaceFailed { source: std::io::Error }`.
-fn as_io_error(e: Error) -> std::io::Error {
-    match e {
-        Error::Io(io_err) => io_err,
-        other => std::io::Error::other(other.to_string()),
-    }
 }
 
 /// Applies the metadata-preservation set defined for `write_copy`
