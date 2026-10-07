@@ -38,8 +38,33 @@
 //! reports the exact reason (clean end-of-file vs. truncated
 //! tail vs. corrupt frame). Callers replaying for recovery can
 //! distinguish a clean shutdown from a crash.
+//!
+//! ## Zero runs
+//!
+//! Every frame starts with the non-zero magic byte `0x46`, so a
+//! zero byte where a frame should begin is never record data.
+//! The reader classifies such a zero run by where it ends:
+//!
+//! - **At end of file** — sector padding left by a Direct-IO
+//!   partial flush, or space extended by preallocation. The
+//!   journal ends cleanly ([`JournalTailState::CleanEnd`]) and
+//!   [`JournalReader::position`] reports the offset where the
+//!   zero run starts, which is the end of the last record.
+//! - **At a 512-byte boundary, within 64 MiB** — a gap left by
+//!   a 1.1.0 Direct-IO writer when it rotated a log-buffer slot
+//!   or resumed at a sector boundary. The reader skips the gap
+//!   and continues with the frame at the boundary. 1.1.1 writers
+//!   never produce such gaps; the skip keeps journals written by
+//!   1.1.0 readable.
+//! - **Anywhere else** — space a writer reserved but never
+//!   filled (a crash or a failed write while appends were in
+//!   flight). Iteration stops with
+//!   [`JournalTailState::TruncatedHeader`] at the start of the
+//!   run, which is a recoverable torn tail.
 
-use crate::journal::format::{decode_frame, FrameDecode, FRAME_OVERHEAD};
+use crate::journal::format::{
+    decode_frame, FrameDecode, FRAME_MAGIC_V1, FRAME_MAX_PAYLOAD, FRAME_OVERHEAD,
+};
 use crate::journal::Lsn;
 use crate::{Error, Result};
 use std::fs::{File, OpenOptions};
@@ -52,21 +77,17 @@ use std::path::Path;
 /// monopolising the page cache.
 const READ_BUF_SIZE: usize = 64 * 1024;
 
-/// Sector granularity used when zero-pad-skipping the trailing
-/// partial sector of a Direct-IO journal. 512 is the smallest
-/// sector size on any modern device; skipping in 512-byte
-/// increments works for every multiple-of-512 actual sector
-/// (which covers all common configurations: 512, 1024, 2048,
-/// 4096).
-const PAD_SKIP_GRANULARITY: u64 = 512;
+/// Alignment at which a writer-produced zero gap ends. Direct-IO
+/// writers place the next frame after a gap at a sector boundary,
+/// and every supported sector size is a multiple of 512.
+const GAP_ALIGN: u64 = 512;
 
-/// Maximum number of pad sectors the reader will skip past in a
-/// single zero-pad region before giving up and surfacing
-/// `BadMagic`. A healthy direct-IO journal has at most one
-/// trailing pad sector (after a partial flush); we cap defensively
-/// at 16 so a pathological all-zero file doesn't trigger an
-/// O(file_size) scan.
-const MAX_PAD_SKIP_SECTORS: u32 = 16;
+/// Longest zero run, in bytes, that the reader skips in the middle
+/// of a journal. A 1.1.0 Direct-IO writer could leave a rotation gap
+/// of up to one log-buffer slot minus one byte, and slots are capped
+/// at 64 MiB (`JournalOptions::log_buffer_kib`). Longer runs are not
+/// writer gaps and end iteration as a torn tail instead.
+const MAX_GAP_SKIP: u64 = crate::journal::options::MAX_LOG_BUFFER_BYTES as u64;
 
 /// Outcome of an iteration that yielded `None` — distinguishes
 /// clean end-of-file from various truncation/corruption modes.
@@ -80,13 +101,18 @@ const MAX_PAD_SKIP_SECTORS: u32 = 16;
 pub enum JournalTailState {
     /// Iteration consumed the entire file with no errors. The
     /// journal ended cleanly at the LSN reported by
-    /// [`JournalReader::position`].
+    /// [`JournalReader::position`]. Zero bytes after the last
+    /// record (Direct-IO sector padding, preallocated space) are
+    /// part of a clean end; `position` then reports the end of
+    /// the last record rather than the file size.
     CleanEnd,
     /// Iteration stopped because a frame's header was
-    /// incomplete (less than 8 bytes left). Indicates a crash
-    /// mid-write: the writer reserved the LSN but didn't get
-    /// to write the full header. The caller should truncate
-    /// the file at [`JournalReader::position`] before
+    /// incomplete (less than 8 bytes left), or because the
+    /// frame position holds a run of zero bytes that is not a
+    /// skippable writer gap (see the module docs). Indicates a
+    /// crash or a failed write: the writer reserved the LSN but
+    /// didn't get to write the full header. The caller should
+    /// truncate the file at [`JournalReader::position`] before
     /// reopening for further appends.
     TruncatedHeader,
     /// Iteration stopped because a frame's payload was
@@ -99,7 +125,9 @@ pub enum JournalTailState {
     /// before the trailer. Treat as truncation: the caller
     /// should truncate at [`JournalReader::position`].
     ChecksumMismatch,
-    /// A frame's magic prefix didn't match `0x46535901`. This
+    /// A frame's magic prefix didn't match `0x46535901` and the
+    /// frame does not start with a zero byte (zero runs are
+    /// classified separately; see the module docs). This
     /// indicates either (a) the file is not an fsys journal
     /// (format confusion), (b) the journal was written by a
     /// future version with a different magic byte, or (c)
@@ -290,14 +318,45 @@ impl JournalReader {
     /// - [`Error::Io`] with `InvalidData` if the frame at
     ///   `lsn` doesn't decode cleanly (bad magic, bad CRC,
     ///   etc.).
+    /// - [`Error::Io`] with `UnexpectedEof` if the frame's
+    ///   declared length runs past the end of the file. The
+    ///   length is validated before any payload buffer is
+    ///   allocated, so a corrupt length field cannot trigger a
+    ///   large allocation.
     pub fn read_at_lsn(&mut self, lsn: Lsn) -> Result<JournalRecord> {
-        // Read a header-sized chunk first to learn the length.
+        // Read the 8-byte header first and validate it before
+        // sizing any buffer from the on-disk length field.
         let lsn_off = lsn.as_u64();
-        let mut header = [0u8; FRAME_OVERHEAD];
-        self.read_exact_at(lsn_off, &mut header[..8])?;
-        let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-        // Read the full frame.
-        let mut frame = vec![0u8; FRAME_OVERHEAD + length];
+        let mut header = [0u8; 8];
+        self.read_exact_at(lsn_off, &mut header)?;
+        let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        if magic != FRAME_MAGIC_V1 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bad magic at LSN {lsn}"),
+            )));
+        }
+        let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        if length > FRAME_MAX_PAYLOAD {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("frame length at LSN {lsn} exceeds FRAME_MAX_PAYLOAD"),
+            )));
+        }
+        // `length <= FRAME_MAX_PAYLOAD` (2^28 - 1), so the sum fits in
+        // `usize` on every supported target, 32-bit included.
+        let frame_len = FRAME_OVERHEAD + length as usize;
+        let file_len = self.file.metadata().map_err(Error::Io)?.len();
+        let fits = lsn_off
+            .checked_add(frame_len as u64)
+            .is_some_and(|end| end <= file_len);
+        if !fits {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("frame at LSN {lsn} is truncated"),
+            )));
+        }
+        let mut frame = vec![0u8; frame_len];
         self.read_exact_at(lsn_off, &mut frame)?;
         // Decode + validate.
         match decode_frame(&frame) {
@@ -368,22 +427,22 @@ impl JournalReader {
 ///
 /// The iterator owns a 64 KiB read buffer and re-fills it as
 /// records are decoded. The reader's cursor advances after
-/// each successful frame decode.
+/// each successful frame decode. The buffer grows past 64 KiB
+/// only for a record larger than that, and never beyond the
+/// bytes the file actually holds from the frame's start, so a
+/// corrupt length field cannot force a large allocation.
 pub struct JournalIter<'a> {
     reader: &'a mut JournalReader,
     /// Local read buffer. `valid_start..valid_end` is the
     /// region containing data not-yet-consumed by frame decode.
+    /// It always mirrors `file[cursor..cursor + (valid_end -
+    /// valid_start)]`.
     buf: Vec<u8>,
     valid_start: usize,
     valid_end: usize,
     /// Once an error or end-of-file has been observed, no
     /// further iteration attempts are made.
     finished: bool,
-    /// Counts consecutive pad-sector skips. Resets to zero on
-    /// every successful frame decode. Capped at
-    /// `MAX_PAD_SKIP_SECTORS` to bound the cost of zero-pad
-    /// scanning on pathological input.
-    pad_skips_in_a_row: u32,
 }
 
 impl<'a> JournalIter<'a> {
@@ -394,61 +453,76 @@ impl<'a> JournalIter<'a> {
             valid_start: 0,
             valid_end: 0,
             finished: false,
-            pad_skips_in_a_row: 0,
         }
+    }
+
+    /// Number of buffered bytes not yet consumed by decode.
+    #[inline]
+    fn buffered(&self) -> usize {
+        self.valid_end - self.valid_start
+    }
+
+    /// Records why iteration ended and stops the iterator.
+    fn finish(&mut self, state: JournalTailState) -> Option<Result<JournalRecord>> {
+        self.reader.last_state = state;
+        self.finished = true;
+        None
     }
 
     /// Refills the read buffer from the file at the current
     /// cursor + valid_end-relative offset. Compacts any
     /// remaining unconsumed bytes to the front of the buffer
-    /// before reading.
-    fn refill(&mut self) -> Result<()> {
+    /// before reading. Returns the number of bytes read; `0`
+    /// means no progress was possible (end of file, or the file
+    /// is shorter than the size cached at open time).
+    fn refill(&mut self) -> Result<usize> {
         // Compact unconsumed tail to the front.
         if self.valid_start > 0 {
-            let remaining = self.valid_end - self.valid_start;
+            let remaining = self.buffered();
             self.buf.copy_within(self.valid_start..self.valid_end, 0);
             self.valid_start = 0;
             self.valid_end = remaining;
         }
 
-        // Read into the empty tail of the buffer.
-        let space = self.buf.len() - self.valid_end;
-        if space == 0 {
-            // Buffer is full but the next frame doesn't fit.
-            // For a 64 KiB buffer this only happens for records
-            // larger than ~64 KiB — rare in WAL workloads. Grow
-            // the buffer to fit the largest record we'll see.
-            // The frame's length field (already in the buffer)
-            // tells us how much we need.
-            //
-            // Inspect bytes 4..8 of the current valid region to
-            // find the record length.
-            if self.valid_end - self.valid_start < 8 {
-                return Ok(()); // need more bytes for the header
+        if self.buf.len() == self.valid_end {
+            // Buffer is full but the frame at its start doesn't
+            // fit: a record larger than the 64 KiB default. Grow
+            // to the frame's declared size, capped at the bytes
+            // the file holds from the frame start. The cap keeps
+            // a corrupt length field from driving the allocation;
+            // when the file is shorter than the frame claims, the
+            // decode then reports a truncated payload.
+            if self.valid_end < 8 {
+                return Ok(0);
             }
-            let len_bytes = &self.buf[self.valid_start + 4..self.valid_start + 8];
             let payload_len =
-                u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]])
-                    as usize;
-            let needed = FRAME_OVERHEAD + payload_len;
-            if self.buf.len() < needed {
-                self.buf.resize(needed, 0);
+                u32::from_le_bytes([self.buf[4], self.buf[5], self.buf[6], self.buf[7]]);
+            if payload_len > FRAME_MAX_PAYLOAD {
+                // `decode_frame` reports LengthOverflow for this
+                // header; nothing to read.
+                return Ok(0);
+            }
+            // `payload_len <= FRAME_MAX_PAYLOAD` (2^28 - 1): the sum
+            // fits in `usize` on every supported target.
+            let needed = FRAME_OVERHEAD + payload_len as usize;
+            let in_file = self.reader.file_size.saturating_sub(self.reader.cursor);
+            let target = usize::try_from(in_file).map_or(needed, |n| needed.min(n));
+            if self.buf.len() < target {
+                self.buf.resize(target, 0);
             }
         }
 
-        // Issue the read at file offset = cursor + (valid_end - valid_start).
-        // valid_start is 0 after compaction so this simplifies to:
-        // file_offset = self.reader.cursor + valid_end.
+        // Issue the read at file offset = cursor + buffered bytes
+        // (`valid_start` is 0 after compaction).
         let file_offset = self.reader.cursor + self.valid_end as u64;
         if file_offset >= self.reader.file_size {
-            return Ok(()); // no more data to read
+            return Ok(0); // no more data to read
         }
-        let to_read = std::cmp::min(
-            (self.reader.file_size - file_offset) as usize,
-            self.buf.len() - self.valid_end,
-        );
+        let in_file = self.reader.file_size - file_offset;
+        let space = self.buf.len() - self.valid_end;
+        let to_read = usize::try_from(in_file).map_or(space, |n| n.min(space));
         if to_read == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let buf_slice = &mut self.buf[self.valid_end..self.valid_end + to_read];
         // Use std::io::Seek + Read; same rationale as
@@ -472,7 +546,40 @@ impl<'a> JournalIter<'a> {
             total += n;
         }
         self.valid_end += total;
-        Ok(())
+        Ok(total)
+    }
+
+    /// Classifies the zero run starting at the cursor (see the
+    /// module docs). Returns `Ok(None)` when the run is a
+    /// writer gap that was skipped (the cursor now sits on the
+    /// frame after it), or `Ok(Some(state))` when iteration must
+    /// end; in that case the cursor is reset to the start of the
+    /// run so [`JournalReader::position`] reports the recovery
+    /// point.
+    fn skip_zero_run(&mut self) -> Result<Option<JournalTailState>> {
+        let run_start = self.reader.cursor;
+        loop {
+            let view = &self.buf[self.valid_start..self.valid_end];
+            if let Some(k) = view.iter().position(|&b| b != 0) {
+                self.valid_start += k;
+                self.reader.cursor += k as u64;
+                break;
+            }
+            self.reader.cursor += view.len() as u64;
+            self.valid_start = self.valid_end;
+            if self.reader.cursor >= self.reader.file_size || self.refill()? == 0 {
+                // Zeros run to the end of the file: padding or
+                // preallocated space after the last record.
+                self.reader.cursor = run_start;
+                return Ok(Some(JournalTailState::CleanEnd));
+            }
+        }
+        let run_end = self.reader.cursor;
+        if run_end % GAP_ALIGN == 0 && run_end - run_start <= MAX_GAP_SKIP {
+            return Ok(None);
+        }
+        self.reader.cursor = run_start;
+        Ok(Some(JournalTailState::TruncatedHeader))
     }
 }
 
@@ -484,43 +591,31 @@ impl<'a> Iterator for JournalIter<'a> {
             return None;
         }
         loop {
-            // If we don't have enough buffered data to even read
-            // a header, refill.
-            let need_refill = (self.valid_end - self.valid_start) < 8;
-            // `next_unread_file_offset` = absolute file offset of
-            // the byte just past the last-read data. This is the
-            // file position from which the next read syscall
-            // would pick up. Note: cursor + (valid_end -
-            // valid_start) — NOT cursor + valid_end. cursor
-            // tracks the next-to-decode frame's file offset; the
-            // buffered region [valid_start..valid_end] holds
-            // file[cursor..cursor + (valid_end - valid_start)].
-            let next_unread_file_offset =
-                self.reader.cursor + (self.valid_end - self.valid_start) as u64;
-            let at_eof = next_unread_file_offset >= self.reader.file_size
-                && (self.valid_end - self.valid_start) == 0;
-            if at_eof {
-                self.reader.last_state = JournalTailState::CleanEnd;
-                self.finished = true;
-                return None;
-            }
-            if need_refill {
-                if let Err(e) = self.refill() {
-                    self.finished = true;
-                    return Some(Err(e));
+            if self.buffered() == 0 {
+                if self.reader.cursor >= self.reader.file_size {
+                    return self.finish(JournalTailState::CleanEnd);
                 }
-                // After refill, if we still don't have enough
-                // bytes for a header, the journal ends with a
-                // partial header — truncated tail.
-                if (self.valid_end - self.valid_start) < 8 {
-                    if (self.valid_end - self.valid_start) == 0 {
-                        // No leftover bytes — clean end.
-                        self.reader.last_state = JournalTailState::CleanEnd;
-                    } else {
-                        self.reader.last_state = JournalTailState::TruncatedHeader;
+                match self.refill() {
+                    Ok(0) => return self.finish(JournalTailState::CleanEnd),
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.finished = true;
+                        return Some(Err(e));
                     }
-                    self.finished = true;
-                    return None;
+                }
+            }
+
+            // A frame never starts with a zero byte (the magic's
+            // first byte is 0x46); classify the zero run instead
+            // of decoding it.
+            if self.buf[self.valid_start] == 0 {
+                match self.skip_zero_run() {
+                    Ok(None) => continue,
+                    Ok(Some(state)) => return self.finish(state),
+                    Err(e) => {
+                        self.finished = true;
+                        return Some(Err(e));
+                    }
                 }
             }
 
@@ -536,89 +631,39 @@ impl<'a> Iterator for JournalIter<'a> {
                     let payload = view[payload_start..payload_end].to_vec();
                     self.reader.cursor += consumed as u64;
                     self.valid_start += consumed;
-                    // Successful decode resets the pad-skip counter
-                    // — the next zero-magic encounter starts a
-                    // fresh skip budget.
-                    self.pad_skips_in_a_row = 0;
                     return Some(Ok(JournalRecord { lsn, payload }));
                 }
                 FrameDecode::Truncated => {
-                    // Need more bytes — refill and retry.
-                    let bytes_in_buffer = self.valid_end - self.valid_start;
-                    // Same fix as the at_eof check above:
-                    // next_unread_file_offset = cursor +
-                    // (valid_end - valid_start), NOT cursor +
-                    // valid_end.
-                    let next_unread_file_offset = self.reader.cursor + bytes_in_buffer as u64;
-                    let bytes_we_could_still_read = self
-                        .reader
-                        .file_size
-                        .saturating_sub(next_unread_file_offset);
-                    if bytes_we_could_still_read == 0 {
-                        // No more file to read; this is a real truncation.
-                        // Distinguish header vs. payload truncation by
-                        // checking how much we have.
-                        self.reader.last_state = if bytes_in_buffer < 8 {
-                            JournalTailState::TruncatedHeader
-                        } else {
-                            JournalTailState::TruncatedPayload
-                        };
-                        self.finished = true;
-                        return None;
+                    // Need more bytes. If the file has none left,
+                    // this is a real truncation; distinguish header
+                    // vs. payload truncation by how much we have.
+                    let buffered = self.buffered();
+                    let truncated = if buffered < 8 {
+                        JournalTailState::TruncatedHeader
+                    } else {
+                        JournalTailState::TruncatedPayload
+                    };
+                    let next_unread_file_offset = self.reader.cursor + buffered as u64;
+                    if next_unread_file_offset >= self.reader.file_size {
+                        return self.finish(truncated);
                     }
-                    // More file remaining — refill and retry.
-                    if let Err(e) = self.refill() {
-                        self.finished = true;
-                        return Some(Err(e));
+                    match self.refill() {
+                        // No progress: the file is shorter than the
+                        // size cached at open time.
+                        Ok(0) => return self.finish(truncated),
+                        Ok(_) => continue,
+                        Err(e) => {
+                            self.finished = true;
+                            return Some(Err(e));
+                        }
                     }
-                    continue;
                 }
-                FrameDecode::BadMagic => {
-                    // Zero-magic = sector-pad from a Direct-IO
-                    // journal's partial flush. Real frames have
-                    // magic 0x46535901 (≠ 0). If the first 4
-                    // header bytes are zero, advance the cursor
-                    // to the next 512-byte boundary and retry.
-                    // Capped at MAX_PAD_SKIP_SECTORS to avoid
-                    // O(file_size) scans of pathological all-zero
-                    // files.
-                    let view = &self.buf[self.valid_start..self.valid_end];
-                    let header_zero = view.len() >= 4
-                        && view[0] == 0
-                        && view[1] == 0
-                        && view[2] == 0
-                        && view[3] == 0;
-                    if header_zero && self.pad_skips_in_a_row < MAX_PAD_SKIP_SECTORS {
-                        // Advance cursor to next 512-aligned offset.
-                        let cur = self.reader.cursor;
-                        let next = (cur / PAD_SKIP_GRANULARITY + 1) * PAD_SKIP_GRANULARITY;
-                        let advance = (next - cur) as usize;
-                        // Drop the consumed bytes from the buffer
-                        // window (or all of it if `advance` exceeds
-                        // what's buffered — refill catches up).
-                        let buffered = self.valid_end - self.valid_start;
-                        let drop_from_buf = advance.min(buffered);
-                        self.valid_start += drop_from_buf;
-                        self.reader.cursor = next;
-                        self.pad_skips_in_a_row += 1;
-                        // Re-loop; the next iteration will refill
-                        // if needed and retry decode at the new
-                        // sector boundary.
-                        continue;
-                    }
-                    self.reader.last_state = JournalTailState::BadMagic;
-                    self.finished = true;
-                    return None;
-                }
+                FrameDecode::BadMagic => return self.finish(JournalTailState::BadMagic),
                 FrameDecode::LengthOverflow => {
-                    self.reader.last_state = JournalTailState::LengthOverflow;
-                    self.finished = true;
-                    return None;
+                    return self.finish(JournalTailState::LengthOverflow)
                 }
                 FrameDecode::ChecksumMismatch => {
-                    self.reader.last_state = JournalTailState::ChecksumMismatch;
-                    self.finished = true;
-                    return None;
+                    return self.finish(JournalTailState::ChecksumMismatch)
                 }
             }
         }
@@ -1027,5 +1072,231 @@ mod tests {
         let recs: Vec<JournalRecord> = reader.iter().map(|r| r.unwrap()).collect();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].payload, b"third");
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 1.1.1 — zero-run classification and allocation bounds
+    // ─────────────────────────────────────────────────────────
+
+    /// Encodes `payload` as one frame.
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        crate::journal::format::encode_frame_owned(payload).unwrap()
+    }
+
+    /// Drains the reader, returning the payloads, the tail state
+    /// and the final position.
+    fn drain(path: &Path) -> (Vec<Vec<u8>>, JournalTailState, u64) {
+        let mut reader = JournalReader::open(path).unwrap();
+        let payloads = reader.iter().map(|r| r.unwrap().payload).collect();
+        (payloads, reader.tail_state(), reader.position().as_u64())
+    }
+
+    #[test]
+    fn test_iter_three_byte_gap_before_aligned_frame_is_skipped() {
+        // The 1.1.0 rotation-gap shape that broke the old 4-byte
+        // zero-magic rule: a 3-byte zero run ends exactly at a
+        // 512-byte boundary where the next frame starts.
+        let path = tmp_path("gap3");
+        let _g = Cleanup(path.clone());
+        // One 15-byte frame + 38 13-byte frames = 509 bytes.
+        let mut bytes = frame(b"abc");
+        for _ in 0..38 {
+            bytes.extend_from_slice(&frame(b"x"));
+        }
+        assert_eq!(bytes.len(), 509);
+        let records_before = 39;
+        bytes.resize(512, 0);
+        bytes.extend_from_slice(&frame(b"after-gap"));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (payloads, state, pos) = drain(&path);
+        assert_eq!(payloads.len(), records_before + 1);
+        assert_eq!(payloads.last().unwrap(), b"after-gap");
+        assert_eq!(state, JournalTailState::CleanEnd);
+        assert_eq!(pos, bytes.len() as u64);
+    }
+
+    #[test]
+    fn test_iter_gap_larger_than_8k_before_aligned_frame_is_skipped() {
+        // 1.1.0 rotation gaps can be nearly a whole slot (up to
+        // 64 MiB); the pre-1.1.1 reader gave up after 8 KiB.
+        let path = tmp_path("gap_big");
+        let _g = Cleanup(path.clone());
+        let mut bytes = frame(&[7u8; 100]);
+        bytes.resize(48 * 1024, 0);
+        bytes.extend_from_slice(&frame(b"slot-2"));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (payloads, state, _) = drain(&path);
+        assert_eq!(payloads, vec![vec![7u8; 100], b"slot-2".to_vec()]);
+        assert_eq!(state, JournalTailState::CleanEnd);
+    }
+
+    #[test]
+    fn test_iter_trailing_zeros_report_clean_end_at_last_record() {
+        // Sector padding / preallocated space after the last
+        // record: clean end, and `position` points at the end of
+        // the last record (the resume point), not the file size.
+        for pad in [1usize, 3, 7, 8, 500, 20_000, 200_000] {
+            let path = tmp_path("trailing_zeros");
+            let _g = Cleanup(path.clone());
+            let mut bytes = frame(b"one");
+            bytes.extend_from_slice(&frame(b"two"));
+            let end = bytes.len() as u64;
+            bytes.resize(bytes.len() + pad, 0);
+            std::fs::write(&path, &bytes).unwrap();
+
+            let (payloads, state, pos) = drain(&path);
+            assert_eq!(payloads.len(), 2, "pad={pad}");
+            assert_eq!(state, JournalTailState::CleanEnd, "pad={pad}");
+            assert_eq!(pos, end, "pad={pad}");
+        }
+    }
+
+    #[test]
+    fn test_iter_zero_hole_ending_unaligned_reports_truncated_header() {
+        // A reservation that was never written (crash or failed
+        // write while appends were in flight), followed by a
+        // later record at an unaligned offset. Not a writer gap:
+        // iteration stops at the hole as a recoverable torn tail.
+        let path = tmp_path("hole");
+        let _g = Cleanup(path.clone());
+        let mut bytes = frame(b"durable");
+        let hole_start = bytes.len() as u64;
+        bytes.resize(bytes.len() + 40, 0);
+        bytes.extend_from_slice(&frame(b"after-hole"));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (payloads, state, pos) = drain(&path);
+        assert_eq!(payloads, vec![b"durable".to_vec()]);
+        assert_eq!(state, JournalTailState::TruncatedHeader);
+        assert_eq!(pos, hole_start);
+    }
+
+    #[test]
+    fn test_iter_zero_run_longer_than_max_gap_reports_truncated_header() {
+        // A mid-file zero run longer than any 1.1.0 slot is not a
+        // writer gap, even when it ends on a 512-byte boundary.
+        let path = tmp_path("huge_gap");
+        let _g = Cleanup(path.clone());
+        let head = frame(b"head");
+        let gap_end = round_up_512(head.len() as u64 + MAX_GAP_SKIP + 1);
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&head).unwrap();
+            let _ = f.seek(SeekFrom::Start(gap_end)).unwrap();
+            f.write_all(&frame(b"tail")).unwrap();
+        }
+        let (payloads, state, pos) = drain(&path);
+        assert_eq!(payloads, vec![b"head".to_vec()]);
+        assert_eq!(state, JournalTailState::TruncatedHeader);
+        assert_eq!(pos, head.len() as u64);
+    }
+
+    fn round_up_512(n: u64) -> u64 {
+        n.div_ceil(512) * 512
+    }
+
+    #[test]
+    fn test_iter_nonzero_garbage_still_reports_bad_magic() {
+        let path = tmp_path("garbage_after_record");
+        let _g = Cleanup(path.clone());
+        let mut bytes = frame(b"ok");
+        bytes.extend_from_slice(b"\x01\x02\x03\x04\x05\x06\x07\x08\x09");
+        std::fs::write(&path, &bytes).unwrap();
+        let (payloads, state, _) = drain(&path);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(state, JournalTailState::BadMagic);
+    }
+
+    #[test]
+    fn test_iter_huge_declared_length_does_not_grow_buffer_past_file() {
+        // 70 KiB file whose only header claims a 256 MiB payload.
+        // The iterator must report a truncated payload without
+        // sizing its buffer from the untrusted length field.
+        let path = tmp_path("evil_len");
+        let _g = Cleanup(path.clone());
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&FRAME_MAGIC_V1.to_be_bytes());
+        bytes.extend_from_slice(&FRAME_MAX_PAYLOAD.to_le_bytes());
+        bytes.resize(70 * 1024, 0xAA);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = JournalReader::open(&path).unwrap();
+        let mut iter = reader.iter();
+        assert!(iter.next().is_none());
+        assert!(
+            iter.buf.len() <= bytes.len(),
+            "buffer grew to {} bytes for a {}-byte file",
+            iter.buf.len(),
+            bytes.len()
+        );
+        drop(iter);
+        assert_eq!(reader.tail_state(), JournalTailState::TruncatedPayload);
+    }
+
+    #[test]
+    fn test_read_at_lsn_oversize_length_rejected_before_allocation() {
+        let path = tmp_path("evil_read_at");
+        let _g = Cleanup(path.clone());
+        let mut header = FRAME_MAGIC_V1.to_be_bytes().to_vec();
+        header.extend_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, &header).unwrap();
+        let mut reader = JournalReader::open(&path).unwrap();
+        let err = reader.read_at_lsn(Lsn::ZERO).unwrap_err();
+        match err {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_read_at_lsn_length_past_eof_returns_unexpected_eof() {
+        let path = tmp_path("read_at_short");
+        let _g = Cleanup(path.clone());
+        let mut bytes = FRAME_MAGIC_V1.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&(FRAME_MAX_PAYLOAD).to_le_bytes());
+        bytes.extend_from_slice(&[0xAB; 64]);
+        std::fs::write(&path, &bytes).unwrap();
+        let mut reader = JournalReader::open(&path).unwrap();
+        match reader.read_at_lsn(Lsn::ZERO).unwrap_err() {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof),
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_read_at_lsn_zero_bytes_report_bad_magic() {
+        let path = tmp_path("read_at_zero");
+        let _g = Cleanup(path.clone());
+        std::fs::write(&path, [0u8; 64]).unwrap();
+        let mut reader = JournalReader::open(&path).unwrap();
+        match reader.read_at_lsn(Lsn::ZERO).unwrap_err() {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_iter_file_shorter_than_cached_size_stops_without_spinning() {
+        // The file shrinks after the reader cached its size. The
+        // iterator must stop rather than retry a read that can
+        // never make progress.
+        let path = tmp_path("shrunk");
+        let _g = Cleanup(path.clone());
+        let mut bytes = frame(b"first");
+        bytes.extend_from_slice(&frame(&[9u8; 300]));
+        std::fs::write(&path, &bytes).unwrap();
+        let mut reader = JournalReader::open(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(40)
+            .unwrap();
+        let n = reader.iter().filter_map(|r| r.ok()).count();
+        assert_eq!(n, 1);
+        assert_eq!(reader.tail_state(), JournalTailState::TruncatedPayload);
     }
 }
