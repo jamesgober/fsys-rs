@@ -83,9 +83,12 @@ pub(crate) fn open_append(path: &Path) -> Result<File> {
 }
 
 pub(crate) fn open_write_at(path: &Path) -> Result<File> {
+    // `truncate(false)`: random-access writes overlay byte ranges and must
+    // keep the rest of the file.
     OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)
         .map_err(Error::Io)
 }
@@ -662,12 +665,15 @@ pub(crate) fn probe_sector_size(path: &Path) -> u32 {
         Err(_) => return 512,
     };
 
+    // SAFETY: `statfs` is plain old data (integers and integer arrays),
+    // so the all-zero bit pattern is a valid value; `libc::statfs` fully
+    // writes it before any field is read.
     let mut st: statfs = unsafe { std::mem::zeroed() };
     // SAFETY: path_cstr is valid NUL-terminated; st is properly sized.
     let ret = unsafe { libc::statfs(path_cstr.as_ptr(), &mut st) };
     if ret == 0 && st.f_bsize > 0 {
         let bs = st.f_bsize as u64;
-        if bs >= 512 && bs <= 65536 {
+        if (512..=65536).contains(&bs) {
             return bs as u32;
         }
     }
