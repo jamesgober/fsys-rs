@@ -497,7 +497,7 @@ impl Handle {
     /// always returns `false` — the native substrate is unreachable.
     #[cfg(all(target_os = "linux", feature = "async"))]
     fn substrate_is_native(&self) -> bool {
-        if native_async_disabled_by_env() {
+        if std::env::var_os("FSYS_DISABLE_NATIVE_ASYNC").is_some() {
             return false;
         }
         if self.active_method() != Method::Direct {
@@ -1475,15 +1475,6 @@ impl Handle {
             .submit_async(ops, self.snapshot(), false)
             .await
     }
-}
-
-/// `true` when `FSYS_DISABLE_NATIVE_ASYNC` is set. Read once per
-/// process (the variable is a startup switch), so the async substrate
-/// check costs no environment lookup per op.
-#[cfg(all(target_os = "linux", feature = "async"))]
-fn native_async_disabled_by_env() -> bool {
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("FSYS_DISABLE_NATIVE_ASYNC").is_some())
 }
 
 /// Volume serial number of the volume holding `file`, used to key the
