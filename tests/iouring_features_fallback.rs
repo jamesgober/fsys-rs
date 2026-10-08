@@ -151,10 +151,10 @@ fn preallocate_falls_back_to_posix_fallocate_cleanly() {
     // fallback path is actually invoked — and verifies:
     //   1. No panic, no hang
     //   2. Returns `Ok(())`
-    //   3. File is at least `len` bytes after the call
-    //      (`posix_fallocate` extends the file as it writes
-    //      zero-bytes; that's its semantic vs `fallocate`
-    //      which can keep the size with `FALLOC_FL_KEEP_SIZE`)
+    //   3. The journal's logical size is unchanged (1.1.1): the
+    //      journal truncates back after `posix_fallocate` extends
+    //      the file with zeros, so the zero region can never
+    //      become the resume point of the next open.
     force_fallback_paths();
     let path = tmp_path("preallocate_fallback");
     let _g = Cleanup(path.clone());
@@ -166,13 +166,13 @@ fn preallocate_falls_back_to_posix_fallocate_cleanly() {
         .expect("preallocate must take the posix_fallocate fallback cleanly");
 
     // posix_fallocate writes zeros and extends the file; the
-    // file size must be at least RESERVE_BYTES after the call.
+    // journal restores the logical size, so the file is still
+    // empty.
     log.close().expect("close");
     let meta = std::fs::metadata(&path).expect("stat");
-    assert!(
-        meta.len() >= RESERVE_BYTES,
-        "file size after posix_fallocate fallback: {} < expected {}",
+    assert_eq!(
         meta.len(),
-        RESERVE_BYTES
+        0,
+        "journal preallocate must not change the logical size (fallback path)"
     );
 }

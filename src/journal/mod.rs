@@ -361,10 +361,28 @@ impl JournalHandle {
         // fcntl) — the hint is advisory.
         Self::apply_write_lifetime_hint(&file, options.write_lifetime_hint);
 
-        // Resume: next_lsn = current file length. Seek to end so
-        // that any sneaky `write()` (which we don't use, but
-        // belt-and-braces) lands at the right place.
-        let len = file.seek(std::io::SeekFrom::End(0)).map_err(Error::Io)?;
+        // Resume past the last cleanly decoded frame, not at the raw
+        // file length (1.1.1). A torn final frame, a zero hole from
+        // an unwritten reservation, or zero-filled space from a
+        // preallocation fallback is cut off so new appends land
+        // where the reader can reach them; pre-1.1.1 appends after
+        // such a tail were unreadable. Journals the reader cannot
+        // classify as a recoverable tail (bad magic, length
+        // overflow) are refused, as in Direct-IO mode.
+        let file_len = file.metadata().map_err(Error::Io)?.len();
+        let len = if file_len == 0 {
+            0
+        } else {
+            scan_clean_end(path)?
+        };
+        if len < file_len {
+            file.set_len(len).map_err(Error::Io)?;
+        }
+        // Keep the cursor at the end so a stray `write()` (which
+        // we don't use) would land at the right place.
+        let _ = file
+            .seek(std::io::SeekFrom::Start(len))
+            .map_err(Error::Io)?;
 
         Ok(Self {
             file,
@@ -1375,25 +1393,55 @@ impl JournalHandle {
     /// `offset = 0` means "start at the beginning"; `len` is
     /// the number of bytes to reserve.
     ///
+    /// The journal's logical file size never changes: a
+    /// preallocated region past the last record would otherwise
+    /// read as zero padding and, before 1.1.1, became the resume
+    /// point of the next open. Appends and flushes are held off
+    /// for the duration of the call so the size can be checked and
+    /// restored without racing a concurrent append.
+    ///
     /// # Platform behaviour
     ///
     /// - **Linux:** `fallocate(FALLOC_FL_KEEP_SIZE)` — reserves
-    ///   extents without writing zeros. Falls back to
-    ///   `posix_fallocate` (writes zeros) on filesystems that
-    ///   don't support `fallocate`.
+    ///   extents without writing zeros or changing the size. On
+    ///   filesystems without `fallocate` the platform layer falls
+    ///   back to `posix_fallocate`, which writes zeros and extends
+    ///   the file; the journal then truncates back to the
+    ///   previous size, which releases the reservation, so on
+    ///   such filesystems the call has no lasting effect.
     /// - **macOS:** `fcntl(F_PREALLOCATE)` with contiguous
-    ///   allocation; falls back to non-contiguous.
-    /// - **Windows:** `SetEndOfFile` — bounds the logical size
-    ///   so NTFS plans extents. True physical preallocation
-    ///   (zeroing every block) requires admin privileges.
+    ///   allocation; falls back to non-contiguous. Does not
+    ///   change the file size.
+    /// - **Windows:** `SetFileInformationByHandle` with
+    ///   `FileAllocationInfo` — sets the allocation size without
+    ///   changing the end of file.
     /// - **Other platforms:** no-op (succeeds; allocation
     ///   happens on write).
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] on the underlying syscall failure.
+    /// - [`Error::Io`] on the underlying syscall failure, or if
+    ///   the size check or restore fails.
     pub fn preallocate(&self, offset: u64, len: u64) -> Result<()> {
-        crate::platform::preallocate(&self.file, offset, len)
+        match &self.log_buffer {
+            Some(log_buffer) => log_buffer.quiesced(|| self.preallocate_keep_len(offset, len)),
+            None => {
+                let _closed = self.write_gate.close();
+                self.preallocate_keep_len(offset, len)
+            }
+        }
+    }
+
+    /// Body of [`Self::preallocate`]. The caller has stopped every
+    /// write that could extend the file.
+    fn preallocate_keep_len(&self, offset: u64, len: u64) -> Result<()> {
+        let before = self.file.metadata().map_err(Error::Io)?.len();
+        crate::platform::preallocate(&self.file, offset, len)?;
+        let after = self.file.metadata().map_err(Error::Io)?.len();
+        if after > before {
+            self.file.set_len(before).map_err(Error::Io)?;
+        }
+        Ok(())
     }
 
     /// Hints the kernel about the access pattern for a region
@@ -1605,9 +1653,9 @@ impl Drop for LeaderGuard<'_> {
 // ─────────────────────────────────────────────────────────────────
 
 /// Scans `path` for the byte offset immediately past the last
-/// cleanly-decoded frame. Used by direct-mode resume to set
-/// `next_lsn` past partial / corrupted trailing bytes rather than
-/// at raw `file_size`.
+/// cleanly-decoded frame. Used by resume in both modes to set
+/// `next_lsn` past partial / corrupted / zero trailing bytes
+/// rather than at raw `file_size`.
 ///
 /// Returns `0` for an empty / non-existent file. Surfaces an error
 /// for non-recoverable tail states (`BadMagic`, `LengthOverflow`)
@@ -1628,11 +1676,19 @@ fn scan_clean_end(path: &Path) -> Result<u64> {
         | JournalTailState::ChecksumMismatch => Ok(reader.position().0),
         JournalTailState::BadMagic => Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("journal at {:?} has bad magic at offset {} — refusing to open in direct mode", path, reader.position().0),
+            format!(
+                "journal at {:?} has bad magic at offset {}; refusing to open it",
+                path,
+                reader.position().0
+            ),
         ))),
         JournalTailState::LengthOverflow => Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("journal at {:?} has frame length overflow at offset {} — refusing to open in direct mode", path, reader.position().0),
+            format!(
+                "journal at {:?} has frame length overflow at offset {}; refusing to open it",
+                path,
+                reader.position().0
+            ),
         ))),
     }
 }

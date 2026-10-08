@@ -320,3 +320,235 @@ fn test_synced_frontier_never_covers_unwritten_bytes() {
         assert!(checks > 0);
     }
 }
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).expect("stat").len()
+}
+
+/// FS-J5: a buffered reopen set `next_lsn` to the raw file length.
+/// After a torn final frame, new appends landed behind the torn
+/// bytes and the reader stopped at the tear (ChecksumMismatch), so
+/// every record appended after the reopen was unreadable.
+#[test]
+fn test_buffered_reopen_after_torn_tail_appends_are_readable() {
+    let path = tmp_path("torn_reopen");
+    let _g = Cleanup(path.clone());
+    let fs = builder().build().expect("handle");
+    let first_end;
+    {
+        let log = fs.journal(&path).expect("open");
+        first_end = log.append(b"one").expect("append").as_u64();
+        let _ = log.append(b"two-two-two").expect("append");
+        log.close().expect("close");
+    }
+    // Simulate a crash that tore the last frame.
+    let len = file_len(&path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open for truncate")
+        .set_len(len - 3)
+        .expect("tear");
+
+    let log = fs.journal(&path).expect("reopen");
+    assert_eq!(
+        log.next_lsn().as_u64(),
+        first_end,
+        "resume at the last clean frame"
+    );
+    let _ = log.append(b"three").expect("append");
+    log.close().expect("close");
+    assert_eq!(payloads(&path), vec![b"one".to_vec(), b"three".to_vec()]);
+}
+
+/// Zero bytes after the last record (Direct-IO padding, a crash
+/// that extended the file without writing it, or a zero-filling
+/// preallocation fallback) must not become the resume point.
+#[test]
+fn test_reopen_after_zero_tail_resumes_at_last_record() {
+    for direct in [false, true] {
+        let path = tmp_path("zero_tail");
+        let _g = Cleanup(path.clone());
+        let fs = builder().build().expect("handle");
+        let opts = || JournalOptions::new().direct(direct);
+        let end;
+        {
+            let log = fs.journal_with(&path, opts()).expect("open");
+            let _ = log.append(b"alpha").expect("append");
+            end = log.append(b"beta").expect("append").as_u64();
+            log.close().expect("close");
+        }
+        let len = file_len(&path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_len(len + 1024 * 1024)
+            .expect("extend with zeros");
+
+        let log = fs.journal_with(&path, opts()).expect("reopen");
+        assert_eq!(log.next_lsn().as_u64(), end, "direct={direct}");
+        let _ = log.append(b"gamma").expect("append");
+        log.close().expect("close");
+        assert_eq!(
+            payloads(&path),
+            vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()],
+            "direct={direct}"
+        );
+    }
+}
+
+/// Crash simulation for concurrent buffered appenders: a reserved
+/// range that was never written (zeros) followed by a record that
+/// was. The reopen must resume at the hole, not past it, so the
+/// journal stays a readable prefix.
+#[test]
+fn test_reopen_after_unwritten_reservation_hole_resumes_at_hole() {
+    let direct = false;
+    let path = tmp_path("hole_reopen");
+    let _g = Cleanup(path.clone());
+    let fs = builder().build().expect("handle");
+    let durable_end;
+    {
+        let log = fs.journal(&path).expect("open");
+        durable_end = log.append(b"durable").expect("append").as_u64();
+        log.close().expect("close");
+    }
+    // 40 zero bytes (the unwritten reservation), then a frame
+    // that a later appender did write.
+    let mut bytes = std::fs::read(&path).expect("read");
+    bytes.resize(bytes.len() + 40, 0);
+    {
+        let tmp = tmp_path("hole_frame");
+        let _g2 = Cleanup(tmp.clone());
+        let log = fs.journal(&tmp).expect("frame source");
+        let _ = log.append(b"orphan").expect("append");
+        log.close().expect("close");
+        bytes.extend_from_slice(&std::fs::read(&tmp).expect("read frame"));
+    }
+    std::fs::write(&path, &bytes).expect("write crashed image");
+
+    let (records, state) = read_all(&path);
+    assert_eq!(records.len(), 1);
+    assert_eq!(state, JournalTailState::TruncatedHeader);
+
+    let log = fs
+        .journal_with(&path, JournalOptions::new().direct(direct))
+        .expect("reopen");
+    assert_eq!(log.next_lsn().as_u64(), durable_end, "direct={direct}");
+    let _ = log.append(b"after-recovery").expect("append");
+    log.close().expect("close");
+    assert_eq!(
+        payloads(&path),
+        vec![b"durable".to_vec(), b"after-recovery".to_vec()],
+        "direct={direct}"
+    );
+}
+
+/// A journal whose tail is not recoverable (bad magic) is refused
+/// by the buffered open too, instead of appending behind garbage
+/// where nothing is readable.
+#[test]
+fn test_buffered_open_refuses_bad_magic_journal() {
+    let path = tmp_path("bad_magic_open");
+    let _g = Cleanup(path.clone());
+    std::fs::write(&path, b"\xDE\xAD\xBE\xEF\x00\x00\x00\x00garbage").expect("write");
+    let fs = builder().build().expect("handle");
+    match fs.journal(&path) {
+        Err(fsys::Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+        Err(other) => panic!("unexpected error {other:?}"),
+        Ok(_) => panic!("opened a journal with a bad magic"),
+    }
+}
+
+/// FS-J5: preallocation must not change the journal's logical
+/// size, in either mode.
+#[test]
+fn test_preallocate_does_not_change_logical_size() {
+    for direct in [false, true] {
+        let path = tmp_path("prealloc_size");
+        let _g = Cleanup(path.clone());
+        let fs = builder().build().expect("handle");
+        let opts = || JournalOptions::new().direct(direct);
+        let log = fs.journal_with(&path, opts()).expect("open");
+        let lsn = log.append(b"one").expect("append");
+        log.sync_through(lsn).expect("sync");
+        let before = file_len(&path);
+        log.preallocate(0, 1024 * 1024).expect("preallocate");
+        assert_eq!(file_len(&path), before, "direct={direct}");
+        let end = log.append(b"two").expect("append").as_u64();
+        log.close().expect("close");
+        let log = fs.journal_with(&path, opts()).expect("reopen");
+        assert_eq!(log.next_lsn().as_u64(), end, "direct={direct}");
+        drop(log);
+        assert_eq!(payloads(&path), vec![b"one".to_vec(), b"two".to_vec()]);
+    }
+}
+
+/// Linux: force the zero-filling `posix_fallocate` fallback (it
+/// extends the file) while appenders run, in a child process so the
+/// environment variable does not leak into other tests. The logical
+/// size must be restored without truncating any concurrent append.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_preallocate_fallback_with_concurrent_appends_keeps_every_record() {
+    const CHILD: &str = "FSYS_JOURNAL_INTEGRITY_PREALLOC_CHILD";
+    const NAME: &str = "test_preallocate_fallback_with_concurrent_appends_keeps_every_record";
+    if std::env::var_os(CHILD).is_none() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let status = std::process::Command::new(exe)
+            .args(["--exact", NAME, "--nocapture", "--test-threads", "1"])
+            .env(CHILD, "1")
+            .env("FSYS_TEST_FORCE_POSIX_FALLOCATE", "1")
+            .status()
+            .expect("spawn child");
+        assert!(status.success(), "child run failed: {status}");
+        return;
+    }
+    for direct in [false, true] {
+        let path = tmp_path("prealloc_race");
+        let _g = Cleanup(path.clone());
+        let fs = builder().build().expect("handle");
+        let log = Arc::new(
+            fs.journal_with(
+                &path,
+                JournalOptions::new().direct(direct).log_buffer_kib(4),
+            )
+            .expect("open"),
+        );
+        let mut writers = Vec::new();
+        for t in 0..4u8 {
+            let log = Arc::clone(&log);
+            writers.push(std::thread::spawn(move || {
+                let mut out = Vec::new();
+                for i in 0..300u32 {
+                    let mut p = vec![t; 40 + (i as usize % 300)];
+                    p[..4].copy_from_slice(&i.to_le_bytes());
+                    let _ = log.append(&p).expect("append");
+                    out.push(p);
+                }
+                out
+            }));
+        }
+        for k in 0..20u64 {
+            log.preallocate(0, (k + 1) * 256 * 1024)
+                .expect("preallocate");
+        }
+        let mut expected: Vec<Vec<u8>> = writers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect();
+        let end = log.next_lsn().as_u64();
+        log.sync_through(log.next_lsn()).expect("sync");
+        drop(log);
+        let mut got = payloads(&path);
+        assert_eq!(got.len(), expected.len(), "direct={direct}");
+        got.sort();
+        expected.sort();
+        assert_eq!(got, expected, "direct={direct}");
+        let log = fs
+            .journal_with(&path, JournalOptions::new().direct(direct))
+            .expect("reopen");
+        assert_eq!(log.next_lsn().as_u64(), end, "direct={direct}");
+    }
+}

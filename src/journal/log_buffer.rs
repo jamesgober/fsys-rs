@@ -804,6 +804,22 @@ impl LogBuffer {
         crate::platform::write_at_direct(file, offset, slice)
     }
 
+    /// Runs `f` while no log-buffer write can start or be in
+    /// flight: waits for any in-flight flush, then holds the state
+    /// lock (which every append, rotation and partial flush takes)
+    /// for the duration of `f`. Used by journal preallocation to
+    /// check and restore the file size without racing a flush
+    /// that extends the file.
+    pub(crate) fn quiesced<R>(&self, f: impl FnOnce() -> R) -> R {
+        let mut state = self.state.lock();
+        while state.flushing.is_some() {
+            self.flush_done.wait(&mut state);
+        }
+        let result = f();
+        drop(state);
+        result
+    }
+
     /// Repositions the buffer for resume-after-crash. Called by
     /// `JournalHandle::open_direct` after `scan_clean_end` finds
     /// the last good LSN. Sets `active_flush_pos` to the last

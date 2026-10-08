@@ -32,24 +32,32 @@
 //! itself, use `SeqCst` so the argument above holds in the single
 //! total order of those operations. Callers that flip the epoch
 //! are serialised by an internal mutex.
+//!
+//! The gate can also be *closed* ([`WriteGate::close`]): new
+//! appenders wait before reserving and the closer waits for every
+//! in-flight write to finish. Journal preallocation uses this to
+//! restore the file length after a zero-filling fallback without
+//! racing an append that extends the file.
 
 use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Epoch word increment that flips the parity.
-const FLIP: u64 = 1;
+/// Epoch word bit set while the gate is closed.
+const CLOSED: u64 = 1;
+/// Epoch word increment that flips the parity (bit 1).
+const FLIP: u64 = 2;
 
 /// In-flight write tracker. See the module docs for the protocol.
 pub(crate) struct WriteGate {
-    /// Flip count; its low bit is the parity that selects the
-    /// counter new appenders use.
+    /// Bit 0: [`CLOSED`]. Bits 1..: flip count; bit 1 is the
+    /// parity that selects the counter new appenders use.
     epoch: CachePadded<AtomicU64>,
     /// Appenders currently between registration and the end of
     /// their write, per parity.
     in_flight: [CachePadded<AtomicU64>; 2],
-    /// Serialises [`Self::drain_below`] callers.
+    /// Serialises [`Self::drain_below`] and [`Self::close`].
     flipper: Mutex<()>,
 }
 
@@ -63,6 +71,19 @@ pub(crate) struct WriteTicket<'a> {
 impl Drop for WriteTicket<'_> {
     fn drop(&mut self) {
         let _ = self.counter.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Keeps the gate closed until dropped.
+#[must_use = "dropping the guard reopens the gate"]
+pub(crate) struct ClosedGate<'a> {
+    gate: &'a WriteGate,
+    _flipper: parking_lot::MutexGuard<'a, ()>,
+}
+
+impl Drop for ClosedGate<'_> {
+    fn drop(&mut self) {
+        let _ = self.gate.epoch.fetch_and(!CLOSED, Ordering::SeqCst);
     }
 }
 
@@ -80,17 +101,23 @@ impl WriteGate {
 
     /// Registers an in-flight write. Must be called **before** the
     /// LSN reservation, and the reservation must use
-    /// `Ordering::SeqCst`.
+    /// `Ordering::SeqCst`. Waits while the gate is closed.
     #[inline]
     pub(crate) fn enter(&self) -> WriteTicket<'_> {
+        let mut spins = 0u32;
         loop {
             let epoch = self.epoch.load(Ordering::SeqCst);
+            if epoch & CLOSED != 0 {
+                backoff(&mut spins);
+                continue;
+            }
             let counter: &AtomicU64 = &self.in_flight[parity(epoch)];
             let _ = counter.fetch_add(1, Ordering::SeqCst);
             if self.epoch.load(Ordering::SeqCst) == epoch {
                 return WriteTicket { counter };
             }
-            // A leader flipped the epoch between the read
+            // A leader flipped the epoch (or the gate closed)
+            // between the read
             // and the increment; we have not reserved anything yet.
             let _ = counter.fetch_sub(1, Ordering::Release);
         }
@@ -107,11 +134,25 @@ impl WriteGate {
         wait_zero(&self.in_flight[parity(old)]);
         frontier
     }
+
+    /// Closes the gate: new appenders wait in [`Self::enter`] and
+    /// this call returns once every in-flight write has finished.
+    /// The gate reopens when the returned guard drops.
+    pub(crate) fn close(&self) -> ClosedGate<'_> {
+        let flipper = self.flipper.lock();
+        let _ = self.epoch.fetch_or(CLOSED, Ordering::SeqCst);
+        wait_zero(&self.in_flight[0]);
+        wait_zero(&self.in_flight[1]);
+        ClosedGate {
+            gate: self,
+            _flipper: flipper,
+        }
+    }
 }
 
 #[inline]
 fn parity(epoch: u64) -> usize {
-    (epoch & 1) as usize
+    ((epoch >> 1) & 1) as usize
 }
 
 fn wait_zero(counter: &AtomicU64) {
@@ -197,6 +238,48 @@ mod tests {
         for w in writers {
             w.join().unwrap();
         }
+    }
+
+    #[test]
+    fn test_gate_close_blocks_new_writers_until_reopened() {
+        let gate = Arc::new(WriteGate::new());
+        let closed = gate.close();
+        let entered = Arc::new(AtomicBool::new(false));
+        let g2 = Arc::clone(&gate);
+        let e2 = Arc::clone(&entered);
+        let writer = std::thread::spawn(move || {
+            let _t = g2.enter();
+            e2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !entered.load(Ordering::SeqCst),
+            "writer entered a closed gate"
+        );
+        drop(closed);
+        writer.join().unwrap();
+        assert!(entered.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_gate_close_waits_for_in_flight_writer() {
+        let gate = Arc::new(WriteGate::new());
+        let ticket = gate.enter();
+        let done = Arc::new(AtomicBool::new(false));
+        let g2 = Arc::clone(&gate);
+        let d2 = Arc::clone(&done);
+        let closer = std::thread::spawn(move || {
+            let _c = g2.close();
+            d2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "close returned with a write in flight"
+        );
+        drop(ticket);
+        closer.join().unwrap();
+        assert!(done.load(Ordering::SeqCst));
     }
 
     /// Model check of the protocol: writers reserve ranges on a
