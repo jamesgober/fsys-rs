@@ -108,7 +108,7 @@ For release-mode timings (closer to production), append `--release`. The dev pro
 | # | Example | What it shows | When to use this pattern |
 |---|---|---|---|
 | **15** | [`15_error_handling.rs`](../examples/15_error_handling.rs) | Match on `Error::code()` — stable `FS-NNNNN` codes for log-grep | Production error handling and structured logs. |
-| **16** | [`16_tuning_direct.rs`](../examples/16_tuning_direct.rs) | `Builder::buffer_pool_count` / `buffer_pool_block_size` / `io_uring_queue_depth` | Workload-specific tuning of `Method::Direct`. |
+| **16** | [`16_tuning_direct.rs`](../examples/16_tuning_direct.rs) | `Builder::buffer_pool_count` / `buffer_pool_block_size` / `io_uring_queue_depth` | Workload-specific tuning of `Method::Direct`. The two buffer-pool knobs are reserved and have no effect in 1.1.x; `io_uring_queue_depth` applies on Linux. |
 
 ### Journal substrate (high-throughput WAL)
 

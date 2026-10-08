@@ -124,8 +124,9 @@ pub enum Method {
     ///   via `io_uring` when the kernel supports it (5.1+); fallback to
     ///   `pwrite(2)` + `fdatasync(2)` when `io_uring_setup` fails.
     ///   Buffer + offset + length alignment to `logical_sector` (typically
-    ///   512 or 4096 bytes) is handled by the per-handle aligned buffer
-    ///   pool.
+    ///   512 or 4096 bytes) is handled internally: the payload is copied
+    ///   into a sector-aligned buffer, zero-padded, and the file is
+    ///   trimmed back to the real length before the fence.
     /// - **macOS:** `fcntl(fd, F_NOCACHE, 1)` after open. Durability via
     ///   `fcntl(fd, F_FULLFSYNC, 0)`. If `F_NOCACHE` fails (rare on some
     ///   HFS+ configurations), falls back to `Sync`.

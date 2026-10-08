@@ -36,10 +36,9 @@ use std::sync::Arc;
 /// - `batch_size_max` defaults to `128` (ops taken per dispatcher pass).
 /// - `batch_queue_max` defaults to `1024` (group-lane queue capacity;
 ///   producers block when full).
-/// - `buffer_pool_count` defaults to `64` (per-handle aligned buffer
-///   pool capacity; see locked decision #6 in
-///   `.dev/DECISIONS-0.5.0.md`).
-/// - `buffer_pool_block_size` defaults to `4096` (per-buffer size in bytes).
+/// - `buffer_pool_count` defaults to `64` and `buffer_pool_block_size`
+///   to `4096`. Both are reserved: stored, but not consulted by any IO
+///   path in 1.1.x (see [`Builder::buffer_pool_count`]).
 /// - `io_uring_queue_depth` defaults to `128` (Linux io_uring SQ
 ///   depth). Real `io_uring` integration shipped in `0.5.1` after
 ///   the rustc 1.95 ICE workaround landed; see the io_uring blocker
@@ -279,37 +278,30 @@ impl Builder {
         self
     }
 
-    /// Sets the per-handle aligned buffer pool capacity (number of
-    /// reusable buffers).
+    /// Sets the capacity of the per-handle aligned buffer pool.
     ///
-    /// Default: `64`. Buffers are allocated lazily on the first
-    /// Direct-method op; idle handles cost zero buffer memory. The
-    /// pool is shared between caller threads and the group-lane
-    /// dispatcher; access is lock-free on the fast path
-    /// (`crossbeam_queue::ArrayQueue`).
+    /// **Reserved.** The value is stored but no IO path draws buffers
+    /// from the pool in 1.1.x: every Direct-IO operation allocates its
+    /// own sector-aligned buffer sized to the payload, and that
+    /// allocation is small next to the durability fence each Direct
+    /// write issues. The knob keeps its place in the API so code that
+    /// sets it keeps compiling; it has no effect on memory use or
+    /// throughput today. Any value, including `0`, is accepted.
     ///
-    /// `0` is rejected at [`build`](Builder::build) time. Larger
-    /// values reduce allocation pressure on Direct workloads at the
-    /// cost of higher per-handle resident memory
-    /// (`buffer_pool_count × buffer_pool_block_size` bytes when fully
-    /// populated).
+    /// Default: `64`.
     #[must_use]
     pub fn buffer_pool_count(mut self, n: usize) -> Self {
         self.buffer_pool_count = n;
         self
     }
 
-    /// Sets the per-buffer size in the aligned buffer pool, in bytes.
+    /// Sets the per-buffer size of the aligned buffer pool, in bytes.
     ///
-    /// Default: `4096`. Must be a non-zero multiple of the
-    /// platform's logical sector size (typically 512 or 4096) and a
-    /// power of two when alignment matters; `build()` validates this
-    /// against the probed sector size.
+    /// **Reserved**, like [`Builder::buffer_pool_count`]: stored (and
+    /// rounded up to the probed sector size) but not consulted by any
+    /// IO path in 1.1.x.
     ///
-    /// For Direct IO workloads with payloads larger than the default,
-    /// a 64 KiB or 1 MiB block reduces the number of buffer leases per
-    /// op at the cost of higher per-handle memory (see
-    /// [`Builder::buffer_pool_count`]).
+    /// Default: `4096`.
     #[must_use]
     pub fn buffer_pool_block_size(mut self, bytes: usize) -> Self {
         self.buffer_pool_block_size = bytes;
@@ -436,14 +428,15 @@ impl Builder {
     /// **`Workload::Database`** — tuned for storage-engine
     /// workloads (HiveDB, embedded KV stores, log-structured
     /// merge trees) on NVMe with sustained bulk writes. Sets:
-    /// - `buffer_pool_count = 1024`,
-    ///   `buffer_pool_block_size = 8192` (= 8 MiB resident per
-    ///   handle, 32× the 256 KiB pre-0.9.2 default).
-    /// - `io_uring_queue_depth = 256` (= 2× the pre-0.9.2 default).
-    /// - `batch_queue_max = 4096` (= 4× the pre-0.9.2 default).
+    /// - `io_uring_queue_depth = 256` (= 2× the default).
+    /// - `batch_queue_max = 4096` (= 4× the default).
+    /// - `buffer_pool_count = 1024`, `buffer_pool_block_size = 8192`.
+    ///   These two are reserved knobs with no effect in 1.1.x (see
+    ///   [`Builder::buffer_pool_count`]); no pool memory is allocated.
     ///
     /// **`Workload::Default`** — restores the library defaults
-    /// (256 KiB pool, 128-deep ring, 1024-deep batch queue).
+    /// (128-deep ring, 1024-deep batch queue, default reserved pool
+    /// values).
     /// Useful for tests and for callers who want to revert a
     /// preset before applying a different one.
     #[must_use]
@@ -512,8 +505,8 @@ impl Builder {
     /// Resolves `Method::Auto` using the hardware-detection ladder,
     /// probes the sector size for the root (or current directory), and
     /// validates that no reserved method was requested. The dispatcher
-    /// thread, io_uring ring, buffer pool, and NVMe-passthrough slot
-    /// are all constructed lazily on first use — idle handles cost zero
+    /// thread, io_uring ring, and NVMe-passthrough slot are all
+    /// constructed lazily on first use — idle handles cost zero
     /// threads and zero ring memory.
     ///
     /// # Errors
@@ -674,15 +667,14 @@ impl Default for Builder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Workload {
-    /// The library defaults — 256 KiB buffer pool, 128-deep
-    /// io_uring ring, 1024-deep batch queue. Suitable for
-    /// general file IO; NOT tuned for sustained database
-    /// throughput.
+    /// The library defaults — 128-deep io_uring ring, 1024-deep
+    /// batch queue. Suitable for general file IO; NOT tuned for
+    /// sustained database throughput.
     Default,
-    /// Storage-engine / database workload preset. 8 MiB buffer
-    /// pool, 256-deep ring, 4096-deep batch queue. Suitable for
-    /// HiveDB, embedded KV stores, log-structured merge trees,
-    /// and any workload with sustained bulk writes against an
+    /// Storage-engine / database workload preset. 256-deep ring,
+    /// 4096-deep batch queue (plus the reserved buffer-pool knobs).
+    /// Suitable for HiveDB, embedded KV stores, log-structured merge
+    /// trees, and any workload with sustained bulk writes against an
     /// NVMe target.
     Database,
 }

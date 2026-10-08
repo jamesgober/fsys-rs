@@ -73,8 +73,6 @@ fs.write("/tmp/note.txt", b"hello")?;
 let fs = builder()
     .method(Method::Direct)
     .root("/data")
-    .buffer_pool_count(128)
-    .buffer_pool_block_size(65_536)
     .build()?;
 # Ok::<(), fsys::Error>(())
 ```
@@ -264,8 +262,6 @@ let fs = fsys::builder()
     .mode(Mode::Prod)
     .batch_size_max(256)
     .batch_queue_max(2048)
-    .buffer_pool_count(128)
-    .buffer_pool_block_size(65_536)
     .io_uring_queue_depth(256)
     .build()?;
 ```
@@ -278,12 +274,12 @@ let fs = fsys::builder()
 | `batch_window_ms(u64)` | — | Accepted, unused since 1.1.1: the dispatcher no longer waits for more jobs (each op has its own fence, so waiting only added latency). |
 | `batch_size_max(usize)` | `128` | Ops the dispatcher takes from the queue per pass. `0` = one job per pass. |
 | `batch_queue_max(usize)` | `1024` | Group-lane queue capacity; submitters block when full. `0` = rendezvous queue. |
-| `buffer_pool_count(usize)` | `64` | Number of aligned buffers in the per-handle pool. *(Renamed from `buffer_pool_size` in 0.7.0.)* |
-| `buffer_pool_block_size(usize)` | `4096` | Per-buffer size in bytes. *(Renamed from `buffer_pool_block` in 0.7.0.)* |
+| `buffer_pool_count(usize)` | `64` | Reserved: stored but not used by any IO path in 1.1.x. *(Renamed from `buffer_pool_size` in 0.7.0.)* |
+| `buffer_pool_block_size(usize)` | `4096` | Reserved: stored but not used by any IO path in 1.1.x. *(Renamed from `buffer_pool_block` in 0.7.0.)* |
 | `io_uring_queue_depth(u32)` | `128` | Linux io_uring SQ depth. |
 | `dispatcher_shards(usize)` | `1` | Number of group-lane dispatcher threads per handle. Values > 1 spawn N independent dispatchers; batches hash-route by first op's path. Lifts the pre-0.9.3 one-core ceiling. Clamped to `1..=64`. *(0.9.3.)* |
 | `observer(Arc<dyn FsysObserver>)` | `None` | Register a structured-telemetry hook. Per-op events (journal append / sync / handle write / read) fire on the originating thread. *(0.9.2.)* |
-| `tune_for(Workload)` | — | One-line preset for coordinated knobs. `Workload::Database` sets `buffer_pool_count=1024`, `buffer_pool_block_size=8192`, `io_uring_queue_depth=256`, `batch_queue_max=4096`. *(0.9.2.)* |
+| `tune_for(Workload)` | — | One-line preset for coordinated knobs. `Workload::Database` sets `io_uring_queue_depth=256`, `batch_queue_max=4096` and the reserved `buffer_pool_count=1024`, `buffer_pool_block_size=8192`. *(0.9.2.)* |
 | `sqpoll(u32)` | `None` | Opt-in `IORING_SETUP_SQPOLL` with the given idle timeout (ms). Kernel-side polling thread drains the SQ without `io_uring_enter` syscalls. Linux-only consumption; ignored elsewhere. Falls back to non-SQPOLL on EPERM. *(0.9.7.)* |
 
 ---
