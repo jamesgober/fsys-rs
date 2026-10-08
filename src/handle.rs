@@ -1025,13 +1025,24 @@ impl Handle {
     /// this handle.
     pub(crate) fn update_active_method(&self, method: Method) {
         let active = u16::from(method.to_u8());
-        // `fetch_update` with a closure that always returns `Some`
-        // cannot fail; the result carries no information.
-        let _ = self
-            .methods
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                Some((cur & 0xFF00) | active)
-            });
+        // Replace the low byte (active method) and keep the high byte
+        // (configured method). A plain compare-exchange loop: the std
+        // helper for this was renamed (`fetch_update` -> `try_update`)
+        // in Rust 1.99, and the new name is not available on the 1.75
+        // MSRV.
+        let mut cur = self.methods.load(Ordering::Relaxed);
+        loop {
+            let next = (cur & 0xFF00) | active;
+            match self.methods.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     /// Returns `true` if the active method requires Direct IO.
