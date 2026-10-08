@@ -121,9 +121,12 @@ pub enum JournalBackendKind {
     /// Kernel path with `io_uring` submission + completion (Linux
     /// `Method::Direct` + `Method::Auto` selection).
     KernelIoUring,
-    /// Kernel path with `O_DIRECT` + synchronous `pwrite` + manual
-    /// `fdatasync` (Linux without `io_uring`, macOS, Windows
-    /// `FILE_FLAG_NO_BUFFERING`).
+    /// Kernel path with Direct IO (`O_DIRECT` on Linux, `F_NOCACHE`
+    /// on macOS, `FILE_FLAG_NO_BUFFERING` on Windows) through the
+    /// journal's sector-aligned log buffer, plus `fdatasync` or the
+    /// platform equivalent. On Linux the log-buffer flushes are
+    /// submitted as `IORING_OP_WRITE_FIXED` when an io_uring ring
+    /// can be set up, and as `pwrite` otherwise.
     KernelDirect,
     /// Kernel path with buffered IO + `fdatasync` / equivalent
     /// (the universal fallback; default mode of [`super::JournalHandle`]
@@ -250,8 +253,10 @@ pub struct JournalBackendInfo {
     /// falling through to the kernel path (and to see exactly which
     /// SPDK precondition failed).
     pub fallbacks_skipped: Vec<(JournalBackendKind, String)>,
-    /// Wall-clock time the journal opened. Useful for correlating
-    /// with system logs and metric backends.
+    /// Wall-clock time this record was built. For the kernel path,
+    /// [`super::JournalHandle::backend_info`] builds a fresh record
+    /// on every call, so this is the time of that call, not the
+    /// time the journal was opened.
     pub opened_at: SystemTime,
 }
 

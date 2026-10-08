@@ -112,8 +112,8 @@ pub enum WriteLifetimeHint {
 
 /// 0.9.4 — Per-`sync_through` durability primitive selection.
 ///
-/// `Full` is the default — `sync_through` calls the platform's
-/// full media-durability primitive (`fsync` on Linux,
+/// `Full` is the default: `sync_through` calls the platform's
+/// full media-durability primitive (`fdatasync` on Linux,
 /// `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows). This
 /// matches pre-0.9.4 behaviour exactly.
 ///
@@ -126,26 +126,29 @@ pub enum WriteLifetimeHint {
 #[non_exhaustive]
 pub enum SyncMode {
     /// Full media-durability sync. Default. Every
-    /// `JournalHandle::sync_through` call invokes:
-    /// - Linux: `fsync(2)` via `file.sync_data()` (which on
-    ///   Linux maps to `fdatasync` — already barrier-grade for
-    ///   our purposes).
-    /// - macOS: `fcntl(F_FULLFSYNC)` — forces the drive to
+    /// `JournalHandle::sync_through` call invokes
+    /// `File::sync_data`, which is:
+    /// - Linux: `fdatasync(2)`. It flushes the file data and the
+    ///   metadata needed to read it back (including the size)
+    ///   and the device write cache.
+    /// - macOS: `fcntl(F_FULLFSYNC)`, which forces the drive to
     ///   flush its volatile write cache to media.
-    /// - Windows: `FlushFileBuffers` — equivalent to
-    ///   `FILE_FLAG_WRITE_THROUGH` write completion.
+    /// - Windows: `FlushFileBuffers`.
     ///
     /// Safe on every drive, every workload. Pays the full
     /// media-durability cost on macOS even when the drive has
     /// PLP.
     #[default]
     Full,
-    /// Barrier-grade sync — provides ordering and write-cache
+    /// Barrier-grade sync: provides ordering and write-cache
     /// commit without forcing a full media flush. Cheaper than
-    /// `Full` on macOS (dramatically so on Apple Silicon NVMe),
-    /// identical on Linux (`fdatasync` is already barrier-grade),
-    /// no-op on Windows (`FILE_FLAG_WRITE_THROUGH` already
-    /// provides durable-on-return semantics).
+    /// `Full` on macOS (`F_BARRIERFSYNC`; dramatically so on Apple
+    /// Silicon NVMe) and identical on Linux (`fdatasync`). Windows
+    /// has no barrier primitive: a handle opened without
+    /// `FILE_FLAG_WRITE_THROUGH` (buffered journals) is flushed
+    /// with `FlushFileBuffers` like `Full`, and a write-through
+    /// handle needs no flush because each write is durable when it
+    /// returns.
     ///
     /// **Crash-safety contract.** `Barrier` mode is correct
     /// **only** under one of:
@@ -211,8 +214,8 @@ pub struct JournalOptions {
     /// (every `sync_through` invokes the platform's full
     /// media-durability sync). [`SyncMode::Barrier`] opts into
     /// the cheaper barrier-grade primitive on macOS (PLP drives
-    /// only) and is a no-op on other platforms — see
-    /// [`SyncMode::Barrier`] for the safety contract.
+    /// only); see [`SyncMode::Barrier`] for the safety contract
+    /// and the behaviour on other platforms.
     pub(crate) sync_mode: SyncMode,
     /// 0.9.4 — optional NVMe write-lifetime hint applied via
     /// `fcntl(F_SET_RW_HINT)` at journal-open time (Linux
@@ -258,14 +261,15 @@ impl JournalOptions {
     ///
     /// When enabled, the journal file is opened with `O_DIRECT`
     /// (Linux) / `F_NOCACHE` (macOS) /  `FILE_FLAG_NO_BUFFERING`
-    /// (Windows). Every append is serialised into an in-memory
-    /// sector-aligned log buffer; full buffers (and
+    /// (Windows). Every append is copied into an in-memory,
+    /// sector-aligned, dual-slot log buffer; full slots (and
     /// [`crate::JournalHandle::sync_through`] callers) flush to
     /// disk via a single sector-aligned positioned write. This
     /// eliminates the page-cache hop that the buffered path
-    /// incurs — the kernel writes user-space bytes directly into
-    /// device DMA — at the cost of mutex-serialised appends in
-    /// place of the lock-free fast path.
+    /// incurs (the kernel writes user-space bytes directly into
+    /// device DMA). The cost is a short state lock per append for
+    /// the copy into the active slot, in place of the lock-free
+    /// buffered fast path; slot flushes run outside that lock.
     ///
     /// **When to enable it.** Use Direct-IO mode when:
     /// - You're building a database / queue / ledger whose WAL
@@ -409,16 +413,17 @@ impl JournalOptions {
     ///
     /// Default [`SyncMode::Full`] preserves pre-0.9.4 behaviour
     /// (every `sync_through` invokes the platform's full
-    /// media-durability sync — `fsync` on Linux, `F_FULLFSYNC`
+    /// media-durability sync: `fdatasync` on Linux, `F_FULLFSYNC`
     /// on macOS, `FlushFileBuffers` on Windows).
     ///
     /// [`SyncMode::Barrier`] opts into the barrier-grade
-    /// primitive — cheaper than `Full` on macOS (especially
-    /// Apple Silicon NVMe), identical on Linux (`fdatasync` is
-    /// already barrier-grade), no-op on Windows. Crash-safe
-    /// **only** on drives with PLP or under explicit
-    /// eventual-`sync_full` discipline at commit boundaries.
-    /// See [`SyncMode::Barrier`] for the full safety contract.
+    /// primitive: cheaper than `Full` on macOS (especially
+    /// Apple Silicon NVMe), identical on Linux (`fdatasync`), and
+    /// on Windows the same flush as `Full` unless the handle is
+    /// write-through. Crash-safe **only** on drives with PLP or
+    /// under explicit eventual-`sync_full` discipline at commit
+    /// boundaries. See [`SyncMode::Barrier`] for the full safety
+    /// contract and per-platform details.
     ///
     /// Typical use: a database paired with
     /// [`crate::Handle::is_plp_protected`] — if the drive

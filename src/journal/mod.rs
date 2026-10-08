@@ -250,16 +250,18 @@ pub struct JournalHandle {
         Option<std::sync::Arc<crate::async_io::completion_driver::AsyncIoUring>>,
     >,
     /// Direct-IO mode flag. `true` when the journal was opened with
-    /// [`JournalOptions::direct(true)`]. Determines whether the
-    /// append/sync paths route through [`Self::log_buffer`] (mutex-
-    /// serialised log-buffer pattern) or the lock-free `pwrite`
-    /// path used by buffered-mode journals.
+    /// [`JournalOptions::direct(true)`] and the filesystem accepted
+    /// Direct IO. Determines whether the append/sync paths route
+    /// through [`Self::log_buffer`] (the 0.9.5 dual-slot log
+    /// buffer) or the lock-free `pwrite` path used by
+    /// buffered-mode journals.
     pub(crate) direct: bool,
     /// In-memory sector-aligned log buffer. `Some(_)` exclusively
-    /// when `direct = true`; `None` otherwise. Mutex-protected
-    /// because direct-mode appends serialise into a single shared
-    /// buffer (the InnoDB / WiredTiger pattern). Buffered-mode
-    /// journals retain their lock-free fast path.
+    /// when `direct = true`; `None` otherwise. Self-locking since
+    /// 0.9.5: appenders take its short internal state lock to copy
+    /// into the active slot, and slot flushes run outside that lock
+    /// (see `log_buffer.rs`). Buffered-mode journals retain their
+    /// lock-free fast path.
     ///
     /// 0.9.7 H-2 — private (not `pub(crate)`): only accessed
     /// from within `src/journal/mod.rs`. Demoted so future
@@ -317,19 +319,21 @@ impl JournalHandle {
     /// **Buffered mode** (`options.direct == false`, the default):
     /// the file is opened via standard `OpenOptions`, the
     /// lock-free LSN reservation + concurrent `pwrite` path is
-    /// active, and resume sets `next_lsn` to the existing file
-    /// size.
+    /// active, and resume (1.1.1) scans to the end of the last
+    /// cleanly decoded frame, truncates anything after it and sets
+    /// `next_lsn` there.
     ///
     /// **Direct mode** (`options.direct == true`): the file is
     /// opened with the platform's Direct-IO flag (`O_DIRECT` /
     /// `F_NOCACHE` / `FILE_FLAG_NO_BUFFERING`). An in-memory
-    /// sector-aligned log buffer is allocated; appends serialise
-    /// into the buffer (mutex-protected) and flush in
+    /// sector-aligned dual-slot log buffer is allocated; appends
+    /// copy into it under a short state lock and it flushes in
     /// sector-aligned chunks. Resume scans the existing file
     /// to find the LSN immediately past the last cleanly-decoded
-    /// frame and resumes there — partial trailing sector content
-    /// is rehydrated into the buffer so subsequent flushes
-    /// overwrite the zero-pad cleanly.
+    /// frame and resumes there: bytes past that sector are cut
+    /// off, and the partial trailing sector content is rehydrated
+    /// into the buffer so subsequent flushes overwrite the
+    /// zero-pad cleanly.
     pub(crate) fn open_with_options(path: &Path, options: JournalOptions) -> Result<Self> {
         if options.direct {
             Self::open_direct(path, options)
@@ -1106,7 +1110,7 @@ impl JournalHandle {
                 // mirror of `state.committed_lsn`, updated by the
                 // leader on commit with `Release`). If our target
                 // is covered, return without ever re-acquiring
-                // the state lock — this is the wake-stampede fix.
+                // the state lock; this is the wake-stampede fix.
                 if self.synced_lsn.load(Ordering::Acquire) >= lsn.0 {
                     return Ok(());
                 }
@@ -1162,7 +1166,7 @@ impl JournalHandle {
         if let Ok(frontier) = outcome {
             leader.frontier = Some(frontier);
         }
-        // 0.9.7 H-16 — advisory snapshot of currently parked
+        // 0.9.7 H-16: advisory snapshot of currently parked
         // followers for the observer hook.
         let followers_at_commit = self.group_commit.pending_followers.load(Ordering::Acquire);
         drop(leader);
@@ -1172,7 +1176,7 @@ impl JournalHandle {
             tracing::debug!(new_synced_lsn = frontier, "group-commit fsync completed");
         }
 
-        // 0.9.2 observer hook — leader-only. Followers returned
+        // 0.9.2 observer hook, leader-only. Followers returned
         // early at the `committed_lsn >= lsn.0` check above
         // without ever reaching this point.
         if let Some(obs) = self.observer.as_ref() {
@@ -1397,7 +1401,7 @@ impl JournalHandle {
     ///
     /// # Platform behaviour
     ///
-    /// - **Linux:** `fallocate(FALLOC_FL_KEEP_SIZE)` — reserves
+    /// - **Linux:** `fallocate(FALLOC_FL_KEEP_SIZE)` reserves
     ///   extents without writing zeros or changing the size. On
     ///   filesystems without `fallocate` the platform layer falls
     ///   back to `posix_fallocate`, which writes zeros and extends
@@ -1408,7 +1412,7 @@ impl JournalHandle {
     ///   allocation; falls back to non-contiguous. Does not
     ///   change the file size.
     /// - **Windows:** `SetFileInformationByHandle` with
-    ///   `FileAllocationInfo` — sets the allocation size without
+    ///   `FileAllocationInfo`, which sets the allocation size without
     ///   changing the end of file.
     /// - **Other platforms:** no-op (succeeds; allocation
     ///   happens on write).
@@ -2848,9 +2852,10 @@ mod tests {
     #[test]
     fn sync_mode_barrier_round_trips_through_journal() {
         // SyncMode::Barrier goes through platform::sync_barrier.
-        // On Linux it's fdatasync (same path); on Windows it's a
-        // no-op; on macOS it's F_BARRIERFSYNC. All three return
-        // Ok on a healthy fs — the journal's sync_through must
+        // On Linux it's fdatasync (same path); on macOS it's
+        // F_BARRIERFSYNC; on Windows the platform layer decides
+        // (a flush unless the handle is write-through). All return
+        // Ok on a healthy fs; the journal's sync_through must
         // complete and advance synced_lsn regardless of the
         // underlying primitive.
         let path = tmp_path("sync_mode_barrier");

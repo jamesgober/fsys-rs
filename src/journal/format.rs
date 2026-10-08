@@ -72,10 +72,11 @@
 //!
 //! In all three cases the reader stops cleanly at the last
 //! fully-written record. Partial bytes after that point are
-//! discarded (not returned to the caller), and the resume
-//! cursor for a new [`JournalHandle`] should be set to the LSN
-//! at which the partial bytes started — the writer will
-//! overwrite them.
+//! discarded (not returned to the caller). On reopen, a
+//! [`JournalHandle`] in either mode resumes at the LSN where the
+//! partial bytes start and truncates the file there (Direct-IO
+//! keeps the rest of that sector and rewrites it on the next
+//! flush), so new records follow the last good one.
 
 #![allow(dead_code)] // some helpers are reserved for the writer-side path
 

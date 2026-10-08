@@ -45,18 +45,18 @@
 //! zero byte where a frame should begin is never record data.
 //! The reader classifies such a zero run by where it ends:
 //!
-//! - **At end of file** — sector padding left by a Direct-IO
+//! - **At end of file:** sector padding left by a Direct-IO
 //!   partial flush, or space extended by preallocation. The
 //!   journal ends cleanly ([`JournalTailState::CleanEnd`]) and
 //!   [`JournalReader::position`] reports the offset where the
 //!   zero run starts, which is the end of the last record.
-//! - **At a 512-byte boundary, within 64 MiB** — a gap left by
+//! - **At a 512-byte boundary, within 64 MiB:** a gap left by
 //!   a 1.1.0 Direct-IO writer when it rotated a log-buffer slot
 //!   or resumed at a sector boundary. The reader skips the gap
 //!   and continues with the frame at the boundary. 1.1.1 writers
 //!   never produce such gaps; the skip keeps journals written by
 //!   1.1.0 readable.
-//! - **Anywhere else** — space a writer reserved but never
+//! - **Anywhere else:** space a writer reserved but never
 //!   filled (a crash or a failed write while appends were in
 //!   flight). Iteration stops with
 //!   [`JournalTailState::TruncatedHeader`] at the start of the
@@ -1075,7 +1075,7 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────
-    // 1.1.1 — zero-run classification and allocation bounds
+    // 1.1.1: zero-run classification and allocation bounds
     // ─────────────────────────────────────────────────────────
 
     /// Encodes `payload` as one frame.

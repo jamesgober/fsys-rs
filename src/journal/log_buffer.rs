@@ -588,7 +588,7 @@ impl LogBuffer {
         // other thread to leave `bufs[old_idx]` alone; we have
         // exclusive read access for the syscall.
         //
-        // 0.9.6 — when iouring is available, submit via
+        // 0.9.6: when iouring is available, submit via
         // `IORING_OP_WRITE_FIXED` against the pre-registered slot
         // index (`old_idx`); the kernel skips per-SQE buffer page
         // pinning. Otherwise fall back to the pwrite path.
@@ -710,7 +710,7 @@ impl LogBuffer {
     /// **Coordination.** This method waits for any in-flight
     /// write (`flushing.is_some()`) to complete before issuing the
     /// partial flush, then holds the state lock through the
-    /// partial-flush syscall. This is the deliberate sync point —
+    /// partial-flush syscall. This is the deliberate sync point:
     /// callers asked for "make this durable now" and we honour
     /// that by serialising. Other appenders wait briefly.
     ///
