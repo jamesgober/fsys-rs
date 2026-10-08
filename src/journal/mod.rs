@@ -59,6 +59,7 @@
 
 pub mod backend;
 pub(crate) mod format;
+mod gate;
 pub(crate) mod log_buffer;
 pub mod options;
 mod poison;
@@ -70,6 +71,7 @@ pub use reader::{JournalIter, JournalReader, JournalRecord, JournalTailState};
 
 use crate::{Error, Result};
 use crossbeam_utils::CachePadded;
+use gate::WriteGate;
 use log_buffer::LogBuffer;
 use parking_lot::{Condvar, Mutex as PlMutex};
 use poison::Poison;
@@ -287,6 +289,12 @@ pub struct JournalHandle {
     /// `sync_through` whose target is not already durable then
     /// returns an error. See the `poison` module docs.
     poison: Poison,
+    /// 1.1.1: tracks buffered-mode writes between their LSN
+    /// reservation and the end of their positioned write, so a
+    /// group-commit leader only publishes a durable frontier whose
+    /// bytes have all been written. Unused in Direct-IO mode. See
+    /// the `gate` module docs.
+    write_gate: WriteGate,
 }
 
 impl JournalHandle {
@@ -375,6 +383,7 @@ impl JournalHandle {
             observer: None,
             sync_mode: options.sync_mode,
             poison: Poison::new(),
+            write_gate: WriteGate::new(),
         })
     }
 
@@ -468,6 +477,7 @@ impl JournalHandle {
             observer: None,
             sync_mode: options.sync_mode,
             poison: Poison::new(),
+            write_gate: WriteGate::new(),
         })
     }
 
@@ -595,7 +605,10 @@ impl JournalHandle {
             // active slot proceed concurrently with the flush
             // of the dormant slot.
             let (_start, end) = log_buffer.append_frame(&self.file, record, &self.poison)?;
-            self.next_lsn.store(end, Ordering::Release);
+            // `fetch_max`, not `store`: concurrent appenders finish
+            // in any order, and a slower one must not move the
+            // public frontier backwards.
+            let _ = self.next_lsn.fetch_max(end, Ordering::Release);
             #[cfg(feature = "tracing")]
             tracing::trace!(end_lsn = end, "direct append complete");
             return Ok(Lsn(end));
@@ -630,33 +643,21 @@ impl JournalHandle {
 
         // Reserve a slot for the entire frame. The LSN
         // semantics: caller-visible LSN is the byte offset
-        // *immediately past* this frame — i.e. the start of the
+        // *immediately past* this frame, i.e. the start of the
         // next append. Internally, the file's byte content is
         // framed; readers using `JournalReader` walk the
         // frames forward and yield payloads.
         //
-        // fetch_add is `Release` (0.9.7 M-2 — was `AcqRel`).
-        //
-        // The reservation step does not read any non-atomic
-        // memory protected by another thread's prior Release —
-        // the appender does not consult shared state set up by
-        // another appender's pwrite. So the `Acquire` half of
-        // the previous `AcqRel` was defensive overhead.
-        //
-        // `Release` IS load-bearing: the syncer's
-        // `self.next_lsn.load(Ordering::Acquire)` in
-        // `sync_through` synchronises-with this Release, so the
-        // syncer observes the latest reserved frontier (i.e.
-        // every appender's `end` value publishes through this
-        // Release into the syncer's Acquire view).
-        //
-        // Net cost on aarch64: `fetch_add(Release)` lowers to
-        // `LDADDL` (load-acquire/store-release variant LDADDL
-        // emits only the store-release barrier), whereas
-        // `AcqRel` emits `LDADDAL` with the additional
-        // load-acquire fence. ~0.2-0.5 µs/op saved on tight
-        // appender loops.
-        let start = self.next_lsn.fetch_add(frame_len, Ordering::Release);
+        // 1.1.1: register the write with the gate *before* the
+        // reservation and keep the ticket until the write ends.
+        // The reservation is `SeqCst` because the gate's drain
+        // argument (see `gate.rs`) relies on the single total
+        // order of the epoch reads, this `fetch_add` and the
+        // leader's frontier load. On x86 every RMW is already
+        // sequentially consistent; on aarch64 this is the same
+        // `LDADDAL` the pre-0.9.7 `AcqRel` emitted.
+        let _ticket = self.write_gate.enter();
+        let start = self.next_lsn.fetch_add(frame_len, Ordering::SeqCst);
         let end = start + frame_len;
 
         // 0.9.1 stack-allocated frame fast path: for typical
@@ -867,7 +868,7 @@ impl JournalHandle {
                     last
                 }
             };
-            self.next_lsn.store(last_end, Ordering::Release);
+            let _ = self.next_lsn.fetch_max(last_end, Ordering::Release);
             #[cfg(feature = "tracing")]
             tracing::trace!(end_lsn = last_end, "direct append_batch complete");
             return Ok(Lsn::new(last_end));
@@ -880,13 +881,10 @@ impl JournalHandle {
         // across N records instead of paying N independent
         // syscalls + N independent LSN-reservation atomics.
         let frame_total = total as u64;
-        // `Release` (0.9.7 M-2 — was `AcqRel`). Same reasoning
-        // as the single-record path at line ~604: the
-        // reservation does not consult shared state set up by
-        // a peer appender, so the `Acquire` half is defensive
-        // overhead. The syncer's `Acquire`-load on `next_lsn`
-        // synchronises-with this `Release`.
-        let start = self.next_lsn.fetch_add(frame_total, Ordering::Release);
+        // 1.1.1: registered with the write gate before the
+        // `SeqCst` reservation, same as the single-record path.
+        let _ticket = self.write_gate.enter();
+        let start = self.next_lsn.fetch_add(frame_total, Ordering::SeqCst);
         let end = start + frame_total;
 
         // Allocate without zeroing — `encode_frame_into` writes
@@ -1191,18 +1189,32 @@ impl JournalHandle {
         // partial flush, so this call is consistent with the
         // group-commit captured-frontier invariant. A failed
         // flush poisons the journal inside `flush_partial`.
-        if let Some(log_buffer) = &self.log_buffer {
-            let _ = log_buffer.flush_partial(&self.file, &self.poison)?;
-        }
-
-        // Capture the append frontier. We commit only up
-        // through this point; subsequent appenders may extend
-        // `next_lsn` further, but those records are the next
-        // leader's responsibility. The captured value is a
-        // conservative lower bound on what fsync will actually
-        // make durable (the syscall flushes every dirty page,
-        // which may include later appends).
-        let frontier = self.next_lsn.load(Ordering::Acquire);
+        //
+        // The frontier is what the fsync below makes durable, so it
+        // must only cover bytes that have reached the file:
+        //
+        // - Direct-IO: the end LSN `flush_partial` captured under
+        //   the log-buffer lock. Every byte below it is in the file.
+        //   Pre-1.1.1 the leader re-read `next_lsn` after the flush,
+        //   which could include an append that landed in the log
+        //   buffer after the flush and was never written.
+        // - Buffered: `next_lsn` is a reservation frontier; bytes
+        //   below it may still be in an appender's buffer. The
+        //   write gate waits for every write reserved below the
+        //   frontier to finish before it is returned. Pre-1.1.1 a
+        //   slow appender's bytes could be covered by another
+        //   thread's fsync before they were written, and its own
+        //   `sync_through` then took the fast path with no fsync.
+        //
+        // Later appends are the next leader's responsibility. The
+        // fsync may also persist some of them; the frontier is a
+        // lower bound.
+        let frontier = match &self.log_buffer {
+            Some(log_buffer) => log_buffer.flush_partial(&self.file, &self.poison)?,
+            None => self
+                .write_gate
+                .drain_below(|| self.next_lsn.load(Ordering::SeqCst)),
+        };
 
         // A buffered append that failed after this leader was
         // elected left a hole below `frontier`; do not fsync and
@@ -1414,7 +1426,14 @@ impl JournalHandle {
     ///
     /// - [`Error::Io`] on fsync or close failure.
     pub fn close(self) -> Result<()> {
-        let frontier = self.next_lsn.load(Ordering::Acquire);
+        // Direct-IO: the log buffer's own end LSN is exact; the
+        // public `next_lsn` mirror is published after the buffer
+        // copy. Buffered: every append has returned (we own
+        // `self`), so the reservation frontier is fully written.
+        let frontier = match &self.log_buffer {
+            Some(log_buffer) => log_buffer.next_lsn(),
+            None => self.next_lsn.load(Ordering::SeqCst),
+        };
         self.sync_through(Lsn(frontier))?;
         // File closes when `self` drops; explicit drop here for
         // documentation.
@@ -3109,5 +3128,110 @@ mod tests {
                 .expect("appender hung after a failed rotation flush");
         }
         assert_poisoned(j.append(b"after"));
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 1.1.1: durable frontier only covers written bytes (FS-J3)
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_buffered_sync_waits_for_write_reserved_below_frontier() {
+        // Simulate an appender that registered and reserved its LSN
+        // range but whose positioned write has not finished (the
+        // exact state of a slow `append` between `fetch_add` and
+        // `write_at`). A later append + `sync_through` from another
+        // thread must not publish a frontier past it until the write
+        // lands. Pre-1.1.1 the leader published `next_lsn` at once,
+        // and the slow appender's own `sync_through` then hit the
+        // fast path with no fsync covering its bytes.
+        use std::sync::Arc;
+        let path = tmp_path("frontier_gate");
+        let _g = Cleanup(path.clone());
+        let j = Arc::new(
+            JournalHandle::open_with_options(
+                &path,
+                JournalOptions::new().group_commit_window(None),
+            )
+            .expect("open"),
+        );
+        let frame = format::encode_frame_owned(b"slow").expect("encode");
+        let ticket = j.write_gate.enter();
+        let a_start = j.next_lsn.fetch_add(frame.len() as u64, Ordering::SeqCst);
+        let a_end = a_start + frame.len() as u64;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let j2 = Arc::clone(&j);
+        let _ = std::thread::spawn(move || {
+            let lsn = j2.append(b"fast").expect("append");
+            j2.sync_through(lsn).expect("sync");
+            let _ = tx.send(lsn);
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "sync_through returned while a write below its frontier was in flight"
+        );
+        assert!(
+            j.synced_lsn().as_u64() < a_end,
+            "frontier published past an unwritten range"
+        );
+
+        crate::platform::write_at(&j.file, a_start, &frame).expect("slow write");
+        drop(ticket);
+        let lsn_b = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("sync_through finished after the write landed");
+        assert!(j.synced_lsn() >= lsn_b);
+        // The slow appender's own sync is now covered.
+        j.sync_through(Lsn(a_end)).expect("covered");
+
+        let mut reader = JournalReader::open(&path).expect("reader");
+        let payloads: Vec<Vec<u8>> = reader.iter().map(|r| r.expect("record").payload).collect();
+        assert_eq!(payloads, vec![b"slow".to_vec(), b"fast".to_vec()]);
+    }
+
+    #[test]
+    fn test_direct_next_lsn_never_moves_backwards_under_concurrency() {
+        // FS-J11: direct appends published their end with `store`,
+        // so a slower thread could move `next_lsn` backwards.
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let path = tmp_path("direct_monotonic");
+        let _g = Cleanup(path.clone());
+        let j = Arc::new(
+            JournalHandle::open_with_options(&path, JournalOptions::new().direct(true))
+                .expect("open direct"),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let j = Arc::clone(&j);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut last = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let now = j.next_lsn().as_u64();
+                    assert!(now >= last, "next_lsn moved backwards: {last} -> {now}");
+                    last = now;
+                }
+            })
+        };
+        let mut writers = Vec::new();
+        for t in 0..8u8 {
+            let j = Arc::clone(&j);
+            writers.push(std::thread::spawn(move || {
+                let mut max_end = 0u64;
+                for _ in 0..2000 {
+                    max_end = max_end.max(j.append(&[t; 24]).expect("append").as_u64());
+                }
+                max_end
+            }));
+        }
+        let highest = writers
+            .into_iter()
+            .map(|w| w.join().expect("writer"))
+            .max()
+            .unwrap_or(0);
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().expect("watcher");
+        assert_eq!(j.next_lsn().as_u64(), highest);
     }
 }

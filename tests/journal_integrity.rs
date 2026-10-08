@@ -233,3 +233,90 @@ fn test_mixed_sizes_across_rotations_round_trip() {
         }
     }
 }
+
+/// Walks the live journal and returns the end LSN of the longest
+/// prefix of cleanly decoded records.
+fn clean_prefix_end(path: &Path) -> u64 {
+    let mut reader = JournalReader::open(path).expect("open reader");
+    let mut end = 0u64;
+    for rec in reader.iter() {
+        match rec {
+            Ok(r) => end = r.lsn.as_u64() + r.payload.len() as u64 + 12,
+            Err(_) => break,
+        }
+    }
+    end
+}
+
+/// FS-J3: `sync_through` published a durable frontier covering
+/// bytes that had not been written yet: in buffered mode a slow
+/// appender's reserved range, in Direct-IO mode an append that
+/// landed in the log buffer after the leader's flush. Whenever
+/// `synced_lsn()` reports a frontier, every byte below it must
+/// already decode from the file.
+#[test]
+fn test_synced_frontier_never_covers_unwritten_bytes() {
+    use std::sync::atomic::AtomicBool;
+    for direct in [false, true] {
+        let path = tmp_path("frontier");
+        let _g = Cleanup(path.clone());
+        let fs = builder().build().expect("handle");
+        let log = Arc::new(
+            fs.journal_with(
+                &path,
+                JournalOptions::new()
+                    .direct(direct)
+                    .log_buffer_kib(64)
+                    .group_commit_window(None),
+            )
+            .expect("open"),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::new();
+        // One slow appender with large records (long positioned
+        // writes in buffered mode), three fast append+sync loops.
+        {
+            let log = Arc::clone(&log);
+            let stop = Arc::clone(&stop);
+            workers.push(std::thread::spawn(move || {
+                let big = vec![0xB1u8; 2 * 1024 * 1024];
+                for _ in 0..24 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = log.append(&big).expect("big append");
+                }
+            }));
+        }
+        for t in 0..3u8 {
+            let log = Arc::clone(&log);
+            let stop = Arc::clone(&stop);
+            workers.push(std::thread::spawn(move || {
+                for _ in 0..2000 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let lsn = log.append(&[t; 64]).expect("append");
+                    log.sync_through(lsn).expect("sync");
+                }
+            }));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut checks = 0;
+        while std::time::Instant::now() < deadline && !workers.iter().all(|w| w.is_finished()) {
+            let synced = log.synced_lsn().as_u64();
+            let written = clean_prefix_end(&path);
+            assert!(
+                written >= synced,
+                "direct={direct}: synced_lsn {synced} covers bytes that are not written \
+                 (clean prefix ends at {written})"
+            );
+            checks += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            w.join().expect("worker");
+        }
+        assert!(checks > 0);
+    }
+}
