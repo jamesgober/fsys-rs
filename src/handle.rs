@@ -33,7 +33,7 @@ use crate::pipeline::{BatchOp, HandleSnapshot, Pipeline};
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU16, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 
@@ -156,22 +156,22 @@ const TEMP_PREFIX: &str = ".fsys-tmp-";
 /// # }
 /// ```
 pub struct Handle {
-    /// The method explicitly requested by the caller (possibly `Auto`).
-    configured_method: AtomicU8,
-    /// The method currently in effect after runtime fallbacks.
+    /// The configured method (high byte; possibly `Auto`) and the
+    /// method currently in effect (low byte), packed into one atomic
+    /// so [`Handle::set_method`] publishes both at once and a reader
+    /// never sees a configured method paired with a stale active one.
     ///
-    /// Set to the resolved form of `configured_method` at build time.
-    /// May be updated to a less-capable method if the OS rejects a
-    /// privileged open (e.g. `O_DIRECT` rejected on tmpfs → falls back
-    /// to `Data`).
+    /// The active method starts as the resolved form of the configured
+    /// method and may be downgraded by runtime fallbacks (e.g.
+    /// `O_DIRECT` rejected on tmpfs falls back to `Data`).
     ///
-    /// **0.4.0 limitation.** This field is updated by solo-lane runtime
-    /// fallbacks but **not** by group-lane (batch) per-op fallbacks —
-    /// the dispatcher runs without a [`Handle`] reference. Group-lane
-    /// fallback information surfaces in [`BatchError::source`] for the
-    /// failing op. See decision D-5 in `.dev/DECISIONS-0.4.0.md`; full
-    /// cross-lane consistency arrives in `0.5.0`.
-    active_method: AtomicU8,
+    /// **0.4.0 limitation.** The active method is updated by solo-lane
+    /// runtime fallbacks but **not** by group-lane (batch) per-op
+    /// fallbacks — the dispatcher runs without a [`Handle`] reference.
+    /// Group-lane fallback information surfaces in
+    /// [`BatchError::source`] for the failing op. See decision D-5 in
+    /// `.dev/DECISIONS-0.4.0.md`.
+    methods: AtomicU16,
     /// Optional root directory. When set, all relative paths are resolved
     /// against this root and path-escape checks are enforced.
     root: Option<PathBuf>,
@@ -270,8 +270,7 @@ impl Handle {
         observer: Option<std::sync::Arc<dyn crate::observer::FsysObserver>>,
     ) -> Self {
         Self {
-            configured_method: AtomicU8::new(configured_method.to_u8()),
-            active_method: AtomicU8::new(active_method.to_u8()),
+            methods: AtomicU16::new(pack_methods(configured_method, active_method)),
             root,
             mode,
             sector_size,
@@ -623,7 +622,7 @@ impl Handle {
     #[must_use]
     #[inline]
     pub fn method(&self) -> Method {
-        Method::from_u8(self.configured_method.load(Ordering::Relaxed))
+        Method::from_u8((self.methods.load(Ordering::Relaxed) >> 8) as u8)
     }
 
     /// Returns the method currently in effect after any runtime fallbacks.
@@ -634,33 +633,34 @@ impl Handle {
     #[must_use]
     #[inline]
     pub fn active_method(&self) -> Method {
-        Method::from_u8(self.active_method.load(Ordering::Relaxed))
+        Method::from_u8((self.methods.load(Ordering::Relaxed) & 0xFF) as u8)
     }
 
     /// Updates the configured method for future IO operations.
     ///
     /// Resolves [`Method::Auto`] through the hardware-probe ladder
     /// (same logic as [`Builder::build`](crate::Builder::build)) and
-    /// publishes both the configured + resolved values atomically.
-    /// Existing in-flight IO is unaffected; only subsequent calls
-    /// pick up the new method.
+    /// publishes the configured and resolved values in one atomic
+    /// store. Existing in-flight IO is unaffected; only subsequent
+    /// calls pick up the new method.
+    ///
+    /// Applies the same selectability checks as `Builder::build`, and
+    /// returns the same error for the same method.
     ///
     /// # Errors
     ///
     /// - [`Error::UnsupportedMethod`] if `method` is a reserved
     ///   variant ([`Method::Journal`] — see its docs for why it's
     ///   reserved).
+    /// - [`Error::FeatureNotEnabled`] if `method` is [`Method::Spdk`]
+    ///   and the `spdk` Cargo feature is off.
+    /// - [`Error::SpdkUnavailable`] if `method` is [`Method::Spdk`] and
+    ///   the SPDK backend cannot be used on this host.
     pub fn set_method(&self, method: Method) -> Result<()> {
-        if method.is_reserved() {
-            return Err(Error::UnsupportedMethod {
-                method: method.as_str(),
-            });
-        }
+        crate::builder::check_method_selectable(method)?;
         let resolved = method.resolve();
-        self.configured_method
-            .store(method.to_u8(), Ordering::Relaxed);
-        self.active_method
-            .store(resolved.to_u8(), Ordering::Relaxed);
+        self.methods
+            .store(pack_methods(method, resolved), Ordering::Relaxed);
         Ok(())
     }
 
@@ -1021,7 +1021,14 @@ impl Handle {
     /// `O_DIRECT` on tmpfs). Takes effect for all subsequent operations on
     /// this handle.
     pub(crate) fn update_active_method(&self, method: Method) {
-        self.active_method.store(method.to_u8(), Ordering::Relaxed);
+        let active = u16::from(method.to_u8());
+        // `fetch_update` with a closure that always returns `Some`
+        // cannot fail; the result carries no information.
+        let _ = self
+            .methods
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some((cur & 0xFF00) | active)
+            });
     }
 
     /// Returns `true` if the active method requires Direct IO.
@@ -1594,6 +1601,12 @@ mod rootpath {
     }
 }
 
+/// Packs the configured and active methods into the layout of
+/// `Handle::methods`.
+const fn pack_methods(configured: Method, active: Method) -> u16 {
+    ((configured.to_u8() as u16) << 8) | active.to_u8() as u16
+}
+
 /// Builds a [`BatchError`] for a path-validation failure that happens
 /// *before* submission. `completed = 0` because no op has been
 /// dispatched yet; `failed_at` is the index of the offending op in the
@@ -1686,6 +1699,49 @@ mod tests {
         } else {
             panic!("expected UnsupportedMethod");
         }
+    }
+
+    #[test]
+    fn test_set_method_spdk_is_rejected_like_build() {
+        let h = make_handle(Method::Sync);
+        let from_build = match crate::Builder::new().method(Method::Spdk).build() {
+            Ok(_) => None,
+            Err(e) => Some(e.to_string()),
+        };
+        match h.set_method(Method::Spdk) {
+            Ok(()) => assert!(
+                from_build.is_none(),
+                "set_method accepted Spdk, build refused"
+            ),
+            Err(e) => assert_eq!(Some(e.to_string()), from_build),
+        }
+        // A refused switch leaves the handle untouched.
+        if from_build.is_some() {
+            assert_eq!(h.method(), Method::Sync);
+            assert_eq!(h.active_method(), Method::Sync);
+        }
+    }
+
+    #[test]
+    fn test_method_pair_round_trips_through_packed_atomic() {
+        let h = make_handle(Method::Auto);
+        assert_eq!(h.method(), Method::Auto);
+        assert_ne!(h.active_method(), Method::Auto);
+        h.set_method(Method::Direct).expect("set direct");
+        assert_eq!(
+            (h.method(), h.active_method()),
+            (Method::Direct, Method::Direct)
+        );
+        h.update_active_method(Method::Data);
+        assert_eq!(
+            (h.method(), h.active_method()),
+            (Method::Direct, Method::Data)
+        );
+        h.set_method(Method::Mmap).expect("set mmap");
+        assert_eq!(
+            (h.method(), h.active_method()),
+            (Method::Mmap, Method::Mmap)
+        );
     }
 
     #[test]

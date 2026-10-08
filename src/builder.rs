@@ -530,43 +530,7 @@ impl Builder {
     ///   canonicalisation fails (the path must exist and be a directory
     ///   — `Builder::root` does not `mkdir`).
     pub fn build(self) -> Result<Handle> {
-        if self.method.is_reserved() {
-            return Err(Error::UnsupportedMethod {
-                method: self.method.as_str(),
-            });
-        }
-
-        // 1.1.0 — SPDK gating. `Method::Spdk` is runtime-validated:
-        // the `spdk` Cargo feature must be enabled at compile time AND
-        // the capability probe must report `spdk_eligible = true`.
-        // The actual backend construction lives in the `fsys-spdk`
-        // companion crate; this is the gate that decides whether
-        // forwarding to that crate is even sensible.
-        if self.method == Method::Spdk {
-            #[cfg(not(feature = "spdk"))]
-            {
-                return Err(Error::FeatureNotEnabled { feature: "spdk" });
-            }
-            #[cfg(feature = "spdk")]
-            {
-                let caps = crate::capability::capabilities();
-                if !caps.spdk_eligible {
-                    let reason = caps
-                        .first_spdk_skip_reason()
-                        .cloned()
-                        .unwrap_or(crate::capability::SpdkSkipReason::NotLinux);
-                    return Err(Error::SpdkUnavailable { reason });
-                }
-                // Feature on + eligible — but the `fsys-spdk` companion
-                // crate is in scaffold state in 1.1.0. Surface a clear
-                // error here rather than constructing a half-wired
-                // handle. This branch goes away when the companion
-                // crate ships the real backend.
-                return Err(Error::SpdkUnavailable {
-                    reason: crate::capability::SpdkSkipReason::SpdkLibraryNotFound,
-                });
-            }
-        }
+        check_method_selectable(self.method)?;
 
         let resolved_method = self.method.resolve();
         let mode = self.mode.resolve();
@@ -634,6 +598,59 @@ impl Builder {
             self.observer,
         ))
     }
+}
+
+/// Rejects methods that cannot back a handle on this build / host.
+/// Shared by [`Builder::build`] and [`Handle::set_method`] so both
+/// return the same error for the same method.
+///
+/// # Errors
+///
+/// - [`Error::UnsupportedMethod`] for reserved variants
+///   ([`Method::Journal`]).
+/// - [`Error::FeatureNotEnabled`] for [`Method::Spdk`] without the
+///   `spdk` Cargo feature.
+/// - [`Error::SpdkUnavailable`] for [`Method::Spdk`] when the host is
+///   not eligible or the backend is not available.
+pub(crate) fn check_method_selectable(method: Method) -> Result<()> {
+    if method.is_reserved() {
+        return Err(Error::UnsupportedMethod {
+            method: method.as_str(),
+        });
+    }
+
+    // 1.1.0 — SPDK gating. `Method::Spdk` is runtime-validated:
+    // the `spdk` Cargo feature must be enabled at compile time AND
+    // the capability probe must report `spdk_eligible = true`.
+    // The actual backend construction lives in the `fsys-spdk`
+    // companion crate; this is the gate that decides whether
+    // forwarding to that crate is even sensible.
+    if method == Method::Spdk {
+        #[cfg(not(feature = "spdk"))]
+        {
+            return Err(Error::FeatureNotEnabled { feature: "spdk" });
+        }
+        #[cfg(feature = "spdk")]
+        {
+            let caps = crate::capability::capabilities();
+            if !caps.spdk_eligible {
+                let reason = caps
+                    .first_spdk_skip_reason()
+                    .cloned()
+                    .unwrap_or(crate::capability::SpdkSkipReason::NotLinux);
+                return Err(Error::SpdkUnavailable { reason });
+            }
+            // Feature on + eligible — but the `fsys-spdk` companion
+            // crate is in scaffold state in 1.1.0. Surface a clear
+            // error rather than running a half-wired handle. This
+            // branch goes away when the companion crate ships the
+            // real backend.
+            return Err(Error::SpdkUnavailable {
+                reason: crate::capability::SpdkSkipReason::SpdkLibraryNotFound,
+            });
+        }
+    }
+    Ok(())
 }
 
 impl Default for Builder {
