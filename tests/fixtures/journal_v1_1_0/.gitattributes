@@ -1,0 +1,2 @@
+# Journal fixtures written by fsys 1.1.0; byte-exact, never normalize.
+*.wal binary
