@@ -28,7 +28,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[cfg(all(target_os = "linux", feature = "async"))]
-use crate::async_io::completion_driver::AsyncIoUring;
+use crate::async_io::completion_driver::{AsyncIoUring, FileRef, IoBuf};
 
 /// Default queue depth for journal-owned io_uring rings on Linux.
 /// 256 is large enough to absorb burst append load without backpressure
@@ -184,7 +184,14 @@ impl JournalHandle {
     /// borrowed` on the `--no-default-features --features async`
     /// build (caught by the new feature-matrix CI job, not the
     /// default-features Linux test).
-    async fn append_native(&self, ring: &AsyncIoUring, record: Vec<u8>) -> Result<Lsn> {
+    ///
+    /// 1.1.1: takes `&Arc<Self>` so the op can hold a clone of the
+    /// journal as its file keep-alive, and moves the frame into the
+    /// driver. Once the first poll has queued the write, dropping
+    /// this future cannot free the frame or close the fd while the
+    /// kernel is still writing, and the reserved LSN range is always
+    /// filled.
+    async fn append_native(self: &Arc<Self>, ring: &AsyncIoUring, record: Vec<u8>) -> Result<Lsn> {
         use std::os::fd::AsRawFd;
 
         // Encode the frame on the calling task's stack/heap. The
@@ -192,7 +199,8 @@ impl JournalHandle {
         // less than the kernel-side write latency, so no win
         // pushing it to the io_uring side.
         let frame = crate::journal::format::encode_frame_owned(&record)?;
-        let frame_len = frame.len() as u64;
+        let frame_bytes = frame.len();
+        let frame_len = frame_bytes as u64;
 
         // `Release` (0.9.7 M-2 — was `AcqRel`). Same reasoning
         // as the sync-path equivalent in `journal/mod.rs:604`:
@@ -202,10 +210,15 @@ impl JournalHandle {
         // synchronises-with this `Release`.
         let start = self.next_lsn.fetch_add(frame_len, Ordering::Release);
         let end = start + frame_len;
-        let fd = self.file.as_raw_fd();
-        let n =
-            crate::async_io::iouring_substrate::write_at_native(ring, fd, &frame, start).await?;
-        if n != frame.len() {
+        let file = FileRef::new(Arc::clone(self), |j| j.file.as_raw_fd());
+        let n = crate::async_io::iouring_substrate::write_at_native(
+            ring,
+            file,
+            IoBuf::Vec(frame),
+            start,
+        )
+        .await?;
+        if n != frame_bytes {
             return Err(Error::Io(std::io::Error::other(
                 "native io_uring write returned short count on journal append",
             )));
@@ -228,7 +241,7 @@ impl JournalHandle {
     // 0.9.6 audit fix: takes `&self` rather than `self: Arc<Self>`
     // (same E0505 borrow conflict as `append_native` — see its doc
     // comment for the explanation).
-    async fn sync_through_native(&self, ring: &AsyncIoUring, lsn: Lsn) -> Result<()> {
+    async fn sync_through_native(self: &Arc<Self>, ring: &AsyncIoUring, lsn: Lsn) -> Result<()> {
         use std::os::fd::AsRawFd;
 
         let lsn_off = lsn.as_u64();
@@ -267,8 +280,8 @@ impl JournalHandle {
             drop(state);
 
             let frontier = self.next_lsn.load(Ordering::Acquire);
-            let fd = self.file.as_raw_fd();
-            let result = crate::async_io::iouring_substrate::fdatasync_native(ring, fd).await;
+            let file = FileRef::new(Arc::clone(self), |j| j.file.as_raw_fd());
+            let result = crate::async_io::iouring_substrate::fdatasync_native(ring, file).await;
 
             // Re-acquire to publish committed_lsn and clear
             // in_flight; notify any parked sync-path

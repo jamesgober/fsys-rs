@@ -142,6 +142,7 @@ fn test_direct_write_concurrent_fd_churn_each_keep_own_bytes() {
 mod async_tests {
     use super::*;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_direct_write_async_many_files_each_keep_own_bytes() {
@@ -173,6 +174,101 @@ mod async_tests {
         for i in 0..FILES * 2 {
             let got = std::fs::read(dir.0.join(format!("f{i:03}.bin"))).unwrap();
             assert_bytes(&got, &payload_for(i), &format!("file {i}"));
+        }
+    }
+
+    /// Reads every record in the journal at `path` if the file has a
+    /// clean tail, `None` otherwise.
+    fn read_journal(path: &std::path::Path) -> Option<Vec<Vec<u8>>> {
+        let mut reader = fsys::JournalReader::open(path).ok()?;
+        let mut out = Vec::new();
+        for record in reader.iter() {
+            out.push(record.ok()?.payload);
+        }
+        (reader.tail_state() == fsys::JournalTailState::CleanEnd).then_some(out)
+    }
+
+    /// FS-C2: dropping `append_async` futures right after their first
+    /// poll must neither free the frame under the kernel nor leave a
+    /// hole in the reserved LSN range. Every record must eventually
+    /// decode with a valid CRC, in order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_cancelled_journal_appends_leave_intact_records() {
+        let dir = test_dir("journal_cancel");
+        let fs = builder().root(&dir.0).build().expect("handle");
+        let path = dir.0.join("cancel.wal");
+        let log = Arc::new(fs.journal(&path).expect("journal"));
+        let mut expected = Vec::new();
+        for i in 0..200 {
+            let record = format!("record-{i:04}-{}", "x".repeat(i % 97)).into_bytes();
+            let fut = log.clone().append_async(record.clone());
+            // `timeout` polls the inner future once before checking
+            // the zero deadline, so the append is queued and then
+            // dropped.
+            let _elapsed = tokio::time::timeout(Duration::ZERO, fut).await;
+            // Reuse freed memory right away so a dangling SQE would
+            // pick up foreign bytes.
+            drop(std::hint::black_box(vec![0xEEu8; record.len() + 12]));
+            expected.push(record);
+        }
+        let tail = log
+            .clone()
+            .append_async(b"tail".to_vec())
+            .await
+            .expect("tail append");
+        log.clone().sync_through_async(tail).await.expect("sync");
+        expected.push(b"tail".to_vec());
+
+        // The dropped appends finish in the background; give them a
+        // bounded window to land.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match read_journal(&path) {
+                Some(records) if records == expected => break,
+                other => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "journal never settled: {:?} of {} records readable",
+                        other.map(|r| r.len()),
+                        expected.len()
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+    }
+
+    /// FS-C2: cancelling `write_async` at an early await point must
+    /// leave each target with either its previous content or the full
+    /// new payload, never foreign bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_cancelled_write_async_keeps_old_or_new_content() {
+        let dir = test_dir("write_cancel");
+        let fs = Arc::new(
+            builder()
+                .method(Method::Direct)
+                .root(&dir.0)
+                .build()
+                .expect("handle"),
+        );
+        const FILES: usize = 40;
+        for i in 0..FILES {
+            fs.write(format!("c{i:03}.bin"), b"old").expect("seed");
+        }
+        for i in 0..FILES {
+            let fut = fs
+                .clone()
+                .write_async(format!("c{i:03}.bin"), payload_for(i));
+            let budget = Duration::from_micros((i as u64 % 8) * 40);
+            let _elapsed = tokio::time::timeout(budget, fut).await;
+            drop(std::hint::black_box(vec![0xEEu8; payload_for(i).len()]));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for i in 0..FILES {
+            let got = std::fs::read(dir.0.join(format!("c{i:03}.bin"))).unwrap();
+            if got != b"old" {
+                assert_bytes(&got, &payload_for(i), &format!("file {i}"));
+            }
         }
     }
 }

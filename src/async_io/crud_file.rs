@@ -232,6 +232,7 @@ async fn write_async_native(
     path: &Path,
     data: &[u8],
 ) -> Result<()> {
+    use crate::async_io::completion_driver::{FileRef, IoBuf};
     use crate::async_io::iouring_substrate::{fdatasync_native, write_at_native};
     use std::os::fd::AsRawFd;
 
@@ -250,6 +251,11 @@ async fn write_async_native(
                 source: as_io_error(e),
             }
         })?;
+
+    // The driver holds a clone of this `Arc` as the fd keep-alive
+    // while an op is in flight.
+    let file = Arc::new(file);
+    let file_ref = || FileRef::new(Arc::clone(&file), |f| f.as_raw_fd());
 
     if handle.use_direct() && !direct_ok {
         // O_DIRECT was rejected by the filesystem (tmpfs etc.).
@@ -272,7 +278,7 @@ async fn write_async_native(
     // The temp file is already at size 0; we still need fdatasync
     // to ensure the inode is durable before the rename.
     if data.is_empty() {
-        if let Err(e) = fdatasync_native(ring, file.as_raw_fd()).await {
+        if let Err(e) = fdatasync_native(ring, file_ref()).await {
             drop(file);
             let _ = std::fs::remove_file(&temp);
             return Err(Error::AtomicReplaceFailed {
@@ -304,7 +310,7 @@ async fn write_async_native(
     buf.as_mut_slice()[..data.len()].copy_from_slice(data);
 
     // Native write: io_uring SQE for IORING_OP_WRITE.
-    let n = match write_at_native(ring, file.as_raw_fd(), buf.as_slice(), 0).await {
+    let n = match write_at_native(ring, file_ref(), IoBuf::Aligned(buf), 0).await {
         Ok(n) => n,
         Err(e) => {
             drop(file);
@@ -325,7 +331,7 @@ async fn write_async_native(
     }
 
     // Native fdatasync: io_uring SQE for IORING_OP_FSYNC + DATASYNC.
-    if let Err(e) = fdatasync_native(ring, file.as_raw_fd()).await {
+    if let Err(e) = fdatasync_native(ring, file_ref()).await {
         drop(file);
         let _ = std::fs::remove_file(&temp);
         return Err(Error::AtomicReplaceFailed {

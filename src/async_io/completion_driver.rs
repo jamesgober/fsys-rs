@@ -1,49 +1,66 @@
-//! Native io_uring async substrate — owner task that drives both
-//! submission and completion for the per-handle async ring.
+//! Native io_uring async substrate: owner task that drives both
+//! submission and completion for a per-handle (or per-journal)
+//! async ring.
 //!
 //! ## Architecture (one fused task, not separate submitter/driver)
 //!
 //! Per `.dev/DECISIONS-0.7.0.md` §`Native io_uring async substrate`:
 //! a single tokio task owns the `io_uring::IoUring` value on its
-//! stack frame (same ICE-avoidance rule as the 0.5.1 sync owner
-//! thread — never a struct field, never a function parameter at
-//! module scope). The task fuses submission and completion into
-//! one `tokio::select!` loop:
+//! stack frame and fuses submission and completion into one
+//! `tokio::select!` loop:
 //!
-//! 1. Pull op from the submission `mpsc` channel — caller submits
-//!    via [`AsyncIoUring::submit`].
-//! 2. Push the SQE onto the ring; submit to kernel.
-//! 3. `.await` on `AsyncFd<EventFd>` — yields when the eventfd is
-//!    readable (kernel signals when CQ has new entries).
-//! 4. Drain CQ, route results via per-op `oneshot` senders.
-//! 5. Loop.
+//! 1. Pull ops from the submission `mpsc` channel (callers submit
+//!    via [`AsyncIoUring::submit`]), push their SQEs and submit them
+//!    to the kernel in one batch.
+//! 2. `.await` on `AsyncFd<EventFd>`, which becomes readable when
+//!    the kernel posts CQEs.
+//! 3. Drain the CQ and route each result to its op's `oneshot`.
+//!
+//! ## Buffer and fd ownership
+//!
+//! A future can be dropped at any `.await`. If an SQE only borrowed
+//! the caller's buffer, a cancelled `write_async` would free memory
+//! the kernel is still reading, and a cancelled caller could close
+//! the fd before the SQE was consumed, letting an unrelated `open`
+//! reuse the number. So every [`Op`] **moves** its buffer
+//! ([`IoBuf`]) and a keep-alive for its open file ([`FileRef`]) into
+//! the driver. The driver holds both until the op's final CQE and
+//! drops them before replying. Dropping the caller's future
+//! therefore never frees in-flight memory and never closes an
+//! in-flight fd; the op simply finishes without anyone waiting.
+//!
+//! If the owner task itself stops with ops still in flight (runtime
+//! shutdown, panic, or an abort), the remaining buffers and file
+//! keep-alives are leaked instead of freed, because the kernel may
+//! still touch them.
+//!
+//! ## Short writes and flow control
+//!
+//! A write that completes short is resubmitted for the remainder by
+//! the driver, so once queued it finishes (or fails) as a unit
+//! whether or not the caller still waits. The driver keeps at most
+//! one CQ ring's worth of ops in flight and stops taking new ops
+//! while full, so the completion queue cannot overflow.
 //!
 //! ## Panic resilience
 //!
-//! The owner task's main work is wrapped in `catch_unwind`. On
-//! panic, the driver:
-//! - Sets a shared `poisoned: AtomicBool` so subsequent
-//!   `submit()` calls return [`Error::HandlePoisoned`].
-//! - Drains any remaining receiver items, sending the sentinel
-//!   `i32::MIN` to each pending oneshot so awaiting futures wake
-//!   with [`Error::HandlePoisoned`] instead of hanging on a
-//!   never-completed `oneshot::recv`.
-//!
-//! This is the load-bearing invariant called out in the
-//! "Critical reminders for this phase" section of
-//! `.dev/DECISIONS-0.7.0.md`. The panic-injection unit tests below
-//! validate it exhaustively.
+//! If the owner task panics, unwinding drops every pending
+//! `oneshot::Sender` (awaiting callers see `RecvError`, which
+//! [`AsyncIoUring::submit`] turns into [`Error::HandlePoisoned`]) and
+//! the `mpsc::Receiver` (later sends fail and surface as
+//! [`Error::CompletionDriverDead`]). `submit` records either case in
+//! the `poisoned` flag so subsequent submits short-circuit.
 //!
 //! ## Lifecycle
 //!
-//! - Constructed by [`crate::handle::Handle`] on the first native-
-//!   substrate op. The constructor synchronously probes
-//!   `io_uring::IoUring::new(queue_depth)` and `eventfd(2)` so that
-//!   capability failure surfaces as `Error::IoUringSetupFailed`
-//!   from `submit_async` rather than from a dangling driver task.
-//! - The owner task is spawned via `tokio::task::spawn`. The
-//!   `JoinHandle` lives on `AsyncIoUring`; on drop, the task is
-//!   sent `Op::Shutdown` and aborted as a backstop.
+//! - Constructed lazily on the first native-substrate op. The
+//!   constructor synchronously probes `io_uring_setup(2)` and
+//!   `eventfd(2)` so that capability failure surfaces as
+//!   `Error::IoUringSetupFailed` rather than from a dangling task.
+//! - Dropping [`AsyncIoUring`] closes the submission channel. The
+//!   owner task finishes the ops already in flight and then exits;
+//!   it is not aborted, since aborting would strand in-flight
+//!   buffers.
 
 #![cfg(all(target_os = "linux", feature = "async"))]
 #![allow(dead_code)] // Same ICE-class workaround as `linux_iouring.rs` —
@@ -54,70 +71,106 @@
                      // correctness (everything here is reachable from
                      // `Handle::async_io_uring`).
 
+use crate::platform::linux_iouring::MAX_SQE_LEN;
+use crate::platform::AlignedBuf;
 use crate::{Error, Result};
+use std::any::Any;
+use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, oneshot};
 
-/// Op submitted to the owner task. The owner task pulls from the
-/// `mpsc` channel and processes one op per submission cycle.
-pub(crate) enum Op {
-    Write {
-        fd: RawFd,
-        buf_ptr: usize,
-        buf_len: usize,
-        offset: u64,
-        reply: oneshot::Sender<i32>,
-    },
-    Read {
-        fd: RawFd,
-        buf_ptr: usize,
-        buf_len: usize,
-        offset: u64,
-        reply: oneshot::Sender<i32>,
-    },
-    Fdatasync {
-        fd: RawFd,
-        reply: oneshot::Sender<i32>,
-    },
-    /// Cooperative shutdown — owner exits its loop cleanly after
-    /// receiving this op.
-    Shutdown,
+/// Delay before the owner retries a submission the kernel refused
+/// with a transient error (`EAGAIN` / `EBUSY`). The SQEs stay queued
+/// in the meantime.
+const SUBMIT_RETRY: Duration = Duration::from_millis(1);
+
+/// Reply channel for one op: bytes written (0 for fsync) or the
+/// kernel's error.
+pub(crate) type Reply = oneshot::Sender<std::io::Result<usize>>;
+
+/// A buffer the driver owns while the kernel may access it.
+///
+/// Both variants keep their bytes in a separate heap allocation, so
+/// moving an `IoBuf` (into the channel, into the pending map) never
+/// moves the memory an SQE points at.
+pub(crate) enum IoBuf {
+    /// Plain heap buffer (journal frames, buffered-mode writes).
+    Vec(Vec<u8>),
+    /// Sector-aligned buffer for `O_DIRECT` writes.
+    Aligned(AlignedBuf),
 }
 
-/// Public handle to the native async substrate's owner task.
+impl IoBuf {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            IoBuf::Vec(v) => v,
+            IoBuf::Aligned(b) => b.as_slice(),
+        }
+    }
+}
+
+/// Keeps an fd's open file alive while an op that names it is in
+/// flight.
 ///
-/// Owns the `mpsc::Sender` for submission, the `AtomicBool` poison
-/// flag (shared with the owner task), and the `JoinHandle`.
+/// The descriptor stays valid for as long as this value (and so the
+/// `owner` it holds) lives. The driver drops it only after the op's
+/// final CQE, so a caller that gives up early cannot close the fd
+/// under the kernel.
+pub(crate) struct FileRef {
+    fd: RawFd,
+    _owner: Arc<dyn Any + Send + Sync>,
+}
+
+impl FileRef {
+    /// Wraps `owner`, reading the descriptor to use with `fd_of`.
+    /// `fd_of` must return a descriptor that `owner` keeps open.
+    pub(crate) fn new<T: Any + Send + Sync>(
+        owner: Arc<T>,
+        fd_of: impl FnOnce(&T) -> RawFd,
+    ) -> Self {
+        let fd = fd_of(&owner);
+        Self { fd, _owner: owner }
+    }
+}
+
+/// Op submitted to the owner task.
+pub(crate) enum Op {
+    /// Write all of `buf` at `offset`. The reply carries the bytes
+    /// written, which is below `buf`'s length only when the kernel
+    /// reported zero progress.
+    Write {
+        file: FileRef,
+        buf: IoBuf,
+        offset: u64,
+        reply: Reply,
+    },
+    /// `fsync` with `IORING_FSYNC_DATASYNC` (same durability as
+    /// `fdatasync(2)`).
+    Fdatasync { file: FileRef, reply: Reply },
+}
+
+/// Handle to the native async substrate's owner task.
+///
+/// Owns the submission `mpsc::Sender` and the `poisoned` flag. The
+/// owner task is detached: it exits on its own once this value is
+/// dropped and every in-flight op has completed.
 pub(crate) struct AsyncIoUring {
-    /// Submission channel. `mpsc::UnboundedSender` is already
-    /// `Send + Sync` and supports concurrent `send` from multiple
-    /// owners — no Mutex is needed on the hot path. (Earlier
-    /// 0.7.0 versions wrapped this in `AsyncMutex<Option<...>>`
-    /// to support setting it to `None` on shutdown; the audit
-    /// pass for 0.8.0 removed that overhead — shutdown signalling
-    /// now goes via the `shutdown` flag below + sending
-    /// `Op::Shutdown` through the channel.)
+    /// Submission channel. `mpsc::UnboundedSender` is `Send + Sync`
+    /// and supports concurrent `send` from many callers without a
+    /// lock. Unbounded is safe here because the owner stops pulling
+    /// ops while the ring is full; queued ops wait in the channel.
     submit_tx: mpsc::UnboundedSender<Op>,
-    /// Set to `true` by [`AsyncIoUring::shutdown`]. Submit checks
-    /// this before sending and returns
-    /// [`Error::CompletionDriverDead`] if set, avoiding the
-    /// channel-send overhead on already-shut-down handles.
-    shutdown: AtomicBool,
-    /// Set to `true` by `submit` itself when the owner task has
-    /// dropped its receiver mid-op (panic) or its `oneshot::Sender`
-    /// has been dropped before the reply landed. The owner task
-    /// does NOT write this directly — panic resilience is achieved
-    /// via structural drop (see [`owner_main`] doc), and `submit`
-    /// is the witness that translates the structural failure into
-    /// the `poisoned` signal.
-    poisoned: Arc<AtomicBool>,
-    /// JoinHandle for the owner task. Locked only by `shutdown` /
-    /// Drop, never on the hot path. `std::sync::Mutex` is fine
-    /// because lock duration is bounded by `shutdown`'s 5-second
-    /// timeout or by `JoinHandle::abort` (~µs).
+    /// Set by [`AsyncIoUring::submit`] when it observes that the
+    /// owner task is gone (channel closed or a reply sender dropped
+    /// without an answer). Later submits short-circuit on it.
+    poisoned: AtomicBool,
+    /// Owner task handle, kept only so tests can abort the owner to
+    /// simulate a panic or wait for it to exit.
+    #[cfg(test)]
     join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -126,21 +179,15 @@ impl AsyncIoUring {
     /// `io_uring_setup(2)` and `eventfd(2)` so capability failure
     /// surfaces here rather than from a dangling task.
     ///
-    /// Spawns the owner task on the current tokio runtime — must be
+    /// Spawns the owner task on the current tokio runtime; must be
     /// called from inside a runtime context.
     pub(crate) fn new(queue_depth: u32) -> Result<Self> {
-        // 0.9.4: probe with the elite setup flags
-        // (`COOP_TASKRUN` / `SINGLE_ISSUER` / `DEFER_TASKRUN`) the
-        // host kernel supports. The cached probe in
-        // `iouring_features::features()` runs at most once per
-        // process; subsequent ring constructions just re-apply
-        // the cached bits.
+        // 0.9.4: probe with the setup flags the host kernel supports.
+        // 0.9.6: RingMode::Async excludes DEFER_TASKRUN (the kernel
+        // would not post CQEs without an explicit GETEVENTS enter)
+        // and SINGLE_ISSUER (tokio may move this task between
+        // threads). See `RingMode` in iouring_features.rs.
         let mut probe_builder = io_uring::IoUring::builder();
-        // 0.9.6 fix: pass RingMode::Async — DEFER_TASKRUN is
-        // incompatible with the eventfd-driven completion loop
-        // because the kernel won't post CQEs without an
-        // explicit io_uring_enter(GETEVENTS) call. See
-        // `RingMode` doc in iouring_features.rs.
         crate::platform::iouring_features::apply(
             &mut probe_builder,
             crate::platform::iouring_features::RingMode::Async,
@@ -150,72 +197,59 @@ impl AsyncIoUring {
             Err(source) => return Err(Error::IoUringSetupFailed { source }),
         }
 
-        // Probe eventfd construction synchronously too.
-        let eventfd = create_eventfd()?;
-        // Pass it through to the task as a RawFd; the task wraps in
-        // OwnedFd + AsyncFd inside its scope so the eventfd is
-        // dropped when the task exits.
-        let eventfd_raw = eventfd.into_raw_fd();
+        // Probe eventfd construction synchronously too. The task
+        // takes ownership of the raw fd and wraps it again so the
+        // eventfd is closed exactly once when the task exits.
+        let eventfd_raw = create_eventfd()?.into_raw_fd();
 
         let (tx, rx) = mpsc::unbounded_channel::<Op>();
-        let poisoned = Arc::new(AtomicBool::new(false));
-
-        let join = tokio::task::spawn(async move {
-            owner_main(queue_depth, eventfd_raw, rx).await;
-        });
+        let join = tokio::task::spawn(owner_loop(queue_depth, eventfd_raw, rx));
+        // Detach outside tests: the task ends by itself once the
+        // channel closes and its in-flight ops are done.
+        #[cfg(not(test))]
+        drop(join);
 
         Ok(Self {
             submit_tx: tx,
-            shutdown: AtomicBool::new(false),
-            poisoned,
+            poisoned: AtomicBool::new(false),
+            #[cfg(test)]
             join: std::sync::Mutex::new(Some(join)),
         })
     }
 
-    /// Returns `true` if the owner task has panicked.
+    /// Returns `true` once a submit has observed that the owner task
+    /// is gone.
     pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Acquire)
     }
 
-    /// Submits an op to the owner task and `.await`s its
-    /// completion via the per-op `oneshot`.
+    /// Builds an op around a fresh reply channel, hands it to the
+    /// owner task and `.await`s the result.
     ///
-    /// On panic in the driver, the owner task drains pending ops
-    /// with the sentinel `i32::MIN` so the caller sees
-    /// `Error::HandlePoisoned` rather than a hang.
-    pub(crate) async fn submit(&self, op: Op, reply: oneshot::Receiver<i32>) -> Result<i32> {
-        // Fast-path: poisoned/shutdown flags short-circuit without
-        // touching the channel. Both are pure atomic loads.
+    /// The op (with its buffer and file keep-alive) is queued
+    /// synchronously on the first poll. Dropping the returned future
+    /// after that does not cancel the op; it completes in the
+    /// background and its result is discarded.
+    pub(crate) async fn submit(&self, make_op: impl FnOnce(Reply) -> Op) -> Result<usize> {
         if self.is_poisoned() {
             return Err(Error::HandlePoisoned {
                 reason: "io_uring completion driver panicked".to_string(),
             });
         }
-        if self.shutdown.load(Ordering::Acquire) {
-            return Err(Error::CompletionDriverDead);
-        }
-        // Channel-closed → owner task dropped the receiver
-        // (typically because it panicked). Mark poisoned so future
-        // submits short-circuit; surface this submission as
-        // CompletionDriverDead.
-        if self.submit_tx.send(op).is_err() {
+        let (tx, rx) = oneshot::channel();
+        // Channel closed: the owner task is gone (typically a panic).
+        // Mark poisoned so future submits short-circuit.
+        if self.submit_tx.send(make_op(tx)).is_err() {
             self.poisoned.store(true, Ordering::Release);
             return Err(Error::CompletionDriverDead);
         }
-
-        match reply.await {
-            Ok(code) if code == i32::MIN => {
-                self.poisoned.store(true, Ordering::Release);
-                Err(Error::HandlePoisoned {
-                    reason: "io_uring completion driver panicked mid-op".to_string(),
-                })
-            }
-            Ok(code) => Ok(code),
+        match rx.await {
+            Ok(Ok(n)) => Ok(n),
+            Ok(Err(e)) => Err(Error::Io(e)),
             Err(_recv_err) => {
-                // The owner task dropped the sender for this op
-                // before signalling — this happens when the task
-                // panics and unwinds with `pending` still
-                // populated. Mark poisoned and surface.
+                // The owner dropped this op's sender without
+                // answering, which only happens when the task
+                // unwinds or is torn down mid-op.
                 self.poisoned.store(true, Ordering::Release);
                 Err(Error::HandlePoisoned {
                     reason: "io_uring completion driver dropped sender".to_string(),
@@ -223,116 +257,56 @@ impl AsyncIoUring {
             }
         }
     }
+}
 
-    /// Signals cooperative shutdown to the owner task and awaits
-    /// its termination. Drops the submission sender so the task's
-    /// `mpsc::Receiver::recv` returns `None` and the loop exits.
-    pub(crate) async fn shutdown(&self) {
-        // Mark shutdown active so subsequent `submit`s short-circuit
-        // on the atomic check before reaching the channel.
-        self.shutdown.store(true, Ordering::Release);
+// ─────────────────────────────────────────────────────────────────────────────
+// Owner task
+// ─────────────────────────────────────────────────────────────────────────────
 
-        // Send Op::Shutdown so the owner task gets a clean exit
-        // signal even with queued submissions ahead of it.
-        // `send` failure here means the channel is already closed
-        // (owner task already exited) — that's fine.
-        let _ = self.submit_tx.send(Op::Shutdown);
+/// An op the kernel may still be working on.
+struct InFlight {
+    reply: Reply,
+    file: FileRef,
+    /// `None` for fsync.
+    buf: Option<IoBuf>,
+    /// Bytes already written (writes only).
+    done: usize,
+    /// File offset of `buf[0]`.
+    offset: u64,
+}
 
-        // Take the JoinHandle out of the slot and await the task's
-        // natural exit. The lock here is sync and contended at most
-        // once (this fn + Drop). If `lock()` is poisoned (Mutex
-        // poisoning from a panicked holder) we fall through to the
-        // None path, which is safe — Drop will abort if anything
-        // remains.
-        let join_opt = match self.join.lock() {
-            Ok(mut g) => g.take(),
-            Err(p) => p.into_inner().take(),
-        };
-        if let Some(join) = join_opt {
-            let abort_handle = join.abort_handle();
-            if tokio::time::timeout(std::time::Duration::from_secs(5), join)
-                .await
-                .is_err()
-            {
-                abort_handle.abort();
-            }
-        }
+/// In-flight ops keyed by SQE `user_data`.
+#[derive(Default)]
+struct PendingOps(HashMap<u64, InFlight>);
+
+impl PendingOps {
+    fn track(&mut self, id: u64, op: InFlight) {
+        // Ids come from a 64-bit counter, so a live id is never
+        // reissued; the previous value is always `None`.
+        let _previous = self.0.insert(id, op);
     }
 }
 
-impl Drop for AsyncIoUring {
+impl Drop for PendingOps {
     fn drop(&mut self) {
-        // Best-effort sync cleanup. The structured shutdown above
-        // is async, but Handle::drop is sync — so on the unhappy
-        // drop path we just abort the task and let the runtime
-        // clean up. Pending oneshot receivers will see
-        // RecvError → `Error::HandlePoisoned`.
-        //
-        // `try_lock` would still work here, but since this is
-        // `&mut self`, there are no other holders by definition —
-        // `get_mut` is contention-free.
-        if let Ok(g) = self.join.get_mut() {
-            if let Some(j) = g.take() {
-                j.abort();
-            }
+        // Entries are left only when the owner stops abnormally
+        // (runtime shutdown, panic, abort). The kernel may still read
+        // these buffers or use these fds, so leak them rather than
+        // free them. Dropping each `reply` wakes its caller with an
+        // error.
+        for (_, op) in self.0.drain() {
+            std::mem::forget(op.buf);
+            std::mem::forget(op.file);
+            drop(op.reply);
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Owner task main loop
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Owner task entry point.
-///
-/// **Panic-resilience strategy.** We do NOT use `catch_unwind` —
-/// `block_on` inside `catch_unwind` is incompatible with tokio
-/// runtimes (the runtime detects the nested `block_on` and aborts).
-/// Instead, panic resilience is achieved by structural drop:
-///
-/// 1. If the loop panics, tokio's task framework catches it and
-///    marks the `JoinHandle` as failed.
-/// 2. Stack unwind drops the `pending` HashMap, which drops every
-///    `oneshot::Sender` it owns. Awaiting `oneshot::Receiver`s see
-///    `RecvError`, which `submit()` translates into
-///    `Error::HandlePoisoned`.
-/// 3. The `mpsc::Receiver` drops too, closing the channel. Future
-///    `tx.send()` calls fail; `submit()` translates the failure
-///    into `Error::CompletionDriverDead` AND sets the shared
-///    `poisoned` flag so subsequent submits short-circuit on the
-///    fast-path atomic check. The owner task itself does not
-///    write `poisoned` — `submit()` is the witness that converts
-///    the structural failure into the flag transition.
-///
-/// Net effect: every awaiting submitter wakes up with a defined
-/// error, and every new submit short-circuits via the poisoned
-/// flag. The "load-bearing invariant" called out in
-/// `.dev/DECISIONS-0.7.0.md` is preserved.
-async fn owner_main(queue_depth: u32, eventfd_raw: RawFd, rx: mpsc::UnboundedReceiver<Op>) {
-    // Run the inner loop directly. If it panics, tokio's task
-    // framework catches the unwind; the channel + pending map
-    // drop on the unwind path, signalling all submitters.
-    owner_loop(queue_depth, eventfd_raw, rx).await;
-    // Note: `eventfd_raw` is consumed by AsyncFd inside owner_loop
-    // (wrapped via OwnedFd::from_raw_fd). On normal return AsyncFd
-    // drops, closing the eventfd. On panic the OwnedFd drops via
-    // unwind. No additional close is needed here.
-}
-
-/// Inner loop. The owner owns:
-/// - The `IoUring` value (on this stack frame; never escapes).
-/// - The `AsyncFd<OwnedFd>` wrapping the eventfd.
-/// - The `pending` HashMap of `user_data → oneshot::Sender`.
-/// - The submission `mpsc::Receiver`.
+/// Owner task body. Owns the ring, the eventfd (via `AsyncFd`) and
+/// the pending-op table; see the module docs for the loop shape.
 async fn owner_loop(queue_depth: u32, eventfd_raw: RawFd, mut rx: mpsc::UnboundedReceiver<Op>) {
-    use std::collections::HashMap;
-
-    // Wrap the eventfd in `OwnedFd` first thing — before any
-    // fallible construction below. If anything panics or returns
-    // early, the unwind drops `OwnedFd` and closes the eventfd
-    // exactly once. Eliminates the leak window that existed in
-    // 0.7.0 between `register_eventfd_with_ring` succeeding and
-    // ownership being established.
+    // Wrap the eventfd in `OwnedFd` before anything fallible so every
+    // exit path closes it exactly once.
     //
     // SAFETY: `eventfd_raw` is a valid eventfd produced by
     // `create_eventfd` (which used `OwnedFd::into_raw_fd` to release
@@ -340,179 +314,227 @@ async fn owner_loop(queue_depth: u32, eventfd_raw: RawFd, mut rx: mpsc::Unbounde
     // owner from this point onward.
     let owned_fd = unsafe { OwnedFd::from_raw_fd(eventfd_raw) };
 
-    // Reconstruct the ring on this task's stack. (We probed it
-    // synchronously in `AsyncIoUring::new` to surface kernel
-    // failure as a clean error.)
-    // 0.9.4: apply the cached elite setup flags so this ring
-    // gets the same kernel feature set the probe accepted.
-    // 0.9.6 fix: RingMode::Async excludes DEFER_TASKRUN — the
-    // eventfd-driven loop here is incompatible with that flag's
-    // explicit-driving requirement (see `RingMode` doc).
+    // Rebuild the ring with the flags the probe in
+    // `AsyncIoUring::new` accepted.
     let mut builder = io_uring::IoUring::builder();
     crate::platform::iouring_features::apply(
         &mut builder,
         crate::platform::iouring_features::RingMode::Async,
     );
-    let mut ring = match builder.build(queue_depth) {
-        Ok(r) => r,
-        Err(_) => return, // owned_fd drops, eventfd closes once
-    };
-
-    // SQEs carry the caller's raw fd (`types::Fd`). 1.1.1 removed the
-    // `IORING_REGISTER_FILES` slot cache: it was keyed by fd number
-    // and never invalidated, so a closed-then-reused fd number kept
-    // resolving to the old file's registered slot and writes landed
-    // in the wrong file.
-
-    // Register the eventfd with the ring so the kernel signals it
-    // when CQ has new entries. Use `as_raw_fd()` — registration
-    // does not transfer ownership.
-    if register_eventfd_with_ring(&mut ring, owned_fd.as_raw_fd()).is_err() {
+    let Ok(mut ring) = builder.build(queue_depth) else {
         return; // owned_fd drops, eventfd closes once
+    };
+    // Every SQE carries the caller's raw fd (`types::Fd`), kept open
+    // by the op's `FileRef`. 1.1.1 removed the `IORING_REGISTER_FILES`
+    // slot cache: it was keyed by fd number and never invalidated, so
+    // a closed-then-reused fd number kept resolving to the old file.
+    if ring
+        .submitter()
+        .register_eventfd(owned_fd.as_raw_fd())
+        .is_err()
+    {
+        return;
     }
-
-    // Hand ownership of the eventfd to AsyncFd. From here on,
-    // AsyncFd is responsible for closing the fd when it drops.
-    // On error, `with_interest` consumes and drops `owned_fd`
-    // internally — still closes once.
-    let async_fd = match AsyncFd::with_interest(owned_fd, tokio::io::Interest::READABLE) {
-        Ok(f) => f,
-        Err(_) => return,
+    let Ok(async_fd) = AsyncFd::with_interest(owned_fd, tokio::io::Interest::READABLE) else {
+        return;
     };
 
-    let mut pending: HashMap<u64, oneshot::Sender<i32>> = HashMap::new();
-    let mut next_id: u64 = 1;
+    let max_in_flight = ring.completion().capacity();
+    let mut pending = PendingOps::default();
+    let mut next_id: u64 = 0;
+    let mut closing = false;
 
     loop {
+        if closing && pending.0.is_empty() {
+            return;
+        }
+        let backlog = !ring.submission().is_empty();
         tokio::select! {
-            biased; // prefer submission over completion when both ready
+            biased;
 
-            // Submission path.
-            maybe_op = rx.recv() => {
+            maybe_op = rx.recv(), if !closing && pending.0.len() < max_in_flight => {
                 match maybe_op {
-                    Some(Op::Shutdown) | None => {
-                        // Cooperative shutdown OR sender dropped.
-                        // Drain any pending CQ entries before exiting
-                        // so in-flight ops complete cleanly.
-                        drain_completions_into(&mut ring, &mut pending);
-                        return;
-                    }
                     Some(op) => {
-                        let id = next_id;
                         next_id = next_id.wrapping_add(1);
-                        if id == 0 { next_id = 1; } // 0 reserved
-                        push_sqe_for(&mut ring, id, &op);
-                        match op {
-                            Op::Write { reply, .. }
-                            | Op::Read { reply, .. }
-                            | Op::Fdatasync { reply, .. } => {
-                                let _ = pending.insert(id, reply);
-                            }
-                            // Op::Shutdown handled in the outer match arm
-                            // above — by the time we reach here, the op
-                            // is one of Write / Read / Fdatasync. Use a
-                            // catch-all that drops the (unreachable)
-                            // remainder rather than the unreachable!
-                            // macro (clippy::unreachable lint).
-                            Op::Shutdown => {}
+                        start_op(&mut ring, &mut pending, next_id, op);
+                        // Batch whatever else is already queued into
+                        // the same `io_uring_enter`.
+                        while pending.0.len() < max_in_flight {
+                            let Ok(op) = rx.try_recv() else { break };
+                            next_id = next_id.wrapping_add(1);
+                            start_op(&mut ring, &mut pending, next_id, op);
                         }
-                        let _ = ring.submit();
                     }
+                    // Every `AsyncIoUring` handle is gone. Finish the
+                    // ops in flight, then exit.
+                    None => closing = true,
                 }
             }
 
-            // Completion path: AsyncFd is readable.
-            ready_result = async_fd.readable() => {
-                let mut ready_guard = match ready_result {
-                    Ok(g) => g,
-                    Err(_) => continue,
-                };
-                // Read the eventfd to clear the level-trigger.
-                clear_eventfd(async_fd.get_ref().as_raw_fd());
-                drain_completions_into(&mut ring, &mut pending);
-                ready_guard.clear_ready();
+            ready = async_fd.readable() => {
+                // An error here means the runtime's IO driver is
+                // shutting down; nothing more can be awaited.
+                let Ok(mut guard) = ready else { return };
+                clear_eventfd(guard.get_inner().as_raw_fd());
+                drain_completions(&mut ring, &mut pending);
+                guard.clear_ready();
             }
+
+            () = tokio::time::sleep(SUBMIT_RETRY), if backlog => {}
+        }
+        if !ring.submission().is_empty() {
+            // A refusal (`EAGAIN` / `EBUSY`) leaves the SQEs queued;
+            // the `backlog` branch above retries after
+            // `SUBMIT_RETRY`. The ops' buffers stay owned by
+            // `pending` either way.
+            let _ = ring.submit();
         }
     }
 }
 
-/// Drain CQ entries; route each to its pending oneshot.
-fn drain_completions_into(
-    ring: &mut io_uring::IoUring,
-    pending: &mut std::collections::HashMap<u64, oneshot::Sender<i32>>,
-) {
-    loop {
-        let cqe = match ring.completion().next() {
-            Some(c) => c,
-            None => break,
-        };
-        let id = cqe.user_data();
-        let result = cqe.result();
-        if let Some(tx) = pending.remove(&id) {
-            let _ = tx.send(result);
-        }
-        // No matching pending → caller's future was dropped before
-        // completion. Result is silently discarded.
-    }
-}
-
-/// Push the SQE for the given op onto the ring's submission queue.
-///
-/// Inlined per-variant to honour the 0.5.1 ICE workaround
-/// (no `&mut io_uring::IoUring` as function parameter — but here
-/// we're calling from the OWNER's loop so the parameter is
-/// already on this task's stack; the rule is about *cross-module*
-/// references).
-fn push_sqe_for(ring: &mut io_uring::IoUring, id: u64, op: &Op) {
+/// Builds the SQE for the next chunk of `op` (the whole op for
+/// fsync). Returns `None` only when the file offset would overflow.
+fn sqe_for(id: u64, op: &InFlight) -> Option<io_uring::squeue::Entry> {
     use io_uring::{opcode, types};
+    let fd = types::Fd(op.file.fd);
+    let Some(buf) = op.buf.as_ref() else {
+        return Some(
+            opcode::Fsync::new(fd)
+                .flags(types::FsyncFlags::DATASYNC)
+                .build()
+                .user_data(id),
+        );
+    };
+    let rest = buf.as_slice().get(op.done..)?;
+    let offset = op.offset.checked_add(u64::try_from(op.done).ok()?)?;
+    // `min` bounds the chunk by MAX_SQE_LEN, which fits in a u32.
+    let len = u32::try_from(rest.len().min(MAX_SQE_LEN)).ok()?;
+    Some(
+        opcode::Write::new(fd, rest.as_ptr(), len)
+            .offset(offset)
+            .build()
+            .user_data(id),
+    )
+}
 
-    match op {
+/// Pushes the next SQE for `op` and records it as pending, or
+/// replies with an error if it cannot be queued.
+fn submit_or_fail(ring: &mut io_uring::IoUring, pending: &mut PendingOps, id: u64, op: InFlight) {
+    let Some(entry) = sqe_for(id, &op) else {
+        finish(op, Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
+        return;
+    };
+    // SAFETY: `entry` points into `op.buf`'s heap allocation (stable
+    // across moves of the `IoBuf`) and names `op.file`'s fd, which
+    // `op.file` keeps open. `op` goes into `pending` right after a
+    // successful push and is released only after its CQE has been
+    // reaped (or leaked by `PendingOps::drop`), so the memory and the
+    // fd outlive the kernel's use of them.
+    let pushed = unsafe { ring.submission().push(&entry) }.is_ok() || {
+        // SQ full: hand what is queued to the kernel, then retry
+        // once. A refused submit keeps the SQ full and we fail the
+        // op below without the kernel ever seeing it.
+        let _ = ring.submit();
+        // SAFETY: same as the first push.
+        unsafe { ring.submission().push(&entry) }.is_ok()
+    };
+    if pushed {
+        pending.track(id, op);
+    } else {
+        finish(op, Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
+    }
+}
+
+/// Accepts a new op from the channel.
+fn start_op(ring: &mut io_uring::IoUring, pending: &mut PendingOps, id: u64, op: Op) {
+    let in_flight = match op {
         Op::Write {
-            fd,
-            buf_ptr,
-            buf_len,
+            file,
+            buf,
             offset,
-            ..
-        } => {
-            let entry = opcode::Write::new(types::Fd(*fd), *buf_ptr as *const u8, *buf_len as u32)
-                .offset(*offset)
-                .build()
-                .user_data(id);
-            // SAFETY: Submitter's `&[u8]` borrow is held alive by
-            // the awaiting future across the oneshot. The kernel
-            // reads the buffer at `buf_ptr` for `buf_len` bytes
-            // before signalling completion via the CQ; both
-            // invariants hold while the submitter awaits.
-            let _ = unsafe { ring.submission().push(&entry) };
-        }
-        Op::Read {
-            fd,
-            buf_ptr,
-            buf_len,
+            reply,
+        } => InFlight {
+            reply,
+            file,
+            buf: Some(buf),
+            done: 0,
             offset,
-            ..
-        } => {
-            let entry = opcode::Read::new(types::Fd(*fd), *buf_ptr as *mut u8, *buf_len as u32)
-                .offset(*offset)
-                .build()
-                .user_data(id);
-            // SAFETY: same shape as Op::Write — submitter holds
-            // the `&mut [u8]` borrow alive.
-            let _ = unsafe { ring.submission().push(&entry) };
-        }
-        Op::Fdatasync { fd, .. } => {
-            let entry = opcode::Fsync::new(types::Fd(*fd))
-                .flags(io_uring::types::FsyncFlags::DATASYNC)
-                .build()
-                .user_data(id);
-            // SAFETY: no buffer; fd held alive by submitter.
-            let _ = unsafe { ring.submission().push(&entry) };
-        }
-        Op::Shutdown => {
-            // Same reasoning as in the owner_loop — Shutdown is
-            // handled by the caller before reaching this helper;
-            // a no-op here keeps clippy::unreachable happy.
-        }
+        },
+        Op::Fdatasync { file, reply } => InFlight {
+            reply,
+            file,
+            buf: None,
+            done: 0,
+            offset: 0,
+        },
+    };
+    if in_flight
+        .buf
+        .as_ref()
+        .is_some_and(|b| b.as_slice().is_empty())
+    {
+        finish(in_flight, Ok(0));
+        return;
+    }
+    submit_or_fail(ring, pending, id, in_flight);
+}
+
+/// Releases `op`'s buffer and file keep-alive, then delivers
+/// `result`. The kernel is done with both by the time this runs.
+fn finish(op: InFlight, result: std::io::Result<usize>) {
+    let InFlight {
+        reply, file, buf, ..
+    } = op;
+    drop(buf);
+    drop(file);
+    // The caller may have dropped its future (cancellation); the
+    // result then has no reader and is discarded.
+    let _ = reply.send(result);
+}
+
+/// Drains the CQ and advances or completes each op.
+fn drain_completions(ring: &mut io_uring::IoUring, pending: &mut PendingOps) {
+    loop {
+        let next = ring.completion().next();
+        let Some(cqe) = next else { break };
+        let Some(op) = pending.0.remove(&cqe.user_data()) else {
+            continue;
+        };
+        on_completion(ring, pending, cqe.user_data(), op, cqe.result());
+    }
+}
+
+/// Handles one CQE for `op`: resubmits the rest of a short write,
+/// otherwise finishes the op.
+fn on_completion(
+    ring: &mut io_uring::IoUring,
+    pending: &mut PendingOps,
+    id: u64,
+    mut op: InFlight,
+    res: i32,
+) {
+    let Ok(n) = usize::try_from(res) else {
+        finish(
+            op,
+            Err(std::io::Error::from_raw_os_error(res.saturating_neg())),
+        );
+        return;
+    };
+    let Some(total) = op.buf.as_ref().map(|b| b.as_slice().len()) else {
+        finish(op, Ok(0));
+        return;
+    };
+    if n == 0 {
+        // No progress: report the short count instead of spinning.
+        let done = op.done;
+        finish(op, Ok(done));
+        return;
+    }
+    op.done = op.done.saturating_add(n).min(total);
+    if op.done < total {
+        submit_or_fail(ring, pending, id, op);
+    } else {
+        finish(op, Ok(total));
     }
 }
 
@@ -535,22 +557,13 @@ fn create_eventfd() -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Register the eventfd with the io_uring ring so the kernel
-/// signals it on CQ completion.
-fn register_eventfd_with_ring(
-    ring: &mut io_uring::IoUring,
-    eventfd_raw: RawFd,
-) -> std::io::Result<()> {
-    ring.submitter().register_eventfd(eventfd_raw)
-}
-
 /// Read the eventfd to clear its counter (level-triggered).
 fn clear_eventfd(fd: RawFd) {
     let mut buf: u64 = 0;
     // SAFETY: `fd` is a valid eventfd (registered with the ring
     // and wrapped in our AsyncFd). Reading 8 bytes into a
     // properly-aligned `&mut u64` is the standard eventfd
-    // clear-pattern. Read errors (EAGAIN) are ignored — a spurious
+    // clear-pattern. Read errors (EAGAIN) are ignored: a spurious
     // wakeup is not actionable.
     let _ = unsafe {
         libc::read(
@@ -574,16 +587,24 @@ mod tests {
         AsyncIoUring::new(8).ok()
     }
 
+    /// A `FileRef` naming an invalid fd; the kernel answers `EBADF`.
+    fn bad_file() -> FileRef {
+        FileRef::new(Arc::new(()), |_| -1)
+    }
+
+    /// Takes the owner task's handle out of `ring`.
+    fn take_join(ring: &AsyncIoUring) -> tokio::task::JoinHandle<()> {
+        ring.join
+            .lock()
+            .expect("ring.join mutex poisoned")
+            .take()
+            .expect("owner task handle already taken")
+    }
+
     /// 0.9.6 hardening: wraps an async test body with a hard
     /// 15-second timeout so a regression hangs in seconds, not
-    /// the GitHub Actions default 6-hour job timeout. The pre-
-    /// existing tests that ALREADY do their own
-    /// `tokio::time::timeout` (e.g.
-    /// `fdatasync_against_invalid_fd_returns_error_not_hang`,
-    /// `aborted_owner_task_translates_to_clean_error`,
-    /// `concurrent_submits_resolve_cleanly_on_owner_abort`)
-    /// keep theirs because each picks a duration tuned to its
-    /// own expected behaviour.
+    /// the CI job timeout. Tests that pick their own tighter
+    /// timeout keep it.
     async fn with_timeout<F, T>(fut: F) -> T
     where
         F: std::future::Future<Output = T>,
@@ -592,7 +613,7 @@ mod tests {
         match tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_SECS), fut).await {
             Ok(v) => v,
             Err(_) => panic!(
-                "test exceeded {TIMEOUT_SECS}s timeout — likely a hang in the completion driver"
+                "test exceeded {TIMEOUT_SECS}s timeout, likely a hang in the completion driver"
             ),
         }
     }
@@ -600,122 +621,62 @@ mod tests {
     #[tokio::test]
     async fn construction_returns_or_skips() {
         with_timeout(async {
+            // Either construction succeeded or the runner lacks
+            // io_uring; either way it must not panic.
             let _ring = ring_or_skip();
-            // Either AsyncIoUring::new succeeded (CI runner has
-            // io_uring), or it failed and we skipped — the test passes
-            // either way; we're verifying that construction doesn't
-            // panic.
         })
         .await;
     }
 
     #[tokio::test]
-    async fn shutdown_is_clean() {
+    async fn test_drop_ring_owner_task_exits() {
         with_timeout(async {
             let Some(ring) = ring_or_skip() else { return };
-            ring.shutdown().await;
-            // Subsequent submit must return CompletionDriverDead since
-            // we dropped the sender during shutdown.
-            let (rt, rr) = oneshot::channel();
-            // Best-effort: call submit on the closed ring. We expect
-            // CompletionDriverDead, NOT a hang.
-            let result = ring.submit(Op::Fdatasync { fd: -1, reply: rt }, rr).await;
-            assert!(matches!(result, Err(Error::CompletionDriverDead)));
+            let join = take_join(&ring);
+            drop(ring);
+            join.await.expect("owner task exits cleanly after drop");
         })
         .await;
     }
 
-    /// Validates the **load-bearing invariant** from
-    /// `.dev/DECISIONS-0.7.0.md` "Critical reminders":
-    ///
-    /// > A panic in the driver without poisoning the handle hangs
-    /// > every in-flight async op forever (their oneshots never
-    /// > get sent).
-    ///
-    /// Setup: construct an AsyncIoUring; manually corrupt its
-    /// poisoned flag to `true` (simulating what the
-    /// catch_unwind handler does after a real panic). Verify
-    /// submit returns HandlePoisoned without hanging.
+    /// Validates the load-bearing invariant from
+    /// `.dev/DECISIONS-0.7.0.md` "Critical reminders": a poisoned
+    /// handle must answer with an error, never hang.
     #[tokio::test]
     async fn poisoned_flag_short_circuits_submit() {
         with_timeout(async {
             let Some(ring) = ring_or_skip() else { return };
             ring.poisoned.store(true, Ordering::Release);
-
-            let (rt, rr) = oneshot::channel();
-            let result = ring.submit(Op::Fdatasync { fd: -1, reply: rt }, rr).await;
+            let result = ring
+                .submit(|reply| Op::Fdatasync {
+                    file: bad_file(),
+                    reply,
+                })
+                .await;
             assert!(matches!(result, Err(Error::HandlePoisoned { .. })));
         })
         .await;
     }
 
-    /// Validates that an in-flight submitter whose oneshot
-    /// receiver is dropped before completion arrives doesn't
-    /// crash the driver.
-    #[tokio::test]
-    async fn dropped_receiver_is_handled_gracefully() {
-        with_timeout(async {
-            let Some(ring) = ring_or_skip() else { return };
-
-            // We don't actually have a real fd to fdatasync against,
-            // so the kernel will return -EBADF. We just want to verify
-            // the path doesn't panic.
-            let (rt, rr) = oneshot::channel::<i32>();
-            // Drop rr before submission — submitter sends and
-            // immediately drops the receiver.
-            drop(rr);
-
-            // Build a fresh oneshot for the submit path that the API
-            // expects.
-            let (rt2, rr2) = oneshot::channel::<i32>();
-            let _ = ring.submit(Op::Fdatasync { fd: -1, reply: rt2 }, rr2).await;
-
-            // Cleanup: shutdown should still be clean.
-            ring.shutdown().await;
-            let _ = (rt,); // tx kept for borrow rules
-        })
-        .await;
-    }
-
-    /// **Load-bearing test from `.dev/DECISIONS-0.7.0.md`.**
-    ///
-    /// Construct a real ring; abort the owner task externally
-    /// (simulating a panic via `JoinHandle::abort` — same drop
-    /// semantics from the perspective of `pending`/sender/channel).
-    /// Verify that:
-    ///   1. The poisoned flag transitions to true.
-    ///   2. New submits return `Error::CompletionDriverDead` (since
-    ///      the channel is closed) — NOT a hang.
+    /// Abort the owner task (same drop signature as a panic inside
+    /// the loop) and verify a later submit resolves promptly with a
+    /// defined error.
     #[tokio::test]
     async fn aborted_owner_task_translates_to_clean_error() {
         let Some(ring) = ring_or_skip() else { return };
+        let join = take_join(&ring);
+        join.abort();
+        let _cancelled = join.await;
 
-        // Take and abort the JoinHandle — same drop signature as a
-        // panic inside the loop.
-        //
-        // 0.9.6 audit fix: `ring.join` is a `std::sync::Mutex`
-        // (synchronous) — `lock()` returns `LockResult<MutexGuard>`,
-        // not a future. The pre-0.9.6 `.await` here was a copy-paste
-        // typo that only ever surfaced when the `async` feature
-        // was enabled WITHOUT `--all-targets` muting the test on
-        // Windows (the new feature-matrix CI caught it).
-        {
-            let mut g = ring.join.lock().expect("ring.join mutex poisoned");
-            if let Some(j) = g.take() {
-                j.abort();
-                let _ = j.await; // join the aborted task
-            }
-        }
-
-        // Submit must now return promptly with a defined error.
-        let (rt, rr) = oneshot::channel::<i32>();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            ring.submit(Op::Fdatasync { fd: -1, reply: rt }, rr),
+            ring.submit(|reply| Op::Fdatasync {
+                file: bad_file(),
+                reply,
+            }),
         )
         .await;
-        assert!(result.is_ok(), "submit hung after owner abort");
-        let inner = result.expect("not timeout");
+        let inner = result.expect("submit hung after owner abort");
         assert!(
             matches!(
                 inner,
@@ -723,69 +684,64 @@ mod tests {
             ),
             "expected poisoned/dead error, got {inner:?}"
         );
+        assert!(ring.is_poisoned());
     }
 
     #[tokio::test]
     async fn fdatasync_against_invalid_fd_returns_error_not_hang() {
         let Some(ring) = ring_or_skip() else { return };
-
-        // Submit fdatasync against fd -1 (invalid). Kernel returns
-        // -EBADF; we expect the error to surface as a non-hanging
-        // result.
-        let (rt, rr) = oneshot::channel();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            ring.submit(Op::Fdatasync { fd: -1, reply: rt }, rr),
+            ring.submit(|reply| Op::Fdatasync {
+                file: bad_file(),
+                reply,
+            }),
         )
-        .await;
-        assert!(
-            result.is_ok(),
-            "submit on invalid fd hung — driver isn't draining CQ correctly"
-        );
-        // The kernel returns -EBADF (errno 9); whether we surface
-        // this as Ok(-9) or Err depends on `submit`'s mapping. The
-        // current impl returns Ok(i32) where i32 < 0 means error.
-        // Either way, we've validated no-hang.
-        ring.shutdown().await;
+        .await
+        .expect("submit on invalid fd hung; driver isn't draining CQ correctly");
+        match result {
+            Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EBADF)),
+            other => panic!("expected EBADF, got {other:?}"),
+        }
     }
 
-    /// 0.9.6 audit H-10 — concurrent submits + owner abort race.
-    ///
-    /// Pre-0.9.6 we had `dropped_receiver_is_handled_gracefully`
-    /// (single submitter dropping receiver pre-submit) and
-    /// `aborted_owner_task_translates_to_clean_error` (single
-    /// submit after owner abort). Neither exercised the
-    /// interleaving of **many in-flight submits + concurrent owner
-    /// abort**, which is the race a real production panic would
-    /// surface.
-    ///
-    /// Setup: spawn N concurrent submit tasks against a single
-    /// ring. Mid-flight, abort the owner. Every submitter must
-    /// resolve to a defined error (`CompletionDriverDead` or
-    /// `HandlePoisoned`) within a 5-second timeout — never hang.
-    /// The 5-second budget is generous; the actual resolution
-    /// path is sub-millisecond (channel close propagates O(N)
-    /// pending receivers to error).
+    #[tokio::test]
+    async fn test_empty_write_completes_without_sqe() {
+        with_timeout(async {
+            let Some(ring) = ring_or_skip() else { return };
+            let n = ring
+                .submit(|reply| Op::Write {
+                    file: bad_file(),
+                    buf: IoBuf::Vec(Vec::new()),
+                    offset: 0,
+                    reply,
+                })
+                .await
+                .expect("empty write");
+            assert_eq!(n, 0);
+        })
+        .await;
+    }
+
+    /// 0.9.6 audit H-10: many in-flight submits racing an owner
+    /// abort. Every submitter must resolve to a defined result
+    /// within the timeout, never hang.
     #[tokio::test]
     async fn concurrent_submits_resolve_cleanly_on_owner_abort() {
         let Some(ring) = ring_or_skip() else { return };
-        let ring = std::sync::Arc::new(ring);
-
+        let ring = Arc::new(ring);
         const SUBMITTERS: usize = 16;
 
-        // Spawn N concurrent submitters. Each issues an Fdatasync
-        // against an invalid fd — the kernel will return -EBADF on
-        // any that actually run, but most will be in-flight when
-        // the owner aborts, so they'll see HandlePoisoned /
-        // CompletionDriverDead via the channel-closed path.
         let mut handles = Vec::with_capacity(SUBMITTERS);
         for _ in 0..SUBMITTERS {
-            let ring = std::sync::Arc::clone(&ring);
+            let ring = Arc::clone(&ring);
             handles.push(tokio::spawn(async move {
-                let (rt, rr) = oneshot::channel::<i32>();
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    ring.submit(Op::Fdatasync { fd: -1, reply: rt }, rr),
+                    ring.submit(|reply| Op::Fdatasync {
+                        file: bad_file(),
+                        reply,
+                    }),
                 )
                 .await
             }));
@@ -794,33 +750,118 @@ mod tests {
         // Give the submitters a moment to enqueue their ops.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        // Abort the owner mid-batch — this drops the receiver and
-        // the pending HashMap. `ring.join` is `std::sync::Mutex`
-        // (sync) so `lock()` is sync, returns `LockResult`.
-        {
-            let mut g = ring.join.lock().expect("ring.join mutex poisoned");
-            if let Some(j) = g.take() {
-                j.abort();
-                let _ = j.await;
-            }
-        }
+        let join = take_join(&ring);
+        join.abort();
+        let _cancelled = join.await;
 
-        // Every submitter must resolve (never hang).
         for h in handles {
             let outer = h.await.expect("submitter task panicked");
-            let inner = outer.expect("submitter timeout — owner abort didn't propagate within 5s");
+            let inner = outer.expect("submitter timeout, owner abort didn't propagate within 5s");
             match inner {
-                // Submitted before the abort, kernel returned -EBADF.
-                Ok(rc) => {
-                    assert!(rc < 0, "expected -EBADF or error result, got rc={rc}");
-                }
-                // Submitted after the abort, channel send failed →
-                // CompletionDriverDead. Or the reply oneshot was
-                // dropped by the aborted owner → HandlePoisoned via
-                // submit's witness path.
+                // Completed before the abort: the kernel returned
+                // EBADF.
+                Err(Error::Io(_)) => {}
+                // Submitted after the abort, or its reply was
+                // dropped by the aborted owner.
                 Err(Error::CompletionDriverDead) | Err(Error::HandlePoisoned { .. }) => {}
                 other => panic!("unexpected submitter result: {other:?}"),
             }
         }
+    }
+
+    /// FS-C2: a write whose future is dropped right after it was
+    /// queued must still write the bytes it was given, because the
+    /// driver owns the buffer. Before 1.1.1 the SQE pointed into the
+    /// caller's buffer, which the cancelled caller freed and reused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelled_writes_finish_with_original_bytes() {
+        with_timeout(async {
+            let Some(ring) = ring_or_skip() else { return };
+            let path = std::env::temp_dir().join(format!(
+                "fsys_driver_cancel_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let file = Arc::new(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)
+                    .expect("open"),
+            );
+            const OPS: usize = 64;
+            const LEN: usize = 4096;
+            for i in 0..OPS {
+                let payload = vec![(i % 251) as u8 + 1; LEN];
+                let fut = ring.submit(|reply| Op::Write {
+                    file: FileRef::new(Arc::clone(&file), |f| f.as_raw_fd()),
+                    buf: IoBuf::Vec(payload),
+                    offset: (i * LEN) as u64,
+                    reply,
+                });
+                // Poll once (queues the op), then drop the future.
+                let _elapsed = tokio::time::timeout(Duration::ZERO, fut).await;
+                // Churn the allocator so a freed buffer would be
+                // overwritten.
+                let scratch = vec![0xEEu8; LEN];
+                drop(std::hint::black_box(scratch));
+            }
+            // Dropping the ring lets the owner finish every queued op
+            // and exit; awaiting the task waits for exactly that.
+            let join = take_join(&ring);
+            drop(ring);
+            join.await.expect("owner exits");
+            drop(file);
+            let bytes = std::fs::read(&path).expect("read back");
+            let _cleanup = std::fs::remove_file(&path);
+            assert_eq!(bytes.len(), OPS * LEN);
+            for i in 0..OPS {
+                let want = (i % 251) as u8 + 1;
+                let chunk = &bytes[i * LEN..(i + 1) * LEN];
+                assert!(
+                    chunk.iter().all(|&b| b == want),
+                    "op {i}: cancelled write landed with foreign bytes"
+                );
+            }
+        })
+        .await;
+    }
+
+    /// The fd keep-alive: the caller drops its only handle to the
+    /// file while the op is queued. The driver's `FileRef` keeps the
+    /// fd open, so the write still reaches the right file.
+    #[tokio::test]
+    async fn test_file_ref_keeps_fd_open_until_completion() {
+        with_timeout(async {
+            let Some(ring) = ring_or_skip() else { return };
+            let path =
+                std::env::temp_dir().join(format!("fsys_driver_fileref_{}", std::process::id()));
+            let file = Arc::new(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)
+                    .expect("open"),
+            );
+            let file_ref = FileRef::new(Arc::clone(&file), |f| f.as_raw_fd());
+            drop(file);
+            let n = ring
+                .submit(|reply| Op::Write {
+                    file: file_ref,
+                    buf: IoBuf::Vec(b"kept open".to_vec()),
+                    offset: 0,
+                    reply,
+                })
+                .await
+                .expect("write through FileRef");
+            assert_eq!(n, 9);
+            let bytes = std::fs::read(&path).expect("read back");
+            let _cleanup = std::fs::remove_file(&path);
+            assert_eq!(bytes, b"kept open");
+        })
+        .await;
     }
 }
