@@ -654,12 +654,11 @@ pub(crate) fn probe_direct_io_available() -> bool {
 /// - **macOS:** `fcntl(fd, F_PREALLOCATE, ...)` with
 ///   `F_ALLOCATECONTIG | F_ALLOCATEALL` flags. Falls back to
 ///   `F_ALLOCATEALL` alone if contiguous allocation fails.
-/// - **Windows:** `SetEndOfFile` to extend the logical size. True
-///   physical preallocation requires `SetFileValidData` which
-///   needs the `SE_MANAGE_VOLUME_NAME` privilege; we use it only
-///   when the privilege is detected (caller running as
-///   administrator). Without the privilege the kernel allocates
-///   on the first write — same as not calling preallocate.
+/// - **Windows:** `SetFileInformationByHandle(FileAllocationInfo)`
+///   reserves clusters up to `offset + len` without moving EOF. The
+///   reservation only grows: a request already covered by the current
+///   `AllocationSize` is a no-op. `SetFileValidData` is not used, so
+///   NTFS still zero-fills lazily on first write.
 /// - **Unknown:** no-op (succeeds; the OS allocates on write).
 ///
 /// # Errors

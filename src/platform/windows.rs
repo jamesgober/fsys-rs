@@ -905,31 +905,36 @@ fn try_reflink_refs(src: &Path, dst: &Path) -> Result<u64> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Windows preallocate via `SetFileInformationByHandle` with
-/// `FileAllocationInfo` — the proper analog to Linux's
-/// `fallocate(FALLOC_FL_KEEP_SIZE)`. Reserves NTFS extents
-/// without changing the file's logical size (EOF). The journal's
-/// reader doesn't see zero-filled tail bytes; the writer's
-/// subsequent `WriteFile` calls land on pre-reserved extents
-/// without per-write allocation jitter.
+/// `FileAllocationInfo` — the analog of Linux's
+/// `fallocate(FALLOC_FL_KEEP_SIZE)`. Reserves NTFS clusters for
+/// `[0, offset + len)` without changing the file's logical size (EOF),
+/// so later `WriteFile` calls land on reserved space without
+/// per-write allocation.
 ///
-/// Note: `SetFileInformationByHandle(FileAllocationInfo)` requests
-/// allocation; the actual disk blocks may still be lazily zeroed
-/// by NTFS on first write. True physical preallocation (zero-
-/// initialised blocks at preallocate time) requires
-/// `SetFileValidData` which needs the `SE_MANAGE_VOLUME_NAME`
-/// privilege. The current implementation is the best-available
-/// non-privileged path.
+/// The request only ever grows the reservation: when the file's current
+/// `AllocationSize` (from `GetFileInformationByHandleEx(FileStandardInfo)`)
+/// already covers `offset + len`, the call does nothing. Setting a smaller
+/// allocation would release clusters reserved by an earlier, larger
+/// `preallocate`, and setting it below EOF would truncate the file.
+///
+/// `SetFileValidData` (which also skips NTFS's lazy zeroing but needs the
+/// `SE_MANAGE_VOLUME_NAME` privilege) is not used.
 pub(crate) fn preallocate(file: &File, offset: u64, len: u64) -> Result<()> {
     if len == 0 {
         return Ok(());
     }
     use windows_sys::Win32::Storage::FileSystem::{
-        FileAllocationInfo, GetFileSizeEx, SetFileInformationByHandle, FILE_ALLOCATION_INFO,
+        FileAllocationInfo, SetFileInformationByHandle, FILE_ALLOCATION_INFO,
     };
     let handle = file.as_raw_handle() as HANDLE;
 
     // Compute target allocation size.
-    let end = offset.saturating_add(len);
+    let end = offset.checked_add(len).ok_or_else(|| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "preallocate range overflows u64",
+        ))
+    })?;
     let target = i64::try_from(end).map_err(|_| {
         Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -937,14 +942,8 @@ pub(crate) fn preallocate(file: &File, offset: u64, len: u64) -> Result<()> {
         ))
     })?;
 
-    // Don't shrink — only grow allocation.
-    let mut current: i64 = 0;
-    // SAFETY: handle is valid; GetFileSizeEx writes the size to the out-pointer.
-    let ok: BOOL = unsafe { GetFileSizeEx(handle, &mut current) };
-    if ok == FALSE {
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-    if target <= current {
+    // Only grow the reservation, never shrink it.
+    if target <= allocation_size(file)? {
         return Ok(());
     }
 
@@ -965,6 +964,32 @@ pub(crate) fn preallocate(file: &File, offset: u64, len: u64) -> Result<()> {
         return Err(Error::Io(std::io::Error::last_os_error()));
     }
     Ok(())
+}
+
+/// Returns the bytes currently allocated to `file` on disk
+/// (`FILE_STANDARD_INFO::AllocationSize`).
+fn allocation_size(file: &File) -> Result<i64> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileStandardInfo, GetFileInformationByHandleEx, FILE_STANDARD_INFO,
+    };
+    // SAFETY: FILE_STANDARD_INFO is plain old data (integers and byte
+    // flags); the all-zero bit pattern is valid.
+    let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is owned by `file` for the call; `info` is a live
+    // FILE_STANDARD_INFO and the length passed is exactly its size, so the
+    // kernel writes only inside it.
+    let ok: BOOL = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileStandardInfo,
+            (&mut info as *mut FILE_STANDARD_INFO).cast(),
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if ok == FALSE {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    Ok(info.AllocationSize)
 }
 
 /// Windows advise — best-effort no-op for runtime hints. Windows
@@ -1163,6 +1188,40 @@ mod tests {
         assert!(directory_flush_unsupported(Some(87)));
         assert!(!directory_flush_unsupported(Some(5)));
         assert!(!directory_flush_unsupported(None));
+    }
+
+    #[test]
+    fn test_preallocate_never_shrinks_reservation() {
+        let path = tmp_path("prealloc");
+        let _g = TmpFile(path.clone());
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open");
+        preallocate(&f, 0, 1 << 20).expect("1 MiB");
+        let big = allocation_size(&f).expect("alloc");
+        assert!(big >= 1 << 20, "allocation {big}");
+        // A smaller follow-up request used to compare against EOF (0)
+        // and shrink the reservation to 512 KiB.
+        preallocate(&f, 0, 512 << 10).expect("512 KiB");
+        assert_eq!(allocation_size(&f).expect("alloc"), big);
+        // EOF is untouched throughout.
+        assert_eq!(f.metadata().expect("meta").len(), 0);
+        // Growing past the reservation still works.
+        preallocate(&f, 1 << 20, 1 << 20).expect("grow");
+        assert!(allocation_size(&f).expect("alloc") >= 2 << 20);
+    }
+
+    #[test]
+    fn test_preallocate_rejects_overflowing_range() {
+        let path = tmp_path("prealloc_ovf");
+        let _g = TmpFile(path.clone());
+        let (f, _) = open_write_new(&path, false).expect("open");
+        assert!(preallocate(&f, u64::MAX, 2).is_err());
+        assert!(preallocate(&f, u64::MAX / 2 + 1, 1).is_err());
     }
 
     #[test]
