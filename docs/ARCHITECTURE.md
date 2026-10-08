@@ -95,9 +95,11 @@ prohibited. Diagram reflects the architecture as of **0.9.7**.
   (cross-platform sync, lock-free POSIX/Windows append, native
   io_uring async on Linux) plus an opt-in Direct-IO mode that
   routes appends through a **dual-buffered** sector-aligned
-  log buffer (0.9.5 — dual-buffer decouples appends from
+  log buffer (0.9.5: dual-buffer decouples appends from
   in-flight flushes, lifting Direct mode from a single-core
-  ceiling to multi-core scalable). On Linux + Direct mode, the
+  ceiling to multi-core scalable; 1.1.1: slot rotation and
+  oversize records keep LSNs contiguous instead of skipping to
+  the next slot boundary). On Linux + Direct mode, the
   log-buffer flush submits via `IORING_OP_WRITE_FIXED` against
   pre-registered `AlignedBuf` slots (0.9.6 — saves per-SQE
   kernel-side buffer pinning). Production-grade frame format
@@ -208,14 +210,20 @@ directories, typically 1).
   the `BatchResponse` enum — no second dispatcher pool, no second
   queue.
 - Journal append is **lock-free** across threads (atomic LSN
-  reservation via `AtomicU64::fetch_add` with `Release`
-  ordering — 0.9.7 M-2 tightened from `AcqRel`). Concurrent
-  `pwrite` to distinct offsets is POSIX-atomic per call.
+  reservation via `AtomicU64::fetch_add`). Concurrent `pwrite` to
+  distinct offsets is POSIX-atomic per call. Since 1.1.1 each
+  buffered appender registers in a two-counter write gate before
+  its `SeqCst` reservation, and a `sync_through` leader waits for
+  the writes reserved below its frontier to finish before it
+  fsyncs, so the published durable frontier never covers bytes
+  still in an appender's buffer.
 - Journal `sync_through` uses leader/follower group-commit. Many
   callers waiting on the same target LSN coalesce into one fsync
   syscall; followers wake via atomic-decrement + atomic-check on
   `synced_lsn`, skipping the state mutex on the common-case fast
-  path (0.9.7 H-16).
+  path (0.9.7 H-16). A failed write, flush or fsync poisons the
+  journal (1.1.1): later appends and syncs return an error rather
+  than retrying, and recovery is a reopen.
 - Dispatcher threads (all `N`) are joined cleanly on
   `Handle::drop`.
 

@@ -59,8 +59,10 @@
 
 pub mod backend;
 pub(crate) mod format;
+pub(crate) mod gate;
 pub(crate) mod log_buffer;
 pub mod options;
+pub(crate) mod poison;
 pub mod reader;
 
 pub use backend::{JournalBackend, JournalBackendHealth, JournalBackendInfo, JournalBackendKind};
@@ -69,8 +71,10 @@ pub use reader::{JournalIter, JournalReader, JournalRecord, JournalTailState};
 
 use crate::{Error, Result};
 use crossbeam_utils::CachePadded;
+use gate::WriteGate;
 use log_buffer::LogBuffer;
 use parking_lot::{Condvar, Mutex as PlMutex};
+use poison::Poison;
 use std::fs::{File, OpenOptions};
 use std::io::Seek;
 use std::path::Path;
@@ -246,16 +250,18 @@ pub struct JournalHandle {
         Option<std::sync::Arc<crate::async_io::completion_driver::AsyncIoUring>>,
     >,
     /// Direct-IO mode flag. `true` when the journal was opened with
-    /// [`JournalOptions::direct(true)`]. Determines whether the
-    /// append/sync paths route through [`Self::log_buffer`] (mutex-
-    /// serialised log-buffer pattern) or the lock-free `pwrite`
-    /// path used by buffered-mode journals.
+    /// [`JournalOptions::direct(true)`] and the filesystem accepted
+    /// Direct IO. Determines whether the append/sync paths route
+    /// through [`Self::log_buffer`] (the 0.9.5 dual-slot log
+    /// buffer) or the lock-free `pwrite` path used by
+    /// buffered-mode journals.
     pub(crate) direct: bool,
     /// In-memory sector-aligned log buffer. `Some(_)` exclusively
-    /// when `direct = true`; `None` otherwise. Mutex-protected
-    /// because direct-mode appends serialise into a single shared
-    /// buffer (the InnoDB / WiredTiger pattern). Buffered-mode
-    /// journals retain their lock-free fast path.
+    /// when `direct = true`; `None` otherwise. Self-locking since
+    /// 0.9.5: appenders take its short internal state lock to copy
+    /// into the active slot, and slot flushes run outside that lock
+    /// (see `log_buffer.rs`). Buffered-mode journals retain their
+    /// lock-free fast path.
     ///
     /// 0.9.7 H-2 — private (not `pub(crate)`): only accessed
     /// from within `src/journal/mod.rs`. Demoted so future
@@ -273,13 +279,33 @@ pub struct JournalHandle {
     /// `SyncMode::Full` (default) calls
     /// `file.sync_data()` (the platform's full media-durability
     /// primitive); `SyncMode::Barrier` calls
-    /// `platform::sync_barrier()` (cheaper on macOS with PLP).
+    /// `platform::sync_barrier()` (cheaper on macOS with PLP; on
+    /// Windows the same flush as `Full` unless the handle is
+    /// write-through).
     /// Captured at journal-open time from
     /// `JournalOptions::sync_mode`.
     ///
     /// 0.9.7 H-2 — private (not `pub(crate)`): only consulted
     /// inside `do_sync_locked` / `sync_through` in this module.
     sync_mode: options::SyncMode,
+    /// 1.1.1: sticky failure state. Set by the first failed
+    /// write, flush or fsync; every later append and every
+    /// `sync_through` whose target is not already durable then
+    /// returns an error. See the `poison` module docs.
+    ///
+    /// `pub(crate)` so the native async paths in
+    /// `src/async_io/journal.rs` can check and set it.
+    pub(crate) poison: Poison,
+    /// 1.1.1: tracks buffered-mode writes between their LSN
+    /// reservation and the end of their positioned write, so a
+    /// group-commit leader only publishes a durable frontier whose
+    /// bytes have all been written. Unused in Direct-IO mode. See
+    /// the `gate` module docs. `pub(crate)` so the native async
+    /// append path can register its writes the same way.
+    pub(crate) write_gate: WriteGate,
+    /// 1.1.1: set by [`Self::close`] after its final sync so `Drop`
+    /// does not flush and fsync a second time.
+    closed: bool,
 }
 
 impl JournalHandle {
@@ -299,19 +325,21 @@ impl JournalHandle {
     /// **Buffered mode** (`options.direct == false`, the default):
     /// the file is opened via standard `OpenOptions`, the
     /// lock-free LSN reservation + concurrent `pwrite` path is
-    /// active, and resume sets `next_lsn` to the existing file
-    /// size.
+    /// active, and resume (1.1.1) scans to the end of the last
+    /// cleanly decoded frame, truncates anything after it and sets
+    /// `next_lsn` there.
     ///
     /// **Direct mode** (`options.direct == true`): the file is
     /// opened with the platform's Direct-IO flag (`O_DIRECT` /
     /// `F_NOCACHE` / `FILE_FLAG_NO_BUFFERING`). An in-memory
-    /// sector-aligned log buffer is allocated; appends serialise
-    /// into the buffer (mutex-protected) and flush in
+    /// sector-aligned dual-slot log buffer is allocated; appends
+    /// copy into it under a short state lock and it flushes in
     /// sector-aligned chunks. Resume scans the existing file
     /// to find the LSN immediately past the last cleanly-decoded
-    /// frame and resumes there — partial trailing sector content
-    /// is rehydrated into the buffer so subsequent flushes
-    /// overwrite the zero-pad cleanly.
+    /// frame and resumes there: bytes past that sector are cut
+    /// off, and the partial trailing sector content is rehydrated
+    /// into the buffer so subsequent flushes overwrite the
+    /// zero-pad cleanly.
     pub(crate) fn open_with_options(path: &Path, options: JournalOptions) -> Result<Self> {
         if options.direct {
             Self::open_direct(path, options)
@@ -346,10 +374,28 @@ impl JournalHandle {
         // fcntl) — the hint is advisory.
         Self::apply_write_lifetime_hint(&file, options.write_lifetime_hint);
 
-        // Resume: next_lsn = current file length. Seek to end so
-        // that any sneaky `write()` (which we don't use, but
-        // belt-and-braces) lands at the right place.
-        let len = file.seek(std::io::SeekFrom::End(0)).map_err(Error::Io)?;
+        // Resume past the last cleanly decoded frame, not at the raw
+        // file length (1.1.1). A torn final frame, a zero hole from
+        // an unwritten reservation, or zero-filled space from a
+        // preallocation fallback is cut off so new appends land
+        // where the reader can reach them; pre-1.1.1 appends after
+        // such a tail were unreadable. Journals the reader cannot
+        // classify as a recoverable tail (bad magic, length
+        // overflow) are refused, as in Direct-IO mode.
+        let file_len = file.metadata().map_err(Error::Io)?.len();
+        let len = if file_len == 0 {
+            0
+        } else {
+            scan_clean_end(path)?
+        };
+        if len < file_len {
+            file.set_len(len).map_err(Error::Io)?;
+        }
+        // Keep the cursor at the end so a stray `write()` (which
+        // we don't use) would land at the right place.
+        let _ = file
+            .seek(std::io::SeekFrom::Start(len))
+            .map_err(Error::Io)?;
 
         Ok(Self {
             file,
@@ -367,6 +413,9 @@ impl JournalHandle {
             log_buffer: None,
             observer: None,
             sync_mode: options.sync_mode,
+            poison: Poison::new(),
+            write_gate: WriteGate::new(),
+            closed: false,
         })
     }
 
@@ -405,14 +454,20 @@ impl JournalHandle {
             0
         };
 
-        let sector_size = crate::platform::probe_sector_size(path);
         // Open the journal file with the platform's Direct-IO
         // flag. `open_direct_journal` returns
         // `(file, direct_active)`; `direct_active = false` means
         // the filesystem rejected the flag and we silently fell
         // back to a buffered handle (still functional, observable
         // via `is_direct_active`).
-        let (file, direct_active) = open_direct_journal(path, sector_size)?;
+        let (file, direct_active) = open_direct_journal(path)?;
+
+        // 1.1.1: probe the sector size only once the file exists.
+        // Pre-1.1.1 the probe ran before the open, so on Linux the
+        // first session of a new journal fell back to 512 (statfs
+        // fails on a missing path) while every reopen used the real
+        // block size, and 4Kn devices rejected the 512-byte writes.
+        let sector_size = crate::platform::probe_sector_size(path);
 
         // 0.9.4 — apply the optional NVMe write-lifetime hint.
         // Same non-fatal-on-failure contract as the buffered
@@ -422,8 +477,9 @@ impl JournalHandle {
         // If Direct-IO was rejected by the filesystem
         // (`open_direct_journal` returned `direct_active = false`),
         // fall back to the buffered path. We do NOT silently lose
-        // the "direct" intent — the caller can observe via
+        // the "direct" intent: the caller can observe it via
         // [`Self::is_direct_active`].
+        let file_len = file.metadata().map_err(Error::Io)?.len();
         let log_buffer = if direct_active {
             // Allocate the log buffer. Resume puts `flush_pos` at
             // the largest sector boundary ≤ resume_lsn; the buffer
@@ -435,11 +491,31 @@ impl JournalHandle {
             // implementation). Total memory: 2 × cap_bytes.
             let cap_bytes = options.log_buffer_kib.saturating_mul(1024);
             let buf = LogBuffer::new(cap_bytes, sector_size, 0)?;
+            let ss = u64::from(sector_size);
+            let resume_sector = resume_lsn - resume_lsn % ss;
+            // 1.1.1: drop stale bytes past the resume sector (a torn
+            // frame, an unwritten hole, records past a hole). They
+            // were left in place before, and a later flush that did
+            // not reach them could leave old frames readable after
+            // the new tail.
+            let keep = if resume_lsn > resume_sector {
+                resume_sector + ss
+            } else {
+                resume_sector
+            };
+            if file_len > keep {
+                file.set_len(keep).map_err(Error::Io)?;
+            }
             if resume_lsn > 0 {
-                rehydrate_log_buffer(&buf, &file, sector_size, resume_lsn)?;
+                let prefix = read_resume_prefix(path, resume_sector, resume_lsn)?;
+                buf.set_flush_pos_for_resume(resume_sector, &prefix)?;
             }
             Some(buf)
         } else {
+            // Buffered fallback: same resume rule as `open_buffered`.
+            if file_len > resume_lsn {
+                file.set_len(resume_lsn).map_err(Error::Io)?;
+            }
             None
         };
 
@@ -459,6 +535,9 @@ impl JournalHandle {
             log_buffer,
             observer: None,
             sync_mode: options.sync_mode,
+            poison: Poison::new(),
+            write_gate: WriteGate::new(),
+            closed: false,
         })
     }
 
@@ -511,9 +590,14 @@ impl JournalHandle {
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] on the underlying write failure.
+    /// - [`Error::Io`] on the underlying write failure. The
+    ///   failure poisons the journal (see [`Self::sync_through`]).
     /// - [`Error::Io`] with `InvalidInput` if the record exceeds
-    ///   `FRAME_MAX_PAYLOAD` (256 MiB).
+    ///   `FRAME_MAX_PAYLOAD` (256 MiB). This does not poison the
+    ///   journal; nothing was reserved or written.
+    /// - [`Error::Io`] describing the original failure if the
+    ///   journal was poisoned by an earlier failed write, flush or
+    ///   fsync.
     ///
     /// # Examples
     ///
@@ -568,6 +652,9 @@ impl JournalHandle {
     }
 
     fn append_inner(&self, record: &[u8]) -> Result<Lsn> {
+        // A poisoned journal accepts nothing: an earlier failure may
+        // have left a hole that this record would sit behind.
+        self.poison.check()?;
         if let Some(log_buffer) = &self.log_buffer {
             // Direct-IO log-buffer path.
             // 0.9.5: the LogBuffer is now self-locking
@@ -577,8 +664,11 @@ impl JournalHandle {
             // syscall happens unlocked — appenders into the new
             // active slot proceed concurrently with the flush
             // of the dormant slot.
-            let (_start, end) = log_buffer.append_frame(&self.file, record)?;
-            self.next_lsn.store(end, Ordering::Release);
+            let (_start, end) = log_buffer.append_frame(&self.file, record, &self.poison)?;
+            // `fetch_max`, not `store`: concurrent appenders finish
+            // in any order, and a slower one must not move the
+            // public frontier backwards.
+            let _ = self.next_lsn.fetch_max(end, Ordering::Release);
             #[cfg(feature = "tracing")]
             tracing::trace!(end_lsn = end, "direct append complete");
             return Ok(Lsn(end));
@@ -588,97 +678,77 @@ impl JournalHandle {
         //
         // Encode the frame: 12 bytes of overhead (magic +
         // length + crc32c) wrap the user's payload. Uniform
-        // framing is load-bearing — even zero-length records
+        // framing is load-bearing: even zero-length records
         // produce a 12-byte header-only frame so the reader's
-        // forward-iteration invariant holds. We bounds-check the
-        // record length against `FRAME_MAX_PAYLOAD` (256 MiB)
-        // and the total frame size against `usize::MAX` before
-        // any allocation.
-        let payload_len = record.len();
-        if (payload_len as u64) > (format::FRAME_MAX_PAYLOAD as u64) {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "journal record exceeds FRAME_MAX_PAYLOAD (256 MiB)",
-            )));
-        }
-        let total = payload_len
-            .checked_add(format::FRAME_OVERHEAD)
-            .ok_or_else(|| {
-                Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "journal frame size overflow",
-                ))
-            })?;
-        let frame_len = total as u64;
-
-        // Reserve a slot for the entire frame. The LSN
-        // semantics: caller-visible LSN is the byte offset
-        // *immediately past* this frame — i.e. the start of the
-        // next append. Internally, the file's byte content is
-        // framed; readers using `JournalReader` walk the
-        // frames forward and yield payloads.
+        // forward-iteration invariant holds.
         //
-        // fetch_add is `Release` (0.9.7 M-2 — was `AcqRel`).
+        // Validate and encode before reserving (1.1.1): nothing can
+        // fail between the reservation and the write except the
+        // write itself, so an encode or size error never leaves a
+        // hole in the LSN space. `frame_len` bounds the record by
+        // `FRAME_MAX_PAYLOAD` (256 MiB) before any allocation.
         //
-        // The reservation step does not read any non-atomic
-        // memory protected by another thread's prior Release —
-        // the appender does not consult shared state set up by
-        // another appender's pwrite. So the `Acquire` half of
-        // the previous `AcqRel` was defensive overhead.
-        //
-        // `Release` IS load-bearing: the syncer's
-        // `self.next_lsn.load(Ordering::Acquire)` in
-        // `sync_through` synchronises-with this Release, so the
-        // syncer observes the latest reserved frontier (i.e.
-        // every appender's `end` value publishes through this
-        // Release into the syncer's Acquire view).
-        //
-        // Net cost on aarch64: `fetch_add(Release)` lowers to
-        // `LDADDL` (load-acquire/store-release variant LDADDL
-        // emits only the store-release barrier), whereas
-        // `AcqRel` emits `LDADDAL` with the additional
-        // load-acquire fence. ~0.2-0.5 µs/op saved on tight
-        // appender loops.
-        let start = self.next_lsn.fetch_add(frame_len, Ordering::Release);
-        let end = start + frame_len;
-
         // 0.9.1 stack-allocated frame fast path: for typical
         // WAL records (≤ STACK_FRAME_THRESHOLD-12 bytes payload,
-        // i.e. ≤ 2036 bytes — covers virtually every real-world
+        // i.e. ≤ 2036 bytes, which covers virtually every real-world
         // WAL record), encode directly into a stack array,
         // eliminating the per-append `Vec<u8>` allocation that
         // dominates the bulk-load tight-loop profile. Records
         // larger than the threshold fall back to the heap-
-        // allocated path. Lock-free hot path: pwrite directly
-        // against `&self.file`; concurrent appenders write to
-        // distinct offsets per the LSN-reservation invariant.
-        if total <= STACK_FRAME_THRESHOLD {
-            // Use `MaybeUninit` to skip the per-call zero-init
-            // of an entire `[u8; STACK_FRAME_THRESHOLD]` array.
-            // The encoder writes every byte of `stack[..total]`
-            // before any byte is read by `write_at`. Bytes
-            // `[total..STACK_FRAME_THRESHOLD]` are never read —
-            // we only pass `&stack[..total]` to `write_at`.
-            let mut stack: std::mem::MaybeUninit<[u8; STACK_FRAME_THRESHOLD]> =
-                std::mem::MaybeUninit::uninit();
-            // SAFETY: `MaybeUninit::as_mut_ptr().cast::<u8>()`
-            // yields a `*mut u8` pointing at valid heap-aligned
-            // stack memory of at least `STACK_FRAME_THRESHOLD`
-            // bytes. The slice we construct is exactly `total`
-            // bytes (≤ STACK_FRAME_THRESHOLD), so the slice is
-            // contained within the allocation. `u8` has no
-            // invalid bit patterns; the encoder writes every
-            // byte before this slice is read.
-            let stack_slice: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(stack.as_mut_ptr().cast::<u8>(), total) };
-            let _ = format::encode_frame_into(record, stack_slice)?;
-            crate::platform::write_at(&self.file, start, stack_slice)?;
+        // allocated path.
+        //
+        // `MaybeUninit` skips the per-call zero-init of the whole
+        // stack array. 1.1.1: the encoder writes the frame through
+        // `MaybeUninit::write` and only then exposes those bytes as
+        // `&[u8]`; pre-1.1.1 code built a `&mut [u8]` over the
+        // uninitialized array first, which is undefined behaviour
+        // even though every byte was written before the read.
+        let total = format::frame_len(record.len())?;
+        let mut stack = [std::mem::MaybeUninit::<u8>::uninit(); STACK_FRAME_THRESHOLD];
+        let heap;
+        let encoded: &[u8] = if total <= STACK_FRAME_THRESHOLD {
+            format::encode_frame_into_uninit(record, &mut stack)?
         } else {
-            let frame = format::encode_frame_owned(record)?;
-            crate::platform::write_at(&self.file, start, &frame)?;
-        }
+            heap = format::encode_frame_owned(record)?;
+            &heap
+        };
+        let frame_len = total as u64;
 
-        Ok(Lsn(end))
+        // Reserve a slot for the entire frame. The LSN
+        // semantics: caller-visible LSN is the byte offset
+        // *immediately past* this frame, i.e. the start of the
+        // next append. Internally, the file's byte content is
+        // framed; readers using `JournalReader` walk the
+        // frames forward and yield payloads.
+        //
+        // 1.1.1: register the write with the gate *before* the
+        // reservation and keep the ticket until the write ends.
+        // The reservation is `SeqCst` because the gate's drain
+        // argument (see `gate.rs`) relies on the single total
+        // order of the epoch reads, this `fetch_add` and the
+        // leader's frontier load. On x86 every RMW is already
+        // sequentially consistent; on aarch64 this is the same
+        // `LDADDAL` the pre-0.9.7 `AcqRel` emitted.
+        //
+        // Lock-free hot path: pwrite directly against `&self.file`;
+        // concurrent appenders write to distinct offsets per the
+        // LSN-reservation invariant.
+        let _ticket = self.write_gate.enter();
+        let start = self.next_lsn.fetch_add(frame_len, Ordering::SeqCst);
+        self.write_reserved(start, encoded)?;
+        Ok(Lsn(start + frame_len))
+    }
+
+    /// Writes `bytes` at the reserved offset `start` (buffered
+    /// mode). A failure leaves a hole at an LSN range later
+    /// appends have already been handed past, so it poisons the
+    /// journal before the error is returned.
+    fn write_reserved(&self, start: u64, bytes: &[u8]) -> Result<()> {
+        let result = crate::platform::write_at(&self.file, start, bytes);
+        if let Err(e) = &result {
+            self.poison.set(e);
+        }
+        result
     }
 
     /// Appends `records` to the journal as a single batched
@@ -721,7 +791,10 @@ impl JournalHandle {
     /// - [`Error::Io`] if any record exceeds the journal's
     ///   maximum payload size (256 MiB), if the total batch
     ///   size overflows `usize`, or if the underlying write
-    ///   fails.
+    ///   fails. Only the write failure poisons the journal.
+    /// - [`Error::Io`] describing the original failure if the
+    ///   journal was poisoned by an earlier failed write, flush or
+    ///   fsync.
     ///
     /// # Examples
     ///
@@ -770,6 +843,7 @@ impl JournalHandle {
     }
 
     fn append_batch_inner(&self, records: &[&[u8]]) -> Result<Lsn> {
+        self.poison.check()?;
         if records.is_empty() {
             return Ok(Lsn(self.next_lsn.load(Ordering::Acquire)));
         }
@@ -827,13 +901,14 @@ impl JournalHandle {
                 None => {
                     let mut last: u64 = self.next_lsn.load(Ordering::Acquire);
                     for record in records {
-                        let (_start, end) = log_buffer.append_frame(&self.file, record)?;
+                        let (_start, end) =
+                            log_buffer.append_frame(&self.file, record, &self.poison)?;
                         last = end;
                     }
                     last
                 }
             };
-            self.next_lsn.store(last_end, Ordering::Release);
+            let _ = self.next_lsn.fetch_max(last_end, Ordering::Release);
             #[cfg(feature = "tracing")]
             tracing::trace!(end_lsn = last_end, "direct append_batch complete");
             return Ok(Lsn::new(last_end));
@@ -845,53 +920,31 @@ impl JournalHandle {
         // v0.8.5: the per-record framing overhead now amortises
         // across N records instead of paying N independent
         // syscalls + N independent LSN-reservation atomics.
+        // Build the write buffer in reserved capacity without
+        // zeroing it: `encode_frame_extend` appends each frame with
+        // `extend_from_slice`, so the buffer never exposes
+        // uninitialized bytes and skips a `total`-byte memset (on a
+        // 5 K x 150 B WAL batch, ~810 KiB, that memset was the
+        // difference between a 0.77x regression and a 1.6x win vs
+        // `append`-in-loop). 1.1.1: replaces a `Vec::set_len` over
+        // uninitialized capacity followed by `&mut buf[cursor..]`,
+        // which was undefined behaviour. The buffer is built before
+        // the LSN reservation so nothing but the write itself can
+        // fail once the range is reserved.
+        let mut buf: Vec<u8> = Vec::with_capacity(total);
+        for record in records {
+            let _ = format::encode_frame_extend(record, &mut buf)?;
+        }
+        debug_assert_eq!(buf.len(), total);
+
         let frame_total = total as u64;
-        // `Release` (0.9.7 M-2 — was `AcqRel`). Same reasoning
-        // as the single-record path at line ~604: the
-        // reservation does not consult shared state set up by
-        // a peer appender, so the `Acquire` half is defensive
-        // overhead. The syncer's `Acquire`-load on `next_lsn`
-        // synchronises-with this `Release`.
-        let start = self.next_lsn.fetch_add(frame_total, Ordering::Release);
+        // 1.1.1: registered with the write gate before the
+        // `SeqCst` reservation, same as the single-record path.
+        let _ticket = self.write_gate.enter();
+        let start = self.next_lsn.fetch_add(frame_total, Ordering::SeqCst);
         let end = start + frame_total;
 
-        // Allocate without zeroing — `encode_frame_into` writes
-        // every byte of every frame, and `write_at` only reads
-        // the first `total` bytes. Skipping the `vec![0u8; total]`
-        // memset eliminates a `total`-byte zero pass on the hot
-        // path; on a 5 K × 150 B WAL batch (~810 KiB) that's the
-        // difference between a 0.77× regression and a 1.6× win
-        // vs `append`-in-loop on the canonical sanity bench.
-        //
-        // `clippy::uninit_vec` warns categorically against this
-        // pattern; we override per-call because the surrounding
-        // encode loop establishes the must-write-before-read
-        // invariant for every byte in `[0..total]`.
-        #[allow(clippy::uninit_vec)]
-        let mut buf: Vec<u8> = {
-            let mut v: Vec<u8> = Vec::with_capacity(total);
-            // SAFETY: `Vec::with_capacity(total)` reserves at
-            // least `total` bytes of valid, allocator-aligned
-            // heap memory; `set_len(total)` exposes those bytes
-            // as `u8` (which has no invalid bit patterns and is
-            // not `Drop`). Every byte in `v[0..total]` is fully
-            // written by the encoder loop below — across all
-            // frames the cursor walks from 0 to `total` exactly
-            // once — before `write_at` ever reads from `&buf`.
-            // No uninitialised byte is ever observed.
-            unsafe {
-                v.set_len(total);
-            }
-            v
-        };
-        let mut cursor = 0usize;
-        for record in records {
-            let written = format::encode_frame_into(record, &mut buf[cursor..])?;
-            cursor += written;
-        }
-        debug_assert_eq!(cursor, total);
-
-        crate::platform::write_at(&self.file, start, &buf)?;
+        self.write_reserved(start, &buf)?;
 
         #[cfg(feature = "tracing")]
         tracing::trace!(end_lsn = end, "buffered append_batch complete");
@@ -916,6 +969,20 @@ impl JournalHandle {
     /// the state mutex — a ~5× reduction in lock-hold time under
     /// 100+ concurrent followers.
     ///
+    /// # Failure handling (1.1.1)
+    ///
+    /// A failed write, flush or fsync poisons the journal. After
+    /// that, `sync_through` returns an error for every target that
+    /// was not already durable before the failure, and
+    /// [`Self::append`] / [`Self::append_batch`] return an error for
+    /// every call. The journal does not retry a failed fsync: on
+    /// Linux the kernel may drop the dirty pages behind a failed
+    /// fsync and report success for a retry, so a retry would
+    /// claim durability for data that is gone. Reopen the journal
+    /// to recover; the reopen scan stops at the first hole or torn
+    /// frame. Before 1.1.1 followers retried the fsync themselves
+    /// and could report success after such a failure.
+    ///
     /// # Edge cases
     ///
     /// - [`Lsn::ZERO`] is the start-of-journal sentinel;
@@ -932,6 +999,9 @@ impl JournalHandle {
     ///   platform-equivalent syscall fails.
     /// - [`Error::Io`] with the inner error reflecting any
     ///   buffer-flush failure on Direct-IO journals.
+    /// - [`Error::Io`] describing the original failure if the
+    ///   journal was poisoned by an earlier failed write, flush or
+    ///   fsync and `lsn` is above the durable frontier.
     ///
     /// # Examples
     ///
@@ -966,7 +1036,9 @@ impl JournalHandle {
 
         // Fast path: the durable frontier already covers our
         // target. The atomic load is unconditionally cheaper
-        // than acquiring the group-commit state mutex.
+        // than acquiring the group-commit state mutex. A target
+        // that became durable before a later failure stays
+        // durable, so this path ignores the poison flag.
         if self.synced_lsn.load(Ordering::Acquire) >= lsn.0 {
             #[cfg(feature = "tracing")]
             tracing::trace!(
@@ -1000,6 +1072,11 @@ impl JournalHandle {
                     );
                     return Ok(());
                 }
+                // A failed leader poisons the journal before it
+                // clears `in_flight` under this lock, so a woken
+                // follower sees the failure here instead of
+                // retrying the fsync itself.
+                self.poison.check()?;
                 if !state.in_flight {
                     state.in_flight = true;
                     leader_start = Instant::now();
@@ -1035,17 +1112,17 @@ impl JournalHandle {
                     .fetch_sub(1, Ordering::AcqRel);
                 // Atomic-load `synced_lsn` (the public atomic
                 // mirror of `state.committed_lsn`, updated by the
-                // leader on commit at line ~997 with `Release`).
-                // If our target is covered, return without ever
-                // re-acquiring the state lock — this is the wake-
-                // stampede fix.
+                // leader on commit with `Release`). If our target
+                // is covered, return without ever re-acquiring
+                // the state lock; this is the wake-stampede fix.
                 if self.synced_lsn.load(Ordering::Acquire) >= lsn.0 {
                     return Ok(());
                 }
                 // Slow path: target not yet covered (a later
                 // append landed after the leader captured its
-                // frontier). Re-acquire the lock and loop to
-                // possibly become the next cycle's leader.
+                // frontier, or the leader failed). Re-acquire the
+                // lock and loop to possibly become the next
+                // cycle's leader.
                 state = self.group_commit.state.lock();
             }
 
@@ -1078,24 +1155,92 @@ impl JournalHandle {
             drop(state);
         }
 
+        // From here on we own `in_flight`. The guard clears it and
+        // wakes followers on every exit path, including an early
+        // `?` return and a panic, so a failed flush can never leave
+        // later callers parked forever (pre-1.1.1, a Direct-IO
+        // flush failure returned before the clear and deadlocked
+        // every later `sync_through`).
+        let mut leader = LeaderGuard {
+            group_commit: &self.group_commit,
+            synced_lsn: &self.synced_lsn,
+            frontier: None,
+        };
+        let outcome = self.flush_and_sync();
+        if let Ok(frontier) = outcome {
+            leader.frontier = Some(frontier);
+        }
+        // 0.9.7 H-16: advisory snapshot of currently parked
+        // followers for the observer hook.
+        let followers_at_commit = self.group_commit.pending_followers.load(Ordering::Acquire);
+        drop(leader);
+
+        #[cfg(feature = "tracing")]
+        if let Ok(frontier) = outcome {
+            tracing::debug!(new_synced_lsn = frontier, "group-commit fsync completed");
+        }
+
+        // 0.9.2 observer hook, leader-only. Followers returned
+        // early at the `committed_lsn >= lsn.0` check above
+        // without ever reaching this point.
+        if let Some(obs) = self.observer.as_ref() {
+            obs.on_journal_sync(crate::observer::JournalSyncEvent {
+                durable_lsn: match &outcome {
+                    Ok(frontier) => *frontier,
+                    Err(_) => self.synced_lsn.load(Ordering::Acquire),
+                },
+                duration: leader_start.elapsed(),
+                followers_at_commit,
+                error: outcome.is_err(),
+            });
+        }
+
+        outcome.map(|_| ())
+    }
+
+    /// Leader body of [`Self::sync_through`]: pushes buffered
+    /// Direct-IO bytes to the file, then runs the configured
+    /// durability primitive. Returns the frontier the fsync made
+    /// durable. Any failure poisons the journal.
+    fn flush_and_sync(&self) -> Result<u64> {
         // Direct-IO mode: flush any partially buffered records
         // through a sector-aligned positioned write *before* the
         // fsync. 0.9.5: the LogBuffer self-locks and waits for
         // any in-flight dormant-slot flush before issuing the
         // partial flush, so this call is consistent with the
-        // group-commit captured-frontier invariant.
-        if let Some(log_buffer) = &self.log_buffer {
-            log_buffer.flush_partial(&self.file)?;
-        }
+        // group-commit captured-frontier invariant. A failed
+        // flush poisons the journal inside `flush_partial`.
+        //
+        // The frontier is what the fsync below makes durable, so it
+        // must only cover bytes that have reached the file:
+        //
+        // - Direct-IO: the end LSN `flush_partial` captured under
+        //   the log-buffer lock. Every byte below it is in the file.
+        //   Pre-1.1.1 the leader re-read `next_lsn` after the flush,
+        //   which could include an append that landed in the log
+        //   buffer after the flush and was never written.
+        // - Buffered: `next_lsn` is a reservation frontier; bytes
+        //   below it may still be in an appender's buffer. The
+        //   write gate waits for every write reserved below the
+        //   frontier to finish before it is returned. Pre-1.1.1 a
+        //   slow appender's bytes could be covered by another
+        //   thread's fsync before they were written, and its own
+        //   `sync_through` then took the fast path with no fsync.
+        //
+        // Later appends are the next leader's responsibility. The
+        // fsync may also persist some of them; the frontier is a
+        // lower bound.
+        let frontier = match &self.log_buffer {
+            Some(log_buffer) => log_buffer.flush_partial(&self.file, &self.poison)?,
+            None => self
+                .write_gate
+                .drain_below(|| self.next_lsn.load(Ordering::SeqCst)),
+        };
 
-        // Capture the append frontier. We commit only up
-        // through this point; subsequent appenders may extend
-        // `next_lsn` further, but those records are the next
-        // leader's responsibility. The captured value is a
-        // conservative lower bound on what fsync will actually
-        // make durable (the syscall flushes every dirty page,
-        // which may include later appends).
-        let frontier = self.next_lsn.load(Ordering::Acquire);
+        // A buffered append that failed after this leader was
+        // elected left a hole below `frontier`; do not fsync and
+        // publish past it.
+        self.poison.check()?;
 
         // The actual fsync — outside both the group-commit
         // state lock and the log-buffer lock. Concurrent
@@ -1104,63 +1249,22 @@ impl JournalHandle {
         // kernel scheduling.
         //
         // 0.9.4: route through `sync_mode`. `Full` (default)
-        // keeps the pre-0.9.4 behaviour bit-for-bit
-        // (`file.sync_data()`); `Barrier` calls
-        // `platform::sync_barrier` which is cheaper on macOS
-        // with PLP, identical on Linux (fdatasync is already
-        // barrier-grade), no-op on Windows. See `SyncMode`
-        // docs for the safety contract.
+        // calls `file.sync_data()`; `Barrier` calls
+        // `platform::sync_barrier`. See `SyncMode` docs for the
+        // per-platform primitives and the safety contract.
         let sync_result = match self.sync_mode {
             options::SyncMode::Full => self.file.sync_data().map_err(Error::Io),
             options::SyncMode::Barrier => crate::platform::sync_barrier(&self.file),
         };
-
-        // Re-acquire state to publish the result. If the fsync
-        // failed, we still clear `in_flight` and notify
-        // followers — they will inherit the error via their
-        // own retry on the next sync_through call. We do NOT
-        // advance `committed_lsn` on failure, so followers
-        // re-evaluate and may become the next-cycle leader
-        // (where they re-attempt the fsync themselves).
-        let followers_at_commit;
-        {
-            let mut state = self.group_commit.state.lock();
-            if sync_result.is_ok() && frontier > state.committed_lsn {
-                state.committed_lsn = frontier;
-                self.synced_lsn.store(frontier, Ordering::Release);
-            }
-            // 0.9.7 H-16 — atomic-load advisory snapshot of
-            // currently parked followers (for the observer
-            // hook). Reading inside the lock window gives a
-            // stable value for the duration of `notify_all`.
-            followers_at_commit = self.group_commit.pending_followers.load(Ordering::Acquire);
-            state.in_flight = false;
-            // `notify_all` returns the count of woken threads;
-            // we don't care for backpressure purposes — every
-            // parked follower needs to re-evaluate its target.
-            let _ = self.group_commit.cv_followers.notify_all();
+        // fsyncgate: after a failed fsync the kernel may have
+        // dropped the dirty pages, and a retry can report success
+        // without writing them. Poison instead of letting a later
+        // leader retry.
+        if let Err(e) = &sync_result {
+            self.poison.set(e);
         }
-
-        #[cfg(feature = "tracing")]
-        if sync_result.is_ok() {
-            tracing::debug!(new_synced_lsn = frontier, "group-commit fsync completed");
-        }
-
-        // 0.9.2 observer hook — leader-only. Followers returned
-        // early at the `committed_lsn >= lsn.0` check above
-        // without ever reaching this point.
-        if let Some(obs) = self.observer.as_ref() {
-            obs.on_journal_sync(crate::observer::JournalSyncEvent {
-                durable_lsn: frontier,
-                duration: leader_start.elapsed(),
-                followers_at_commit,
-                error: sync_result.is_err(),
-            });
-        }
-
-        sync_result
+        sync_result.map(|()| frontier)
     }
-
     /// Returns the highest LSN currently known to be on stable
     /// storage.
     ///
@@ -1292,25 +1396,56 @@ impl JournalHandle {
     /// `offset = 0` means "start at the beginning"; `len` is
     /// the number of bytes to reserve.
     ///
+    /// The journal's logical file size never changes: a
+    /// preallocated region past the last record would otherwise
+    /// read as zero padding and, before 1.1.1, became the resume
+    /// point of the next open. Appends and flushes are held off
+    /// for the duration of the call so the size can be checked and
+    /// restored without racing a concurrent append.
+    ///
     /// # Platform behaviour
     ///
-    /// - **Linux:** `fallocate(FALLOC_FL_KEEP_SIZE)` — reserves
-    ///   extents without writing zeros. Falls back to
-    ///   `posix_fallocate` (writes zeros) on filesystems that
-    ///   don't support `fallocate`.
+    /// - **Linux:** `fallocate(FALLOC_FL_KEEP_SIZE)` reserves
+    ///   extents without writing zeros or changing the size. On
+    ///   filesystems without `fallocate` the platform layer falls
+    ///   back to `posix_fallocate`, which writes zeros and extends
+    ///   the file; the journal then truncates back to the
+    ///   previous size, which releases the reservation, so on
+    ///   such filesystems the call has no lasting effect.
     /// - **macOS:** `fcntl(F_PREALLOCATE)` with contiguous
-    ///   allocation; falls back to non-contiguous.
-    /// - **Windows:** `SetEndOfFile` — bounds the logical size
-    ///   so NTFS plans extents. True physical preallocation
-    ///   (zeroing every block) requires admin privileges.
+    ///   allocation; falls back to non-contiguous. Does not
+    ///   change the file size.
+    /// - **Windows:** `SetFileInformationByHandle(FileAllocationInfo)`
+    ///   reserves clusters up to `offset + len` without moving EOF;
+    ///   a request already covered by the current allocation is a
+    ///   no-op (never shrinks). `SetFileValidData` is not used.
     /// - **Other platforms:** no-op (succeeds; allocation
     ///   happens on write).
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] on the underlying syscall failure.
+    /// - [`Error::Io`] on the underlying syscall failure, or if
+    ///   the size check or restore fails.
     pub fn preallocate(&self, offset: u64, len: u64) -> Result<()> {
-        crate::platform::preallocate(&self.file, offset, len)
+        match &self.log_buffer {
+            Some(log_buffer) => log_buffer.quiesced(|| self.preallocate_keep_len(offset, len)),
+            None => {
+                let _closed = self.write_gate.close();
+                self.preallocate_keep_len(offset, len)
+            }
+        }
+    }
+
+    /// Body of [`Self::preallocate`]. The caller has stopped every
+    /// write that could extend the file.
+    fn preallocate_keep_len(&self, offset: u64, len: u64) -> Result<()> {
+        let before = self.file.metadata().map_err(Error::Io)?.len();
+        crate::platform::preallocate(&self.file, offset, len)?;
+        let after = self.file.metadata().map_err(Error::Io)?.len();
+        if after > before {
+            self.file.set_len(before).map_err(Error::Io)?;
+        }
+        Ok(())
     }
 
     /// Hints the kernel about the access pattern for a region
@@ -1342,9 +1477,20 @@ impl JournalHandle {
     /// # Errors
     ///
     /// - [`Error::Io`] on fsync or close failure.
-    pub fn close(self) -> Result<()> {
-        let frontier = self.next_lsn.load(Ordering::Acquire);
+    pub fn close(mut self) -> Result<()> {
+        // Direct-IO: the log buffer's own end LSN is exact; the
+        // public `next_lsn` mirror is published after the buffer
+        // copy. Buffered: every append has returned (we own
+        // `self`), so the reservation frontier is fully written.
+        let frontier = match &self.log_buffer {
+            Some(log_buffer) => log_buffer.next_lsn(),
+            None => self.next_lsn.load(Ordering::SeqCst),
+        };
         self.sync_through(Lsn(frontier))?;
+        // Everything is durable; `Drop` only has to close the file.
+        // Pre-1.1.1 `Drop` flushed and fsynced again after a
+        // successful close.
+        self.closed = true;
         // File closes when `self` drops; explicit drop here for
         // documentation.
         drop(self);
@@ -1374,9 +1520,17 @@ impl Drop for JournalHandle {
         // close — flush whatever's in the log buffer so the
         // partial trailing sector lands on disk before we lose
         // the writer's view of it.
+        // A poisoned journal must not write again: the flush could
+        // land bytes after a hole, and a retried fsync can report
+        // success for pages a failed one dropped.
+        if self.poison.is_set() || self.closed {
+            return;
+        }
         if let Some(log_buffer) = &self.log_buffer {
             // 0.9.5: self-locking LogBuffer; no outer mutex.
-            let _ = log_buffer.flush_partial(&self.file);
+            // Errors are deliberately ignored: Drop cannot report
+            // them, and `close()` is the error-reporting path.
+            let _ = log_buffer.flush_partial(&self.file, &self.poison);
             let _ = self.file.sync_data();
         }
     }
@@ -1473,14 +1627,43 @@ impl GroupCommit {
     }
 }
 
+/// Owns the group-commit leader role (`in_flight == true`) for the
+/// duration of one [`JournalHandle::sync_through`] leader cycle.
+///
+/// On drop it publishes `frontier` (when the cycle succeeded),
+/// clears `in_flight` and wakes every parked follower, whatever
+/// path the leader leaves by.
+struct LeaderGuard<'a> {
+    group_commit: &'a GroupCommit,
+    synced_lsn: &'a AtomicU64,
+    /// Durable frontier to publish; `None` when the cycle failed.
+    frontier: Option<u64>,
+}
+
+impl Drop for LeaderGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.group_commit.state.lock();
+        if let Some(frontier) = self.frontier {
+            if frontier > state.committed_lsn {
+                state.committed_lsn = frontier;
+                self.synced_lsn.store(frontier, Ordering::Release);
+            }
+        }
+        state.in_flight = false;
+        // Every parked follower must re-evaluate its target; the
+        // woken count is irrelevant.
+        let _ = self.group_commit.cv_followers.notify_all();
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Internal helpers — direct-mode constructor + resume-scan
 // ─────────────────────────────────────────────────────────────────
 
 /// Scans `path` for the byte offset immediately past the last
-/// cleanly-decoded frame. Used by direct-mode resume to set
-/// `next_lsn` past partial / corrupted trailing bytes rather than
-/// at raw `file_size`.
+/// cleanly-decoded frame. Used by resume in both modes to set
+/// `next_lsn` past partial / corrupted / zero trailing bytes
+/// rather than at raw `file_size`.
 ///
 /// Returns `0` for an empty / non-existent file. Surfaces an error
 /// for non-recoverable tail states (`BadMagic`, `LengthOverflow`)
@@ -1501,33 +1684,50 @@ fn scan_clean_end(path: &Path) -> Result<u64> {
         | JournalTailState::ChecksumMismatch => Ok(reader.position().0),
         JournalTailState::BadMagic => Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("journal at {:?} has bad magic at offset {} — refusing to open in direct mode", path, reader.position().0),
+            format!(
+                "journal at {:?} has bad magic at offset {}; refusing to open it",
+                path,
+                reader.position().0
+            ),
         ))),
         JournalTailState::LengthOverflow => Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("journal at {:?} has frame length overflow at offset {} — refusing to open in direct mode", path, reader.position().0),
+            format!(
+                "journal at {:?} has frame length overflow at offset {}; refusing to open it",
+                path,
+                reader.position().0
+            ),
         ))),
     }
 }
+
+/// Creation mode for Direct-IO journal files on Linux: `0o666`
+/// filtered by the process umask, the same default `std` uses for
+/// buffered journals. Pre-1.1.1 Direct-IO journals were created
+/// `0o600`, so the file mode depended on the IO mode.
+#[cfg(target_os = "linux")]
+const JOURNAL_CREATE_MODE: libc::c_int = 0o666;
 
 /// Open the journal file with the platform's Direct-IO flag.
 /// Returns `(file, direct_active)`. `direct_active = false` means
 /// the filesystem rejected `O_DIRECT` and the caller should fall
 /// back to buffered semantics.
 #[cfg(target_os = "linux")]
-fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
+fn open_direct_journal(path: &Path) -> Result<(File, bool)> {
     use std::os::fd::FromRawFd;
-    let path_cstr =
-        std::ffi::CString::new(path.as_os_str().to_string_lossy().as_bytes()).map_err(|_| {
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "journal path contains a NUL byte",
-            ))
-        })?;
+    use std::os::unix::ffi::OsStrExt;
+    // 1.1.1: pass the path's raw bytes. `to_string_lossy` replaced
+    // non-UTF-8 bytes with U+FFFD and opened a different file.
+    let path_cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "journal path contains a NUL byte",
+        ))
+    })?;
     let mut flags = libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_DIRECT;
     // SAFETY: path_cstr is a valid NUL-terminated string; flags +
     // mode are valid open(2) arguments.
-    let fd = unsafe { libc::open(path_cstr.as_ptr(), flags, 0o600_i32) };
+    let fd = unsafe { libc::open(path_cstr.as_ptr(), flags, JOURNAL_CREATE_MODE) };
     if fd >= 0 {
         // SAFETY: fd is a valid open file descriptor we just
         // created/opened.
@@ -1539,7 +1739,7 @@ fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
         // Retry without it; the caller falls back to buffered.
         flags &= !libc::O_DIRECT;
         // SAFETY: same as above.
-        let fd2 = unsafe { libc::open(path_cstr.as_ptr(), flags, 0o600_i32) };
+        let fd2 = unsafe { libc::open(path_cstr.as_ptr(), flags, JOURNAL_CREATE_MODE) };
         if fd2 >= 0 {
             // SAFETY: fd2 is a valid open file descriptor.
             return Ok((unsafe { File::from_raw_fd(fd2) }, false));
@@ -1550,7 +1750,7 @@ fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
 }
 
 #[cfg(target_os = "macos")]
-fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
+fn open_direct_journal(path: &Path) -> Result<(File, bool)> {
     use std::os::unix::io::AsRawFd;
     let file = OpenOptions::new()
         .read(true)
@@ -1566,7 +1766,7 @@ fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
 }
 
 #[cfg(target_os = "windows")]
-fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
+fn open_direct_journal(path: &Path) -> Result<(File, bool)> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
@@ -1619,7 +1819,7 @@ fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
+fn open_direct_journal(path: &Path) -> Result<(File, bool)> {
     // No Direct-IO on unknown platforms — fall back silently.
     let file = OpenOptions::new()
         .read(true)
@@ -1631,30 +1831,36 @@ fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
     Ok((file, false))
 }
 
-/// Rehydrate the log buffer's first sector from the on-disk
-/// content of the partial trailing sector. Used on resume so that
-/// subsequent flushes overwrite the zero-pad cleanly without
-/// destroying records.
-fn rehydrate_log_buffer(
-    buf: &LogBuffer,
-    file: &File,
-    sector_size: u32,
-    resume_lsn: u64,
-) -> Result<()> {
-    let ss = sector_size as u64;
-    let last_sector_start = (resume_lsn / ss) * ss;
-    let in_sector_offset = (resume_lsn - last_sector_start) as usize;
-    if in_sector_offset == 0 {
-        // resume_lsn lands exactly on a sector boundary; nothing
-        // to rehydrate, the buffer is already initialised to
-        // (flush_pos = 0, len = 0). Move flush_pos forward.
-        buf.set_flush_pos_for_resume(resume_lsn, 0, &[]);
-        return Ok(());
+/// Reads the bytes of the resume LSN's sector that precede the
+/// resume LSN (`[resume_sector, resume_lsn)`), used to prime the
+/// log buffer on a Direct-IO reopen.
+///
+/// The read goes through a separate buffered read-only handle
+/// rather than the Direct-IO handle: `O_DIRECT` /
+/// `FILE_FLAG_NO_BUFFERING` reads need a sector-aligned buffer,
+/// offset and length, and a short read past the end of file is
+/// not reliable on every platform. Pre-1.1.1 the Direct-IO handle
+/// was read into an unaligned `Vec`; a short or failed read
+/// silently primed the buffer with fewer bytes than the resume
+/// LSN implied, and the next flush overwrote the last records.
+fn read_resume_prefix(path: &Path, resume_sector: u64, resume_lsn: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let len = usize::try_from(resume_lsn - resume_sector).map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "journal resume sector offset does not fit in usize",
+        ))
+    })?;
+    let mut prefix = vec![0u8; len];
+    if len == 0 {
+        return Ok(prefix);
     }
-    // Read the partial trailing sector from disk.
-    let bytes = crate::platform::read_range(file, last_sector_start, sector_size as usize)?;
-    buf.set_flush_pos_for_resume(last_sector_start, in_sector_offset, &bytes);
-    Ok(())
+    let mut reader = File::open(path).map_err(Error::Io)?;
+    let _ = reader
+        .seek(std::io::SeekFrom::Start(resume_sector))
+        .map_err(Error::Io)?;
+    reader.read_exact(&mut prefix).map_err(Error::Io)?;
+    Ok(prefix)
 }
 
 #[cfg(test)]
@@ -2651,9 +2857,10 @@ mod tests {
     #[test]
     fn sync_mode_barrier_round_trips_through_journal() {
         // SyncMode::Barrier goes through platform::sync_barrier.
-        // On Linux it's fdatasync (same path); on Windows it's a
-        // no-op; on macOS it's F_BARRIERFSYNC. All three return
-        // Ok on a healthy fs — the journal's sync_through must
+        // On Linux it's fdatasync (same path); on macOS it's
+        // F_BARRIERFSYNC; on Windows it's FlushFileBuffers unless
+        // the handle is write-through. All return
+        // Ok on a healthy fs; the journal's sync_through must
         // complete and advance synced_lsn regardless of the
         // underlying primitive.
         let path = tmp_path("sync_mode_barrier");
@@ -2730,5 +2937,398 @@ mod tests {
             h.join().expect("join");
         }
         assert!(j.synced_lsn() >= *lsns.last().unwrap());
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 1.1.1: sticky poison after write / flush / fsync failure
+    //
+    // Failures are injected by swapping the journal's file handle
+    // for one the OS rejects: a read-only handle fails every
+    // positioned write on every platform (EBADF / ACCESS_DENIED),
+    // and fails FlushFileBuffers on Windows. On Unix an fsync
+    // failure is injected with a writable `/dev/null` handle,
+    // whose `fdatasync` returns EINVAL.
+    // ─────────────────────────────────────────────────────────
+
+    fn read_only(path: &Path) -> File {
+        File::open(path).expect("read-only handle")
+    }
+
+    fn writable(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("writable handle")
+    }
+
+    /// A handle whose `sync_data` fails, or `None` on a platform
+    /// with no known way to build one (the caller then skips).
+    /// Windows and Linux always provide one.
+    fn failing_sync_handle(path: &Path) -> Option<File> {
+        #[cfg(windows)]
+        {
+            // FlushFileBuffers needs GENERIC_WRITE; writes through
+            // this handle fail too, so callers only sync with it.
+            let f = read_only(path);
+            assert!(
+                f.sync_data().is_err(),
+                "read-only FlushFileBuffers must fail"
+            );
+            Some(f)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = path;
+            let f = OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .expect("open /dev/null");
+            assert!(f.sync_data().is_err(), "fdatasync on /dev/null must fail");
+            Some(f)
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            let _ = path;
+            let f = OpenOptions::new().write(true).open("/dev/null").ok()?;
+            f.sync_data().is_err().then_some(f)
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
+    fn assert_poisoned<T: std::fmt::Debug>(r: Result<T>) {
+        match r {
+            Err(Error::Io(e)) => assert!(
+                e.to_string().contains("poisoned"),
+                "expected the poison error, got {e}"
+            ),
+            other => panic!("expected the poison error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_buffered_append_write_failure_poisons_journal() {
+        let path = tmp_path("poison_write");
+        let _g = Cleanup(path.clone());
+        let mut j = JournalHandle::open(&path).expect("open");
+        let durable = j.append(b"durable").expect("append");
+        j.sync_through(durable).expect("sync");
+        let acked = j.append(b"acked-not-synced").expect("append");
+
+        j.file = read_only(&path);
+        assert!(
+            j.append(b"fails").is_err(),
+            "write through read-only handle"
+        );
+
+        // Even with a healthy handle back, the journal stays
+        // poisoned: the failed append left a hole at its LSN.
+        j.file = writable(&path);
+        assert_poisoned(j.append(b"later"));
+        assert_poisoned(j.append_batch(&[b"batch" as &[u8]]));
+        assert_poisoned(j.sync_through(acked));
+        // A target that was durable before the failure is still
+        // reported durable.
+        j.sync_through(durable).expect("already durable");
+    }
+
+    #[test]
+    fn test_buffered_batch_write_failure_poisons_journal() {
+        let path = tmp_path("poison_batch");
+        let _g = Cleanup(path.clone());
+        let mut j = JournalHandle::open(&path).expect("open");
+        j.file = read_only(&path);
+        assert!(j.append_batch(&[b"a" as &[u8], b"b"]).is_err());
+        j.file = writable(&path);
+        assert_poisoned(j.append(b"later"));
+    }
+
+    #[test]
+    fn test_sync_failure_poisons_and_is_not_retried() {
+        // fsyncgate: a failed fsync must not be retried by a later
+        // caller, because the retry can succeed without the pages
+        // the failed call dropped.
+        let path = tmp_path("poison_fsync");
+        let _g = Cleanup(path.clone());
+        let mut j = JournalHandle::open_with_options(
+            &path,
+            JournalOptions::new().group_commit_window(None),
+        )
+        .expect("open");
+        let lsn = j.append(b"record").expect("append");
+        let Some(bad) = failing_sync_handle(&path) else {
+            return;
+        };
+        j.file = bad;
+        assert!(j.sync_through(lsn).is_err(), "fsync through bad handle");
+        j.file = writable(&path);
+        assert_poisoned(j.sync_through(lsn));
+        assert_poisoned(j.append(b"after"));
+        assert!(j.synced_lsn() < lsn, "failed sync must not publish");
+    }
+
+    #[test]
+    fn test_sync_failure_followers_get_error_not_success() {
+        // Followers parked behind a leader whose fsync fails must
+        // not report success and must not hang.
+        use std::sync::{Arc, Barrier};
+        let path = tmp_path("poison_followers");
+        let _g = Cleanup(path.clone());
+        let mut j = JournalHandle::open_with_options(
+            &path,
+            JournalOptions::new()
+                .group_commit_window(Some(Duration::from_millis(20)))
+                .group_commit_max_batch(64),
+        )
+        .expect("open");
+        let lsn = j.append(b"record").expect("append");
+        let Some(bad) = failing_sync_handle(&path) else {
+            return;
+        };
+        j.file = bad;
+        let j = Arc::new(j);
+        let gate = Arc::new(Barrier::new(8));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..8 {
+            let j = Arc::clone(&j);
+            let gate = Arc::clone(&gate);
+            let tx = tx.clone();
+            let _ = std::thread::spawn(move || {
+                let _ = gate.wait();
+                let _ = tx.send(j.sync_through(lsn).is_ok());
+            });
+        }
+        drop(tx);
+        for _ in 0..8 {
+            let ok = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("sync_through hung after a failed fsync");
+            assert!(!ok, "a caller reported success after the fsync failed");
+        }
+    }
+
+    #[test]
+    fn test_direct_flush_failure_does_not_deadlock_later_syncs() {
+        // FS-H2: a Direct-IO partial-flush failure returned from
+        // `sync_through` before `in_flight` was cleared, so every
+        // later `sync_through` parked forever as a follower.
+        let path = tmp_path("poison_direct_flush");
+        let _g = Cleanup(path.clone());
+        let mut j = JournalHandle::open_with_options(&path, JournalOptions::new().direct(true))
+            .expect("open direct");
+        let lsn = j.append(b"buffered in the log buffer").expect("append");
+        j.file = read_only(&path);
+        assert!(
+            j.sync_through(lsn).is_err(),
+            "flush through read-only handle"
+        );
+
+        let j = std::sync::Arc::new(j);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let j2 = std::sync::Arc::clone(&j);
+        let _ = std::thread::spawn(move || {
+            let _ = tx.send(j2.sync_through(lsn).is_err());
+        });
+        let failed = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("second sync_through deadlocked after a failed flush");
+        assert!(failed, "second sync_through must report the failure");
+    }
+
+    #[test]
+    fn test_direct_rotation_flush_failure_poisons_later_appends() {
+        // FS-J4: a failed rotation flush lost a slot of
+        // acknowledged records, but only the rotating caller saw
+        // the error; later appends and syncs succeeded past the
+        // hole.
+        let path = tmp_path("poison_rotation");
+        let _g = Cleanup(path.clone());
+        let mut j = JournalHandle::open_with_options(
+            &path,
+            JournalOptions::new().direct(true).log_buffer_kib(4),
+        )
+        .expect("open direct");
+        j.file = read_only(&path);
+        let mut failed = false;
+        for _ in 0..1000 {
+            if j.append(&[0x5A; 100]).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(
+            failed,
+            "a rotation flush through a read-only handle must fail"
+        );
+        j.file = writable(&path);
+        assert_poisoned(j.append(b"later"));
+        assert_poisoned(j.sync_through(j.next_lsn()));
+    }
+
+    #[test]
+    fn test_direct_rotation_failure_wakes_waiting_appenders_with_error() {
+        // Appenders parked behind a failing rotation flush must
+        // wake with the poison error (no hang, no success into a
+        // slot that will never be written).
+        use std::sync::{Arc, Barrier};
+        let path = tmp_path("poison_rotation_waiters");
+        let _g = Cleanup(path.clone());
+        let mut j = JournalHandle::open_with_options(
+            &path,
+            JournalOptions::new().direct(true).log_buffer_kib(4),
+        )
+        .expect("open direct");
+        j.file = read_only(&path);
+        let j = Arc::new(j);
+        let gate = Arc::new(Barrier::new(4));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for t in 0..4u8 {
+            let j = Arc::clone(&j);
+            let gate = Arc::clone(&gate);
+            let tx = tx.clone();
+            let _ = std::thread::spawn(move || {
+                let _ = gate.wait();
+                let mut errors = 0;
+                for _ in 0..200 {
+                    if j.append(&[t; 300]).is_err() {
+                        errors += 1;
+                    }
+                }
+                let _ = tx.send(errors);
+            });
+        }
+        drop(tx);
+        for _ in 0..4 {
+            let _ = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("appender hung after a failed rotation flush");
+        }
+        assert_poisoned(j.append(b"after"));
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 1.1.1: durable frontier only covers written bytes (FS-J3)
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_buffered_sync_waits_for_write_reserved_below_frontier() {
+        // Simulate an appender that registered and reserved its LSN
+        // range but whose positioned write has not finished (the
+        // exact state of a slow `append` between `fetch_add` and
+        // `write_at`). A later append + `sync_through` from another
+        // thread must not publish a frontier past it until the write
+        // lands. Pre-1.1.1 the leader published `next_lsn` at once,
+        // and the slow appender's own `sync_through` then hit the
+        // fast path with no fsync covering its bytes.
+        use std::sync::Arc;
+        let path = tmp_path("frontier_gate");
+        let _g = Cleanup(path.clone());
+        let j = Arc::new(
+            JournalHandle::open_with_options(
+                &path,
+                JournalOptions::new().group_commit_window(None),
+            )
+            .expect("open"),
+        );
+        let frame = format::encode_frame_owned(b"slow").expect("encode");
+        let ticket = j.write_gate.enter();
+        let a_start = j.next_lsn.fetch_add(frame.len() as u64, Ordering::SeqCst);
+        let a_end = a_start + frame.len() as u64;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let j2 = Arc::clone(&j);
+        let _ = std::thread::spawn(move || {
+            let lsn = j2.append(b"fast").expect("append");
+            j2.sync_through(lsn).expect("sync");
+            let _ = tx.send(lsn);
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "sync_through returned while a write below its frontier was in flight"
+        );
+        assert!(
+            j.synced_lsn().as_u64() < a_end,
+            "frontier published past an unwritten range"
+        );
+
+        crate::platform::write_at(&j.file, a_start, &frame).expect("slow write");
+        drop(ticket);
+        let lsn_b = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("sync_through finished after the write landed");
+        assert!(j.synced_lsn() >= lsn_b);
+        // The slow appender's own sync is now covered.
+        j.sync_through(Lsn(a_end)).expect("covered");
+
+        let mut reader = JournalReader::open(&path).expect("reader");
+        let payloads: Vec<Vec<u8>> = reader.iter().map(|r| r.expect("record").payload).collect();
+        assert_eq!(payloads, vec![b"slow".to_vec(), b"fast".to_vec()]);
+    }
+
+    #[test]
+    fn test_direct_next_lsn_never_moves_backwards_under_concurrency() {
+        // FS-J11: direct appends published their end with `store`,
+        // so a slower thread could move `next_lsn` backwards.
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let path = tmp_path("direct_monotonic");
+        let _g = Cleanup(path.clone());
+        let j = Arc::new(
+            JournalHandle::open_with_options(&path, JournalOptions::new().direct(true))
+                .expect("open direct"),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let j = Arc::clone(&j);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut last = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let now = j.next_lsn().as_u64();
+                    assert!(now >= last, "next_lsn moved backwards: {last} -> {now}");
+                    last = now;
+                }
+            })
+        };
+        let mut writers = Vec::new();
+        for t in 0..8u8 {
+            let j = Arc::clone(&j);
+            writers.push(std::thread::spawn(move || {
+                let mut max_end = 0u64;
+                for _ in 0..2000 {
+                    max_end = max_end.max(j.append(&[t; 24]).expect("append").as_u64());
+                }
+                max_end
+            }));
+        }
+        let highest = writers
+            .into_iter()
+            .map(|w| w.join().expect("writer"))
+            .max()
+            .unwrap_or(0);
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().expect("watcher");
+        assert_eq!(j.next_lsn().as_u64(), highest);
+    }
+
+    #[test]
+    fn test_direct_open_probes_sector_size_after_creating_file() {
+        // FS-J7: the probe ran before the file existed, so on Linux
+        // a new journal's first session used 512-byte sectors and
+        // every reopen used the filesystem block size.
+        let path = tmp_path("sector_probe");
+        let _g = Cleanup(path.clone());
+        let j = JournalHandle::open_with_options(&path, JournalOptions::new().direct(true))
+            .expect("open direct");
+        if let Some(log_buffer) = &j.log_buffer {
+            assert_eq!(
+                log_buffer.sector_size(),
+                crate::platform::probe_sector_size(&path) as usize
+            );
+        }
     }
 }

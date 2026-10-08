@@ -37,14 +37,26 @@
 //! - `active_len` is the number of valid (record-bearing) bytes
 //!   in the active slot, measured from byte 0. `active_len ≤
 //!   capacity`.
-//! - `flushing == Some(idx)` ⟹ slot `idx` is exclusively
+//! - LSNs are contiguous: `active_flush_pos + active_len` is
+//!   the end of the last appended record, and every byte below
+//!   it belongs to a record. Rotation and the oversize path
+//!   never skip to a fresh slot boundary; they carry the
+//!   partial trailing sector into the active slot instead.
+//! - Bytes of a slot past its `active_len` are zero (slots are
+//!   zeroed when allocated and after every flush), so a flush
+//!   of a partial sector writes zero padding.
+//! - `flushing == Some(Slot(idx))` ⟹ slot `idx` is exclusively
 //!   accessed by the flush-owning thread; no other thread
 //!   reads or writes that slot until `flushing` transitions
 //!   back to `None`. This is the state-machine guarantee that
 //!   makes the `UnsafeCell<AlignedBuf>` interior mutability
 //!   sound.
-//! - `flushing == Some(idx)` ⟹ `idx != active_idx`. We never
-//!   flush the active slot via the rotation path.
+//! - `flushing == Some(Slot(idx))` ⟹ `idx != active_idx`. We
+//!   never flush the active slot via the rotation path.
+//! - At most one write runs outside the lock at a time
+//!   (`flushing.is_some()`). Every other write (rotation,
+//!   oversize record, partial flush) waits for it, which keeps
+//!   writes of the shared partial sector in LSN order.
 //!
 //! ## Memory footprint
 //!
@@ -65,19 +77,43 @@
 //! resume-after-crash semantics. Same invariant as the
 //! pre-0.9.5 single-buffer.
 //!
-//! When the active slot eventually fills (`active_len ==
-//! capacity`), a rotation triggers a real flush of the slot,
-//! advances `active_flush_pos += capacity` for the new active,
-//! and zeros the just-flushed slot so any future partial
-//! flush on it (when it becomes active again) sees zeroed
-//! padding.
+//! When a record does not fit in the rest of the active slot,
+//! a rotation writes `round_up(active_len, sector)` bytes of
+//! the slot, advances `active_flush_pos` by the whole sectors
+//! it contained, and copies the partial trailing sector (the
+//! bytes past the last sector boundary) into the other slot,
+//! which becomes active. The record then lands right after the
+//! previous one. The just-flushed slot is zeroed so any future
+//! partial flush on it sees zeroed padding. When the shared
+//! partial sector is written again from the new slot, that
+//! write waits for the rotation flush, so the newer content
+//! always lands last.
+//!
+//! Before 1.1.1 a rotation advanced `active_flush_pos` by the
+//! full slot capacity, leaving a zero gap between the last
+//! record of the old slot and the first record of the new one.
+//! The reader still skips such gaps so journals written by
+//! 1.1.0 stay readable.
+//!
+//! ## Oversize records
+//!
+//! A record that does not fit in a slot even after a rotation
+//! (frame larger than `capacity` minus the carried tail) is
+//! written straight from a private scratch buffer together with
+//! the active slot's current contents. The active slot is
+//! re-seated at the last sector boundary of the record and
+//! holds the record's partial trailing sector. While that write
+//! runs, `flushing` is `Some(Scratch)` so rotations and partial
+//! flushes wait for it; appenders that fit in the active slot
+//! keep going.
 
 #![allow(dead_code)] // some accessors are reserved for benches / future probes
 
 use crate::journal::format;
+use crate::journal::poison::Poison;
 use crate::platform::{round_up, AlignedBuf};
 use crate::{Error, Result};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::cell::UnsafeCell;
 use std::fs::File;
 
@@ -151,13 +187,16 @@ struct IouringFlushState {
 // `bufs[i]` is governed by:
 //   - `bufs[state.active_idx]` is mutated only while the state
 //     lock is held (during `append_frame` / `flush_partial` /
-//     `set_flush_pos_for_resume`).
-//   - `bufs[state.flushing.unwrap()]` is read by exactly the
-//     thread that set `state.flushing = Some(idx)` (the flush
-//     owner); that thread holds no lock during the syscall but
-//     the state-machine guarantees no other thread touches
+//     `set_flush_pos_for_resume`), and the dormant slot is only
+//     touched under the lock while no flush is in flight (the
+//     rotation copies the carried tail into it).
+//   - When `state.flushing == Some(InFlight::Slot(idx))`,
+//     `bufs[idx]` is read by exactly the thread that set it (the
+//     flush owner); that thread holds no lock during the syscall
+//     but the state-machine guarantees no other thread touches
 //     `bufs[idx]` because no transition can take place on a
-//     slot in the `flushing` state.
+//     slot in the `flushing` state. `InFlight::Scratch` borrows
+//     no slot.
 // Both modes — exclusive write under the lock and exclusive
 // read by the flush owner — yield exclusive aliasing semantics
 // equivalent to `&mut [u8]`. There is no data race.
@@ -179,19 +218,28 @@ struct State {
     /// `0 <= active_len <= capacity` always.
     active_len: usize,
     /// File offset of byte 0 of the active slot. Always
-    /// sector-aligned. Advances by `capacity` on every full-slot
-    /// flush; can advance by an unaligned amount on the
-    /// oversize-record path (which then re-aligns to the
-    /// preceding sector boundary).
+    /// sector-aligned. A rotation or an oversize record advances
+    /// it to the last sector boundary at or below the end of the
+    /// written data.
     active_flush_pos: u64,
-    /// `Some(idx)` while slot `idx` is being flushed by some
-    /// thread that has dropped the state lock to perform the
-    /// `write_at_direct` syscall. The flush owner re-acquires
-    /// the lock after the syscall to transition `flushing` back
-    /// to `None`. While `Some(idx)`, no other thread reads or
-    /// writes `bufs[idx]`. Invariant: `flushing.is_some()` ⟹
-    /// `flushing.unwrap() != active_idx`.
-    flushing: Option<u8>,
+    /// `Some(_)` while a write runs outside the state lock. The
+    /// owner re-acquires the lock after the syscall to transition
+    /// `flushing` back to `None` and notify `flush_done`. See
+    /// [`InFlight`] for what each variant protects.
+    flushing: Option<InFlight>,
+}
+
+/// A write that runs with the state lock dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InFlight {
+    /// Slot `idx` was rotated out and is being written. No other
+    /// thread reads or writes `bufs[idx]` until the flush ends.
+    /// Invariant: `idx != active_idx`.
+    Slot(u8),
+    /// An oversize record (prefixed by the active slot's earlier
+    /// contents) is being written from a scratch buffer owned by
+    /// the writing thread. No slot is borrowed by the write.
+    Scratch,
 }
 
 impl LogBuffer {
@@ -344,9 +392,9 @@ impl LogBuffer {
         records: &[&[u8]],
         total_encoded_size: usize,
     ) -> Result<Option<(u64, u64)>> {
-        if records.is_empty() {
-            return Ok(Some((0, 0)));
-        }
+        // `JournalHandle::append_batch` returns before reaching here
+        // for an empty batch; an empty slice would still be handled
+        // correctly (an empty range at the current end).
         let mut state = self.state.lock();
         let remaining = self.capacity.saturating_sub(state.active_len);
         if total_encoded_size > remaining {
@@ -388,187 +436,263 @@ impl LogBuffer {
 
     /// Encodes `payload` as a frame and appends to the active
     /// slot, rotating slots when the active fills and waiting
-    /// for the dormant slot's flush to finish if both are busy.
+    /// for an in-flight flush to finish if it must.
     ///
     /// Returns `(start_lsn, end_lsn)` — the file-byte-offset
-    /// range the frame occupies.
+    /// range the frame occupies. Ranges returned to concurrent
+    /// callers never overlap and leave no gaps.
     ///
     /// **Concurrent behaviour.** Multiple threads calling
     /// `append_frame` may proceed concurrently as long as the
     /// active slot has room — they serialise on the brief state
     /// lock (microseconds) but **not** on the `write_at_direct`
     /// syscall (milliseconds). Only the thread that triggers a
-    /// rotation pays the syscall cost; other threads continue
-    /// into the new active slot.
-    pub(crate) fn append_frame(&self, file: &File, payload: &[u8]) -> Result<(u64, u64)> {
-        let frame = format::encode_frame_owned(payload)?;
-        let frame_size = frame.len();
+    /// rotation or writes an oversize record pays the syscall
+    /// cost; other threads continue into the active slot.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] with `InvalidInput` if `payload` exceeds
+    ///   the frame format's maximum payload (checked before any
+    ///   allocation).
+    /// - [`Error::Io`] if a flush this call performs fails, or if
+    ///   the scratch allocation for an oversize record fails. A
+    ///   failed flush poisons `poison`.
+    /// - The poison error if `poison` is set, including when it is
+    ///   set by another thread's failed flush while this call
+    ///   waits.
+    pub(crate) fn append_frame(
+        &self,
+        file: &File,
+        payload: &[u8],
+        poison: &Poison,
+    ) -> Result<(u64, u64)> {
+        let frame_size = format::frame_len(payload.len())?;
+        // Records that can fit in a slot are encoded before taking
+        // the lock to keep the critical section short. Larger ones
+        // are encoded straight into their scratch buffer.
+        let frame = if frame_size <= self.capacity {
+            Some(format::encode_frame_owned(payload)?)
+        } else {
+            None
+        };
 
         loop {
             let mut state = self.state.lock();
+            // A failed flush is published under this lock before
+            // waiters are notified, so checking here also covers
+            // threads woken from `flush_done`.
+            poison.check()?;
 
             // Path A — fits in the active slot. Fast path; copy
             // and return.
-            if state.active_len + frame_size <= self.capacity {
-                let active_idx = state.active_idx as usize;
-                let offset = state.active_len;
-                let start = state.active_flush_pos + offset as u64;
-                let end = start + frame_size as u64;
-                // SAFETY: we hold the state lock; the active
-                // slot is exclusively ours for the duration of
-                // this copy. No other thread can mutate
-                // `bufs[active_idx]` while the lock is held;
-                // the state machine guarantees `active_idx !=
-                // flushing.unwrap()` even if a flush is in
-                // flight.
-                unsafe {
-                    let slice = (*self.bufs[active_idx].get()).as_mut_slice();
-                    slice[offset..offset + frame_size].copy_from_slice(&frame);
-                }
-                state.active_len += frame_size;
-                return Ok((start, end));
-            }
-
-            // Path B — doesn't fit. We need to either (a) rotate
-            // (if the dormant slot is free), or (b) wait for the
-            // in-flight flush of the dormant slot to complete.
-            if state.flushing.is_some() {
-                // Both slots are busy: active is full AND the
-                // dormant is being flushed. Park on the condvar;
-                // the flush owner notifies after their syscall
-                // completes.
-                self.flush_done.wait(&mut state);
-                // Re-loop to re-check active capacity.
-                continue;
-            }
-
-            // Path C — rotate. We have data to flush (or are
-            // facing an oversize record); the dormant slot is
-            // free.
-            let old_idx = state.active_idx;
-            let old_len = state.active_len;
-            let old_flush_pos = state.active_flush_pos;
-            let new_idx = old_idx ^ 1;
-
-            if old_len > 0 {
-                // Standard rotation: move active to the other
-                // slot, mark old as flushing, drop the lock,
-                // perform the syscall, re-acquire to clean up.
-                state.active_idx = new_idx;
-                state.active_len = 0;
-                state.active_flush_pos = old_flush_pos
-                    .checked_add(self.capacity as u64)
-                    .ok_or_else(|| Error::Io(std::io::Error::other("flush_pos overflow")))?;
-                state.flushing = Some(old_idx);
-                drop(state);
-
-                // SAFETY: state.flushing = Some(old_idx) tells
-                // every other thread to leave `bufs[old_idx]`
-                // alone; we have exclusive read access for the
-                // syscall.
-                //
-                // 0.9.6 — when iouring is available, submit via
-                // `IORING_OP_WRITE_FIXED` against the
-                // pre-registered slot index (`old_idx`); the
-                // kernel skips per-SQE buffer page pinning.
-                // Otherwise fall back to the pwrite path.
-                let flush_result = unsafe {
-                    let slice = (*self.bufs[old_idx as usize].get()).as_slice();
-                    self.flush_slot_to_disk(file, old_idx, slice, old_flush_pos)
-                };
-
-                // Re-acquire, zero the just-flushed slot, and
-                // wake any appenders parked on `flush_done`.
-                {
-                    let mut state = self.state.lock();
-                    // SAFETY: state.flushing is still Some(old_idx);
-                    // we are still the exclusive owner.
-                    //
-                    // 0.9.6 — `slice.fill(0)` lowers to `memset`
-                    // (vectorised) on every supported toolchain
-                    // since rustc 1.51. The pre-0.9.6 hand-rolled
-                    // `for b in slice.iter_mut() { *b = 0; }` was
-                    // not always vectorised on debug builds and
-                    // cost ~5-10 µs per rotation on a 64 KiB slot.
-                    unsafe {
-                        let slice = (*self.bufs[old_idx as usize].get()).as_mut_slice();
-                        slice.fill(0);
-                    }
-                    state.flushing = None;
-                    let _ = self.flush_done.notify_all();
-                }
-
-                flush_result?;
-
-                // Loop back to retry the append into the new
-                // active slot. If the frame is oversize, the
-                // next iteration's path-A check fails and we
-                // fall through to path-D (oversize standalone
-                // write) with `active_len == 0`.
-                continue;
-            }
-
-            // Path D — oversize record (frame doesn't fit in a
-            // single slot). active_len == 0 (either we just
-            // rotated, or we started here with an empty active
-            // and an oversize frame). Standalone aligned write
-            // at the current flush_pos; load the partial
-            // trailing sector into the (still active) slot.
-            debug_assert_eq!(old_len, 0);
-            debug_assert!(frame_size > self.capacity);
-
-            let start = old_flush_pos;
-            let aligned = round_up(frame_size, self.sector_size);
-            let mut scratch = AlignedBuf::new(aligned, self.sector_size)?;
-            scratch.as_mut_slice()[..frame_size].copy_from_slice(&frame);
-            // alloc_zeroed already filled the trailing pad.
-
-            // Compute new state values from the write outcome.
-            let end = start + frame_size as u64;
-            let new_flush_pos = (end / self.sector_size as u64) * self.sector_size as u64;
-            let tail = (end - new_flush_pos) as usize;
-
-            // We do NOT mark anything as flushing here — the
-            // oversize write is to a region that's neither slot.
-            // No state-machine invariant requires the lock to
-            // be held during the syscall; drop it for the
-            // duration.
-            drop(state);
-
-            crate::platform::write_at_direct(file, start, scratch.as_slice())?;
-
-            // Re-acquire to update state and load the partial-
-            // sector tail into the active slot.
-            {
-                let mut state = self.state.lock();
-                state.active_flush_pos = new_flush_pos;
-                if tail > 0 {
-                    let scratch_offset = aligned - self.sector_size;
-                    let in_sector = (frame_size - scratch_offset).min(self.sector_size);
+            if let Some(frame) = frame.as_deref() {
+                if state.active_len + frame_size <= self.capacity {
                     let active_idx = state.active_idx as usize;
+                    let offset = state.active_len;
+                    let start = state.active_flush_pos + offset as u64;
+                    let end = start + frame_size as u64;
                     // SAFETY: we hold the state lock; the active
-                    // slot is exclusively ours. (No flush is in
-                    // flight; we just dropped & re-acquired but
-                    // the lock guarantees no rotation
-                    // intervened.)
+                    // slot is exclusively ours for the duration of
+                    // this copy. No other thread can mutate
+                    // `bufs[active_idx]` while the lock is held;
+                    // the state machine guarantees an in-flight
+                    // slot flush never targets the active slot.
                     unsafe {
                         let slice = (*self.bufs[active_idx].get()).as_mut_slice();
-                        slice[..in_sector].copy_from_slice(
-                            &scratch.as_slice()[scratch_offset..scratch_offset + in_sector],
-                        );
-                        // Zero the rest of the first sector
-                        // (defensive — alloc_zeroed already
-                        // filled this region, but we may have
-                        // re-used this slot from a prior cycle).
-                        for b in &mut slice[in_sector..self.sector_size] {
-                            *b = 0;
-                        }
+                        slice[offset..offset + frame_size].copy_from_slice(frame);
                     }
-                    state.active_len = tail;
+                    state.active_len += frame_size;
+                    return Ok((start, end));
                 }
             }
-            return Ok((start, end));
+
+            // Path B: does not fit, and a write is in flight. Any
+            // write we would issue next (rotation or oversize)
+            // covers the sector that write may also cover, so it
+            // must wait. The flush owner notifies on completion.
+            if state.flushing.is_some() {
+                self.flush_done.wait(&mut state);
+                continue;
+            }
+
+            // Path C: rotate. After a rotation the active slot
+            // holds only the carried partial sector; if the frame
+            // fits behind it, rotate and retry. `tail + frame_size
+            // <= capacity` together with the Path A miss implies
+            // `active_len >= sector_size`, so every rotation
+            // advances `active_flush_pos` and the loop terminates.
+            let tail = state.active_len % self.sector_size;
+            if tail + frame_size <= self.capacity {
+                self.rotate(state, file, poison)?;
+                continue;
+            }
+
+            // Path D: the frame cannot fit in a slot behind the
+            // carried tail. Write it together with the active
+            // slot's contents from a scratch buffer.
+            return self.append_oversize(
+                state,
+                file,
+                payload,
+                frame.as_deref(),
+                frame_size,
+                poison,
+            );
         }
+    }
+
+    /// Rotates the active slot out to disk. Caller holds the
+    /// state lock (passed in as `state`) with no write in flight
+    /// and a non-empty active slot.
+    ///
+    /// Writes `round_up(active_len, sector)` bytes of the old
+    /// slot at `active_flush_pos`, advances `active_flush_pos` by
+    /// the whole sectors written, and carries the trailing
+    /// partial sector into the other slot, which becomes active.
+    ///
+    /// A failed write poisons `poison` before waiters are woken:
+    /// the records in the old slot were already acknowledged and
+    /// are now lost, so no later append or sync may succeed.
+    fn rotate(&self, mut state: MutexGuard<'_, State>, file: &File, poison: &Poison) -> Result<()> {
+        debug_assert!(state.flushing.is_none());
+        let old_idx = state.active_idx;
+        let old_len = state.active_len;
+        let old_flush_pos = state.active_flush_pos;
+        let new_idx = old_idx ^ 1;
+        let whole = old_len - old_len % self.sector_size;
+        let tail = old_len - whole;
+        let write_len = round_up(old_len, self.sector_size);
+        let new_flush_pos = old_flush_pos
+            .checked_add(whole as u64)
+            .ok_or_else(|| Error::Io(std::io::Error::other("flush_pos overflow")))?;
+
+        // SAFETY: we hold the state lock and no write is in
+        // flight, so both slots are exclusively ours: the old
+        // (active) slot is only read here and the new slot is
+        // only written. They are distinct `UnsafeCell`s, so the
+        // shared and mutable borrows do not alias. The new slot
+        // is all zero past `tail` by the module invariant.
+        unsafe {
+            let src = (*self.bufs[old_idx as usize].get()).as_slice();
+            let dst = (*self.bufs[new_idx as usize].get()).as_mut_slice();
+            dst[..tail].copy_from_slice(&src[whole..old_len]);
+        }
+        state.active_idx = new_idx;
+        state.active_len = tail;
+        state.active_flush_pos = new_flush_pos;
+        state.flushing = Some(InFlight::Slot(old_idx));
+        drop(state);
+
+        // SAFETY: `flushing = Some(Slot(old_idx))` tells every
+        // other thread to leave `bufs[old_idx]` alone; we have
+        // exclusive read access for the syscall.
+        //
+        // 0.9.6: when iouring is available, submit via
+        // `IORING_OP_WRITE_FIXED` against the pre-registered slot
+        // index (`old_idx`); the kernel skips per-SQE buffer page
+        // pinning. Otherwise fall back to the pwrite path.
+        let flush_result = unsafe {
+            let slice = (*self.bufs[old_idx as usize].get()).as_slice();
+            self.flush_slot_to_disk(file, old_idx, &slice[..write_len], old_flush_pos)
+        };
+
+        // Re-acquire, zero the just-flushed slot, and wake any
+        // appenders parked on `flush_done`.
+        let mut state = self.state.lock();
+        // SAFETY: `state.flushing` is still `Some(Slot(old_idx))`;
+        // we are still the exclusive owner of `bufs[old_idx]`.
+        // Bytes past `old_len` are already zero (module invariant).
+        unsafe {
+            let slice = (*self.bufs[old_idx as usize].get()).as_mut_slice();
+            slice[..old_len].fill(0);
+        }
+        if let Err(e) = &flush_result {
+            poison.set(e);
+        }
+        state.flushing = None;
+        let _ = self.flush_done.notify_all();
+        drop(state);
+
+        flush_result
+    }
+
+    /// Writes a record that does not fit in a slot. Caller holds
+    /// the state lock (passed in as `state`) with no write in
+    /// flight.
+    ///
+    /// The scratch buffer holds the active slot's current
+    /// contents followed by the frame, so the write starts at the
+    /// sector-aligned `active_flush_pos`. Before the lock is
+    /// dropped, the active slot is re-seated at the last sector
+    /// boundary of the record and primed with its partial
+    /// trailing sector, so concurrent appenders continue right
+    /// after the record while the write runs. A failed write
+    /// poisons `poison` (it also carried earlier acknowledged
+    /// records from the active slot).
+    fn append_oversize(
+        &self,
+        mut state: MutexGuard<'_, State>,
+        file: &File,
+        payload: &[u8],
+        encoded: Option<&[u8]>,
+        frame_size: usize,
+        poison: &Poison,
+    ) -> Result<(u64, u64)> {
+        debug_assert!(state.flushing.is_none());
+        let ss = self.sector_size;
+        let prefix = state.active_len;
+        let start_pos = state.active_flush_pos;
+        let record_start = start_pos + prefix as u64;
+        let total = prefix
+            .checked_add(frame_size)
+            .ok_or_else(|| Error::Io(std::io::Error::other("oversize frame length overflow")))?;
+        let whole = total - total % ss;
+        let tail = total - whole;
+        let new_flush_pos = start_pos
+            .checked_add(whole as u64)
+            .ok_or_else(|| Error::Io(std::io::Error::other("flush_pos overflow")))?;
+
+        // Fill the scratch buffer before touching the active slot,
+        // so an allocation or encode failure leaves the state
+        // unchanged.
+        let mut scratch = AlignedBuf::new(round_up(total, ss), ss)?;
+        match encoded {
+            Some(frame) => scratch.as_mut_slice()[prefix..total].copy_from_slice(frame),
+            None => {
+                let _ =
+                    format::encode_frame_into(payload, &mut scratch.as_mut_slice()[prefix..total])?;
+            }
+        }
+        let active_idx = state.active_idx as usize;
+        // SAFETY: we hold the state lock and no write is in
+        // flight, so the active slot is exclusively ours. The
+        // scratch buffer is a separate allocation. After this
+        // block the slot holds only the record's partial trailing
+        // sector and is zero past it (module invariant).
+        unsafe {
+            let slot = (*self.bufs[active_idx].get()).as_mut_slice();
+            scratch.as_mut_slice()[..prefix].copy_from_slice(&slot[..prefix]);
+            slot[..prefix].fill(0);
+            slot[..tail].copy_from_slice(&scratch.as_slice()[whole..total]);
+        }
+        state.active_len = tail;
+        state.active_flush_pos = new_flush_pos;
+        state.flushing = Some(InFlight::Scratch);
+        drop(state);
+
+        let write_result = crate::platform::write_at_direct(file, start_pos, scratch.as_slice());
+
+        let mut state = self.state.lock();
+        if let Err(e) = &write_result {
+            poison.set(e);
+        }
+        state.flushing = None;
+        let _ = self.flush_done.notify_all();
+        drop(state);
+
+        write_result?;
+        Ok((record_start, record_start + frame_size as u64))
     }
 
     /// Partial / sync-point flush. Writes `aligned_len(active_len)`
@@ -578,25 +702,37 @@ impl LogBuffer {
     /// active slot from `active_len`. Subsequent flushes overwrite
     /// the partial-sector pad with new record bytes.
     ///
+    /// Returns the end LSN of the last record covered by the
+    /// write, captured under the state lock. Every byte below it
+    /// has been handed to the kernel when this returns `Ok`, so it
+    /// is the frontier a following `fdatasync` makes durable.
+    ///
     /// **Coordination.** This method waits for any in-flight
-    /// dormant-slot flush (`flushing.is_some()`) to complete
-    /// before issuing the partial flush, then holds the state
-    /// lock through the partial-flush syscall. This is the
-    /// deliberate sync point — callers asked for "make this
-    /// durable now" and we honour that by serialising. Other
-    /// appenders wait briefly.
-    pub(crate) fn flush_partial(&self, file: &File) -> Result<()> {
+    /// write (`flushing.is_some()`) to complete before issuing the
+    /// partial flush, then holds the state lock through the
+    /// partial-flush syscall. This is the deliberate sync point:
+    /// callers asked for "make this durable now" and we honour
+    /// that by serialising. Other appenders wait briefly.
+    ///
+    /// # Errors
+    ///
+    /// - The poison error if `poison` is set (including by an
+    ///   in-flight flush this call waited for).
+    /// - [`Error::Io`] if the write fails; `poison` is set.
+    pub(crate) fn flush_partial(&self, file: &File, poison: &Poison) -> Result<u64> {
         let mut state = self.state.lock();
 
-        // Wait for any in-flight dormant-slot flush to finish.
-        // We need a clean state before issuing the partial flush
-        // so the on-disk byte sequence is consistent.
+        // Wait for any in-flight write to finish. We need a clean
+        // state before issuing the partial flush so the on-disk
+        // byte sequence is consistent.
         while state.flushing.is_some() {
             self.flush_done.wait(&mut state);
         }
+        poison.check()?;
 
+        let end = state.active_flush_pos + state.active_len as u64;
         if state.active_len == 0 {
-            return Ok(()); // nothing to flush
+            return Ok(end); // nothing buffered
         }
 
         let aligned = round_up(state.active_len, self.sector_size);
@@ -611,11 +747,14 @@ impl LogBuffer {
         // 0.9.6 — partial flushes route through the
         // iouring-aware helper (`flush_slot_to_disk`) which
         // submits via `IORING_OP_WRITE_FIXED` when available.
-        unsafe {
+        let result = unsafe {
             let slice = (*self.bufs[active_idx].get()).as_slice();
-            self.flush_slot_to_disk(file, active_idx as u8, &slice[..aligned], active_flush_pos)?;
+            self.flush_slot_to_disk(file, active_idx as u8, &slice[..aligned], active_flush_pos)
+        };
+        if let Err(e) = &result {
+            poison.set(e);
         }
-        Ok(())
+        result.map(|()| end)
     }
 
     /// 0.9.6 — Centralised flush dispatcher. Routes via
@@ -665,56 +804,83 @@ impl LogBuffer {
         crate::platform::write_at_direct(file, offset, slice)
     }
 
+    /// Runs `f` while no log-buffer write can start or be in
+    /// flight: waits for any in-flight flush, then holds the state
+    /// lock (which every append, rotation and partial flush takes)
+    /// for the duration of `f`. Used by journal preallocation to
+    /// check and restore the file size without racing a flush
+    /// that extends the file.
+    pub(crate) fn quiesced<R>(&self, f: impl FnOnce() -> R) -> R {
+        let mut state = self.state.lock();
+        while state.flushing.is_some() {
+            self.flush_done.wait(&mut state);
+        }
+        let result = f();
+        drop(state);
+        result
+    }
+
     /// Repositions the buffer for resume-after-crash. Called by
     /// `JournalHandle::open_direct` after `scan_clean_end` finds
-    /// the last good LSN. Sets `active_flush_pos` to the last
-    /// sector boundary at or before `resume_lsn`, primes slot 0
-    /// with the partial-sector tail from disk (`prefix_bytes`)
-    /// so subsequent flushes overwrite the existing on-disk
-    /// zero-pad cleanly, and sets `active_len` to the in-sector
-    /// resume offset.
-    pub(crate) fn set_flush_pos_for_resume(
-        &self,
-        flush_pos: u64,
-        in_sector_offset: usize,
-        prefix_bytes: &[u8],
-    ) {
+    /// the last good LSN. Sets `active_flush_pos` to `flush_pos`
+    /// (the last sector boundary at or before the resume LSN) and
+    /// primes the active slot with `prefix`, the bytes of the
+    /// partial trailing sector that precede the resume LSN, so the
+    /// next flush rewrites that sector with the same leading bytes.
+    /// `active_len` becomes `prefix.len()`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] with `InvalidInput` if `flush_pos` is not
+    /// sector-aligned or `prefix` is not shorter than a sector.
+    pub(crate) fn set_flush_pos_for_resume(&self, flush_pos: u64, prefix: &[u8]) -> Result<()> {
+        if flush_pos % self.sector_size as u64 != 0 || prefix.len() >= self.sector_size {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "journal resume position is not sector-aligned",
+            )));
+        }
         let mut state = self.state.lock();
         debug_assert_eq!(state.active_len, 0, "rehydrate must run on a fresh buffer");
-        debug_assert!(
-            flush_pos % self.sector_size as u64 == 0,
-            "flush_pos must be sector-aligned"
-        );
         debug_assert!(
             state.flushing.is_none(),
             "rehydrate must run before any flush has started"
         );
         state.active_flush_pos = flush_pos;
-        if in_sector_offset > 0 {
-            let copy_len = in_sector_offset
-                .min(prefix_bytes.len())
-                .min(self.sector_size);
-            let active_idx = state.active_idx as usize;
-            // SAFETY: we hold the state lock; the active slot is
-            // exclusively ours during this resume init.
-            unsafe {
-                let slice = (*self.bufs[active_idx].get()).as_mut_slice();
-                slice[..copy_len].copy_from_slice(&prefix_bytes[..copy_len]);
-            }
-            state.active_len = copy_len;
+        let active_idx = state.active_idx as usize;
+        // SAFETY: we hold the state lock; the active slot is
+        // exclusively ours during this resume init. `prefix` is
+        // shorter than a sector, and a slot holds at least one.
+        unsafe {
+            let slice = (*self.bufs[active_idx].get()).as_mut_slice();
+            slice[..prefix.len()].copy_from_slice(prefix);
         }
+        state.active_len = prefix.len();
+        Ok(())
+    }
+
+    /// Device sector size this buffer aligns every write to.
+    #[inline]
+    pub(crate) fn sector_size(&self) -> usize {
+        self.sector_size
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::reader::{JournalReader, JournalTailState};
     use std::fs::OpenOptions;
     use std::io::Read;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
 
     static C: AtomicU32 = AtomicU32::new(0);
+
+    /// Shared never-poisoned state for tests that do not inject
+    /// failures. Tests that poison use their own instance.
+    static NO_POISON: Poison = Poison::new();
 
     fn tmp_path(tag: &str) -> PathBuf {
         let n = C.fetch_add(1, Ordering::Relaxed);
@@ -739,6 +905,24 @@ mod tests {
         (path.clone(), f, Cleanup(path))
     }
 
+    fn file_len(path: &Path) -> u64 {
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    /// Reads every record back, asserting a clean end.
+    fn read_all(path: &Path) -> Vec<(u64, Vec<u8>)> {
+        let mut reader = JournalReader::open(path).unwrap();
+        let out = reader
+            .iter()
+            .map(|r| {
+                let r = r.unwrap();
+                (r.lsn.as_u64(), r.payload)
+            })
+            .collect();
+        assert_eq!(reader.tail_state(), JournalTailState::CleanEnd);
+        out
+    }
+
     #[test]
     fn new_buffer_is_aligned_and_zeroed() {
         let buf = LogBuffer::new(4096, 512, 0).unwrap();
@@ -751,7 +935,7 @@ mod tests {
     fn append_frame_fits_in_active_slot() {
         let (path, file, _g) = make_file();
         let buf = LogBuffer::new(4096, 512, 0).unwrap();
-        let (start, end) = buf.append_frame(&file, b"hello").unwrap();
+        let (start, end) = buf.append_frame(&file, b"hello", &NO_POISON).unwrap();
         assert_eq!(start, 0);
         assert_eq!(end, 5 + format::FRAME_OVERHEAD as u64);
         assert_eq!(buf.next_lsn(), end);
@@ -768,15 +952,19 @@ mod tests {
         // 4096 / 112 = 36 records fit; the 37th triggers rotation.
         let payload = vec![0xABu8; 100];
         for _ in 0..36 {
-            let _ = buf.append_frame(&file, &payload).unwrap();
+            let _ = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
         }
         // Before rotation — nothing on disk yet.
         assert_eq!(buf.flushed_through(), 0);
         // 37th append triggers rotation; old slot (slot 0) gets flushed.
-        let _ = buf.append_frame(&file, &payload).unwrap();
-        // The new active slot's flush_pos is now `capacity` = 4096.
-        assert_eq!(buf.flushed_through(), 4096);
-        // File size = 4096 (the full old slot was written).
+        let (start, _) = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
+        // The 37th record starts right after the 36th: no gap.
+        assert_eq!(start, 36 * 112);
+        // The rotation wrote round_up(4032, 512) = 4096 bytes and
+        // re-seated the active slot at the last whole sector
+        // (3584), carrying the 448-byte partial sector.
+        assert_eq!(buf.flushed_through(), 3584);
+        assert_eq!(buf.buffered_len(), 448 + 112);
         let mut f = OpenOptions::new().read(true).open(&path).unwrap();
         let mut bytes = Vec::new();
         let _ = f.read_to_end(&mut bytes).unwrap();
@@ -787,8 +975,9 @@ mod tests {
     fn flush_partial_writes_records_plus_zero_pad() {
         let (path, file, _g) = make_file();
         let buf = LogBuffer::new(4096, 512, 0).unwrap();
-        let _ = buf.append_frame(&file, b"x").unwrap(); // 13-byte frame
-        buf.flush_partial(&file).unwrap();
+        let _ = buf.append_frame(&file, b"x", &NO_POISON).unwrap(); // 13-byte frame
+        let frontier = buf.flush_partial(&file, &NO_POISON).unwrap();
+        assert_eq!(frontier, 13);
         // Aligned-up to next sector = 512 bytes written.
         let mut f = OpenOptions::new().read(true).open(&path).unwrap();
         let mut bytes = Vec::new();
@@ -806,7 +995,7 @@ mod tests {
         let buf = LogBuffer::new(4096, 512, 0).unwrap();
         // 5000-byte payload → 5012-byte frame, exceeds 4096-byte slot.
         let payload = vec![0xCDu8; 5000];
-        let (start, end) = buf.append_frame(&file, &payload).unwrap();
+        let (start, end) = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
         assert_eq!(start, 0);
         assert_eq!(end, 5012);
         // active_flush_pos lands at the last sector boundary ≤ end:
@@ -816,10 +1005,137 @@ mod tests {
         // sector tail: 5012 - 4608 = 404 bytes.
         assert_eq!(buf.buffered_len(), 404);
         // File on disk is sector-aligned-up: round_up(5012, 512) = 5120.
-        let mut f = OpenOptions::new().read(true).open(&path).unwrap();
-        let mut bytes = Vec::new();
-        let _ = f.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes.len(), 5120);
+        assert_eq!(file_len(&path), 5120);
+    }
+
+    #[test]
+    fn test_rotation_with_partial_sector_keeps_lsns_contiguous() {
+        // 1.1.0 advanced flush_pos by the whole slot on rotation,
+        // leaving a zero gap after the last record of the slot.
+        // 13-byte frames into a 4 KiB slot: 4096 = 13 * 315 + 1,
+        // so every rotation used to leave a 1-byte gap that the
+        // old reader could not skip.
+        let (path, file, _g) = make_file();
+        let buf = LogBuffer::new(4096, 512, 0).unwrap();
+        let mut expected_start = 0u64;
+        for i in 0..2000u32 {
+            let payload = [(i % 251) as u8];
+            let (start, end) = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
+            assert_eq!(start, expected_start, "record {i} is not contiguous");
+            expected_start = end;
+        }
+        assert_eq!(
+            buf.flush_partial(&file, &NO_POISON).unwrap(),
+            expected_start
+        );
+        let records = read_all(&path);
+        assert_eq!(records.len(), 2000);
+        for (i, (lsn, payload)) in records.iter().enumerate() {
+            assert_eq!(*lsn, i as u64 * 13);
+            assert_eq!(payload, &vec![(i % 251) as u8]);
+        }
+    }
+
+    #[test]
+    fn test_rotation_before_large_record_leaves_no_gap() {
+        // A 1000-byte record followed by a 3500-byte record that
+        // does not fit behind it: the 1.1.0 rotation left a
+        // ~3 KiB zero gap here.
+        let (path, file, _g) = make_file();
+        let buf = LogBuffer::new(4096, 512, 0).unwrap();
+        let (_, e1) = buf.append_frame(&file, &[1u8; 1000], &NO_POISON).unwrap();
+        let (s2, e2) = buf.append_frame(&file, &[2u8; 3500], &NO_POISON).unwrap();
+        let (s3, e3) = buf.append_frame(&file, b"after", &NO_POISON).unwrap();
+        assert_eq!(s2, e1);
+        assert_eq!(s3, e2);
+        assert_eq!(buf.flush_partial(&file, &NO_POISON).unwrap(), e3);
+        let payloads: Vec<Vec<u8>> = read_all(&path).into_iter().map(|(_, p)| p).collect();
+        assert_eq!(
+            payloads,
+            vec![vec![1u8; 1000], vec![2u8; 3500], b"after".to_vec()]
+        );
+    }
+
+    #[test]
+    fn test_oversize_after_partial_slot_includes_prefix() {
+        // Oversize record while the active slot holds data that
+        // is not sector-aligned: the scratch write must carry the
+        // prefix so nothing is lost or overlapped.
+        let (path, file, _g) = make_file();
+        let buf = LogBuffer::new(4096, 512, 0).unwrap();
+        let (_, e1) = buf.append_frame(&file, &[1u8; 100], &NO_POISON).unwrap();
+        let (s2, e2) = buf.append_frame(&file, &[2u8; 6000], &NO_POISON).unwrap();
+        let (s3, e3) = buf.append_frame(&file, &[3u8; 10], &NO_POISON).unwrap();
+        assert_eq!((s2, s3), (e1, e2));
+        assert_eq!(buf.flush_partial(&file, &NO_POISON).unwrap(), e3);
+        let payloads: Vec<Vec<u8>> = read_all(&path).into_iter().map(|(_, p)| p).collect();
+        assert_eq!(
+            payloads,
+            vec![vec![1u8; 100], vec![2u8; 6000], vec![3u8; 10]]
+        );
+    }
+
+    #[test]
+    fn test_oversize_payload_rejected_before_allocation() {
+        // A payload over FRAME_MAX_PAYLOAD must be refused by the
+        // size check before anything is allocated for it. A real
+        // 256 MiB payload is too expensive for a unit test, so the
+        // size helper `append_frame` calls first is checked here.
+        assert!(format::frame_len(format::FRAME_MAX_PAYLOAD as usize + 1).is_err());
+        assert_eq!(
+            format::frame_len(format::FRAME_MAX_PAYLOAD as usize).unwrap(),
+            format::FRAME_MAX_PAYLOAD as usize + format::FRAME_OVERHEAD
+        );
+    }
+
+    /// FS-J1 regression: an oversize append used to drop the state
+    /// lock without reserving its range, so concurrent appenders
+    /// were handed the same LSNs and overwrote its bytes. Four
+    /// threads, 4 KiB slots, one thread appending 6000-byte
+    /// records: every returned range must be disjoint, the ranges
+    /// must tile `[0, end)` with no gap, and every record must
+    /// read back intact.
+    #[test]
+    fn test_concurrent_oversize_appends_never_overlap() {
+        for round in 0..5 {
+            let (path, file, _g) = make_file();
+            let buf = Arc::new(LogBuffer::new(4096, 512, 0).unwrap());
+            let file = Arc::new(file);
+            let mut handles = Vec::new();
+            for t in 0..4u8 {
+                let buf = Arc::clone(&buf);
+                let file = Arc::clone(&file);
+                handles.push(std::thread::spawn(move || {
+                    let mut out = Vec::new();
+                    for i in 0..400u32 {
+                        let len = if t == 0 && i % 4 == 0 { 6000 } else { 20 };
+                        let mut payload = vec![t; len];
+                        payload[..4].copy_from_slice(&i.to_le_bytes());
+                        let (s, e) = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
+                        out.push((s, e, payload));
+                    }
+                    out
+                }));
+            }
+            let mut all: Vec<(u64, u64, Vec<u8>)> = handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect();
+            let end = buf.flush_partial(&file, &NO_POISON).unwrap();
+            all.sort_by_key(|r| r.0);
+            let mut cursor = 0u64;
+            for (s, e, _) in &all {
+                assert_eq!(*s, cursor, "round {round}: gap or overlap at {s}");
+                cursor = *e;
+            }
+            assert_eq!(cursor, end);
+            let records = read_all(&path);
+            assert_eq!(records.len(), all.len(), "round {round}");
+            for ((lsn, payload), (s, _, expected)) in records.iter().zip(all.iter()) {
+                assert_eq!(lsn, s);
+                assert_eq!(payload, expected, "round {round}: record at {s} corrupted");
+            }
+        }
     }
 
     // ─────────────────────────────────────────────────────────
@@ -839,7 +1155,7 @@ mod tests {
         let payload = [0xAAu8; 4];
         // 4 rotations: 32 * 4 + 1 = 129 appends.
         for _ in 0..(32 * 4 + 1) {
-            let _ = buf.append_frame(&file, &payload).unwrap();
+            let _ = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
         }
         // After 4 rotations the active slot's flush_pos = 4*512 = 2048.
         assert_eq!(buf.flushed_through(), 2048);
@@ -852,9 +1168,7 @@ mod tests {
         // into the new active slot (fast). We can't directly
         // observe "didn't block" without timing, but we can
         // confirm correctness under contention: N threads each
-        // submit M records, file ends up with N*M records
-        // worth of bytes, no deadlock.
-        use std::sync::Arc;
+        // submit M records and every record reads back.
         let (path, file, _g) = make_file();
         let buf = Arc::new(LogBuffer::new(4096, 512, 0).unwrap());
         let file = Arc::new(file);
@@ -870,7 +1184,9 @@ mod tests {
             let payload = payload.clone();
             handles.push(std::thread::spawn(move || {
                 for _ in 0..per_thread {
-                    let _ = buf.append_frame(&file, &payload).expect("append");
+                    let _ = buf
+                        .append_frame(&file, &payload, &NO_POISON)
+                        .expect("append");
                 }
             }));
         }
@@ -878,25 +1194,13 @@ mod tests {
             h.join().expect("join");
         }
         // Final sync to push the active slot's tail to disk.
-        buf.flush_partial(&file).expect("partial flush");
+        let end = buf.flush_partial(&file, &NO_POISON).expect("partial flush");
 
-        // Confirm the total number of bytes written matches the
-        // total framed-record bytes (modulo sector padding at
-        // the end). Each frame: 12 + 24 = 36 bytes.
-        // Total: 8 * 200 * 36 = 57 600 bytes.
+        // LSNs are contiguous, so the frontier is exactly the sum
+        // of the frame sizes: 8 * 200 * 36 = 57 600 bytes.
         let total_bytes = (n_threads * per_thread * 36) as u64;
-
-        let on_disk_len = std::fs::metadata(&path).unwrap().len();
-        // The on-disk size is the most recent flush's coverage.
-        // It must be at least `total_bytes` (rounded up to a
-        // multiple of capacity) and at most that plus one
-        // capacity-worth (the active slot's pad).
-        assert!(
-            on_disk_len >= total_bytes - 4096,
-            "on-disk {} < total {}",
-            on_disk_len,
-            total_bytes
-        );
+        assert_eq!(end, total_bytes);
+        assert_eq!(read_all(&path).len(), n_threads * per_thread);
     }
 
     #[test]
@@ -913,19 +1217,19 @@ mod tests {
         // Fill slot 0 (32 frames of 16 bytes each).
         let payload = [0xCCu8; 4];
         for _ in 0..32 {
-            let _ = buf.append_frame(&file, &payload).unwrap();
+            let _ = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
         }
         // 33rd append triggers rotation: slot 0 → flush, slot 1
         // becomes active with the 33rd frame.
-        let _ = buf.append_frame(&file, &payload).unwrap();
+        let _ = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
         // Now flush_partial of the active (slot 1, with one
         // frame in it). After this returns, the file holds
         // slot 0's full content (512 bytes) followed by slot 1's
         // partial content (16 bytes + zero pad to 512).
-        buf.flush_partial(&file).unwrap();
-        let on_disk_len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(buf.flush_partial(&file, &NO_POISON).unwrap(), 33 * 16);
         // 512 (slot 0 rotation flush) + 512 (slot 1 partial pad) = 1024.
-        assert_eq!(on_disk_len, 1024);
+        assert_eq!(file_len(&path), 1024);
+        assert_eq!(read_all(&path).len(), 33);
     }
 
     #[test]
@@ -933,16 +1237,23 @@ mod tests {
         // Smoke test: feed enough records to trigger multiple
         // rotations and confirm offsets advance correctly with
         // no panics, no incorrect state, no deadlock.
-        // Rotation fires on the append AFTER the active slot
-        // fills, so 5 rotations require `36 * 5 + 1` = 181 appends.
-        let (_path, file, _g) = make_file();
+        let (path, file, _g) = make_file();
         let buf = LogBuffer::new(4096, 512, 0).unwrap();
         let payload = vec![0xDDu8; 100]; // 112-byte frames
-                                         // 4096 / 112 = 36 frames per slot.
-        for _ in 0..(36 * 5 + 1) {
-            let _ = buf.append_frame(&file, &payload).unwrap();
+        let n = 36 * 5 + 1;
+        for _ in 0..n {
+            let _ = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
         }
-        // After 5 rotations: active_flush_pos = 5 * 4096 = 20480.
-        assert_eq!(buf.flushed_through(), 20480);
+        // LSNs are contiguous across every rotation.
+        assert_eq!(buf.next_lsn(), n as u64 * 112);
+        // active_flush_pos is the last sector boundary at or below
+        // the start of the active slot's carried tail.
+        assert_eq!(buf.flushed_through() % 512, 0);
+        assert!(buf.flushed_through() <= buf.next_lsn());
+        assert_eq!(
+            buf.flush_partial(&file, &NO_POISON).unwrap(),
+            n as u64 * 112
+        );
+        assert_eq!(read_all(&path).len(), n);
     }
 }

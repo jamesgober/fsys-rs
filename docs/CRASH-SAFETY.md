@@ -138,12 +138,12 @@ the reader sees at the journal tail:
 
 | `JournalTailState` | Meaning | Recoverable? |
 |---|---|---|
-| `CleanEnd` | File ended exactly on a frame boundary. No torn record. | n/a |
-| `TruncatedHeader` | Last frame's 12-byte header is partial. Truncate at frame start. | **Yes** |
-| `TruncatedPayload` | Last frame's payload was cut mid-write. Truncate at frame start. | **Yes** |
+| `CleanEnd` | File ended on a frame boundary, or only zero bytes (Direct-IO padding, preallocated space) follow the last frame. `position()` is the end of the last frame. | n/a |
+| `TruncatedHeader` | Last frame's 8-byte header is partial, or a frame position holds zero bytes that are not a 1.1.0 writer gap (a reservation that was never written). Truncate at `position()`. | **Yes** |
+| `TruncatedPayload` | Last frame's payload was cut mid-write (its declared length runs past the end of the file). Truncate at frame start. | **Yes** |
 | `ChecksumMismatch` | Frame decoded but CRC-32C check failed. Truncate at frame start. | **Yes** |
-| `BadMagic` | Frame's magic+version doesn't match. Format-level corruption — surfaces as `Error::Io(InvalidData)`. | **No** — operator intervention required |
-| `LengthOverflow` | Frame's declared length exceeds the 256 MiB limit or remaining file size. Same as `BadMagic`. | **No** |
+| `BadMagic` | A frame starts with a non-zero byte but its magic+version doesn't match. Format-level corruption; opening the journal fails with `Error::Io(InvalidData)`. | **No**: operator intervention required |
+| `LengthOverflow` | Frame's declared length exceeds the 256 MiB limit. Same as `BadMagic`. | **No** |
 
 For recoverable tail states, the recovery procedure is:
 
@@ -154,10 +154,58 @@ For recoverable tail states, the recovery procedure is:
 5. Truncate the file to `reader.position()`, then reopen via
    `Handle::journal` to continue appending.
 
+Since 1.1.1 `Handle::journal` / `Handle::journal_with` run steps
+1-5 themselves in both modes: the open scans to the end of the
+last clean frame, truncates the file there (Direct-IO keeps the
+rest of that sector and rewrites it on the next flush) and
+resumes appending at that LSN. Before 1.1.1 a buffered open
+resumed at the raw file length, so records appended after a torn
+tail were unreadable.
+
 For unrecoverable states (`BadMagic`, `LengthOverflow`), the
-reader does **not** auto-truncate — these indicate format-level
-corruption that may extend beyond the tail. Surface to a human
-operator for triage.
+reader does **not** auto-truncate: these indicate format-level
+corruption that may extend beyond the tail. Opening such a
+journal fails with `InvalidData` in both modes (buffered opens
+accepted it before 1.1.1). Surface to a human operator for
+triage.
+
+#### Zero runs
+
+A frame never starts with a zero byte, so the reader classifies a
+zero run at a frame position by where it ends: at end of file it
+is a clean end; at a 512-byte boundary within 64 MiB it is a gap a
+1.1.0 Direct-IO writer left when it rotated a log-buffer slot or
+resumed on a sector boundary, and the reader skips it; anywhere
+else it is a reservation that was never written and iteration
+stops with `TruncatedHeader`. 1.1.1 writers never leave gaps; the
+skip keeps 1.1.0 journals readable. Fixtures written by 1.1.0
+(`tests/fixtures/journal_v1_1_0/`) pin this.
+
+### Durable frontier
+
+`sync_through` publishes a durable frontier (`synced_lsn`) only
+over bytes that reached the file before the fsync. Buffered
+appenders register with a write gate before they reserve their
+LSN range, and the group-commit leader waits for every write
+reserved below its frontier to finish before it fsyncs. Direct-IO
+leaders publish the end LSN captured under the log-buffer lock
+when they flushed. Before 1.1.1 the frontier could cover a slow
+appender's range that was still in its buffer, and that
+appender's own `sync_through` then returned without any fsync
+covering its bytes.
+
+### Write and sync failures
+
+The first failed write, flush or fsync poisons the journal. Every
+later `append` / `append_batch`, and every `sync_through` whose
+target is not already durable, returns an error that names the
+first failure. The journal does not retry a failed fsync: Linux
+may drop the dirty pages behind a failed fsync and report success
+for a retry ("fsyncgate"). Recovery is to drop the handle and
+reopen; the open stops at the first hole or torn frame. Before
+1.1.1 only the caller whose call failed saw the error, later
+syncs could succeed past a hole, and a failed Direct-IO flush
+inside `sync_through` deadlocked every later `sync_through`.
 
 ### Direct-IO journal mode (0.9.5+ dual-buffer)
 
@@ -171,9 +219,19 @@ The same crash-safety contract applies, with one additional
 recovery detail: the resume path scans the existing file
 forward, finds the LSN past the last cleanly-decoded frame, and
 **re-seats the log buffer at the largest sector boundary at or
-before that LSN**. The partial trailing sector is rehydrated
+before that LSN**. Bytes past that sector are truncated, and the
+partial trailing sector is read back (through a buffered handle)
 into the buffer's first sector so subsequent flushes overwrite
-the existing on-disk zero-pad without destroying records.
+the existing on-disk zero-pad without destroying records. The
+sector size is probed after the file is created, so a new
+journal and its reopens use the same size.
+
+Records stay contiguous across log-buffer slot rotations and
+oversize records: a rotation writes the slot up to its last
+partial sector and carries that sector into the next slot.
+Before 1.1.1 a rotation skipped to the next slot boundary and
+left a zero gap, and an oversize record raced concurrent appends
+for the same LSNs.
 
 ### Test harness — `tests/crash_journal.rs`
 
@@ -205,6 +263,23 @@ Three invariants are asserted:
 Both `JournalOptions::default()` (buffered/lock-free) and
 `JournalOptions::direct(true)` (Direct-IO log buffer) pass the
 harness across 10 consecutive runs.
+
+1.1.1 adds, in both modes:
+
+- A concurrent-appender victim: four threads append and
+  `sync_through` until the parent kills the process. Every
+  acknowledged sync must survive, no record may be torn or
+  duplicated, and the journal must reopen and accept appends.
+- An injected write failure (Linux): the victim caps its file
+  size with `RLIMIT_FSIZE`, so a write fails with `EFBIG`. The
+  journal must stay poisoned, keep every record synced before
+  the failure, and reopen cleanly.
+
+`tests/journal_integrity.rs` covers the remaining failure modes
+with file manipulation (torn and zero tails, unwritten holes,
+stale frames past the resume point) and multi-threaded stress
+(oversize appends racing small ones, the durable frontier under
+a slow appender, preallocation racing appends).
 
 ## Non-write APIs
 
