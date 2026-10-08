@@ -52,7 +52,8 @@
 //! cross-lane consistency arrives in `0.5.0` alongside the platform
 //! module's IO state-machine consolidation.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -121,33 +122,110 @@ impl Default for PipelineConfig {
 /// independently of the calling thread; communication is via
 /// [`crossbeam_channel`]. On drop, the pipeline runs the shutdown
 /// protocol on every shard: signal shutdown, drop the work-queue
-/// sender so each dispatcher sees `Disconnected` after draining, then
-/// wait on each `done_rx.recv_timeout(5s)` and join its thread.
+/// sender, then wait on each `done_rx.recv_timeout(5s)` and join its
+/// thread.
 ///
-/// 0.9.3: holds a `Vec<DispatcherInner>` (one entry per shard). The
-/// default `PipelineConfig::DEFAULT` sets `dispatcher_shards = 1`, so
-/// the vector is one-element-long and behaviour is identical to
-/// pre-0.9.3. Higher shard counts spawn N independent dispatchers
-/// hashed by the first op's path; ops within one batch always land
-/// on the same shard.
+/// 0.9.3: holds one [`Shard`] per dispatcher. The default
+/// `PipelineConfig::DEFAULT` sets `dispatcher_shards = 1`, so there is
+/// one shard and behaviour is identical to pre-0.9.3. Higher shard
+/// counts spawn N independent dispatchers hashed by the first op's
+/// path; ops within one batch always land on the same shard.
 pub(crate) struct Pipeline {
     config: PipelineConfig,
-    /// `None` until the first batch submit, then
-    /// `Some(Vec<DispatcherInner>)` (one entry per shard) for the
-    /// rest of this `Pipeline`'s lifetime (or until `Drop` runs).
-    inner: Mutex<Option<Vec<DispatcherInner>>>,
+    /// Thread spawner. `std::thread::Builder` in production; tests
+    /// inject failures to exercise the respawn path.
+    spawn: SpawnFn,
+    /// Empty until the first batch submit, then one [`Shard`] per
+    /// dispatcher for the rest of this `Pipeline`'s lifetime. After
+    /// initialisation, submits read it with a single atomic load;
+    /// earlier versions locked a mutex on every submit.
+    fleet: OnceLock<Vec<Shard>>,
 }
 
-/// Channels and join handle owned by the pipeline once the dispatcher
-/// has been spawned.
-struct DispatcherInner {
+/// Spawns a named dispatcher thread running `body`.
+type SpawnFn =
+    fn(name: String, body: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<JoinHandle<()>>;
+
+fn spawn_os_thread(
+    name: String,
+    body: Box<dyn FnOnce() + Send + 'static>,
+) -> std::io::Result<JoinHandle<()>> {
+    thread::Builder::new().name(name).spawn(body)
+}
+
+/// Channels and thread state of one dispatcher shard.
+struct Shard {
     job_tx: Sender<BatchJob>,
     shutdown_tx: Sender<()>,
     done_rx: Receiver<()>,
-    /// Wrapped in `Option` so `Pipeline`'s `Drop` impl can `take()`
-    /// ownership of the [`JoinHandle`] for joining (or
-    /// [`std::mem::forget`] on timeout).
-    thread: Option<JoinHandle<()>>,
+    /// `true` once a dispatcher thread owns this shard's receivers.
+    /// Checked on every submit; the mutex below is only taken while
+    /// no thread is running.
+    running: AtomicBool,
+    /// Cold-path state: the dispatcher's join handle, plus the
+    /// receiving ends a (re)spawn hands to a new thread.
+    thread: Mutex<ShardThread>,
+}
+
+struct ShardThread {
+    handle: Option<JoinHandle<()>>,
+    job_rx: Receiver<BatchJob>,
+    shutdown_rx: Receiver<()>,
+    done_tx: Sender<()>,
+}
+
+impl Shard {
+    fn new(config: PipelineConfig) -> Self {
+        let (job_tx, job_rx) = bounded::<BatchJob>(config.batch_queue_max);
+        let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
+        let (done_tx, done_rx) = bounded::<()>(1);
+        Self {
+            job_tx,
+            shutdown_tx,
+            done_rx,
+            running: AtomicBool::new(false),
+            thread: Mutex::new(ShardThread {
+                handle: None,
+                job_rx,
+                shutdown_rx,
+                done_tx,
+            }),
+        }
+    }
+
+    /// Makes sure a dispatcher thread serves this shard, spawning one
+    /// if none is running. Returns `false` when the OS refuses the
+    /// thread; the next submit tries again, so a transient spawn
+    /// failure (thread or memory limit) does not disable the shard
+    /// for the rest of the handle's life.
+    fn ensure_running(&self, config: PipelineConfig, spawn: SpawnFn, name: &str) -> bool {
+        if self.running.load(Ordering::Acquire) {
+            return true;
+        }
+        // Tolerate a poisoned mutex: the lock is never held across
+        // user code, so a poisoned guard still holds consistent state.
+        let mut st = match self.thread.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if self.running.load(Ordering::Acquire) {
+            return true;
+        }
+        let job_rx = st.job_rx.clone();
+        let shutdown_rx = st.shutdown_rx.clone();
+        let done_tx = st.done_tx.clone();
+        let body = Box::new(move || {
+            group::run_dispatcher(config, job_rx, shutdown_rx, done_tx);
+        });
+        match spawn(name.to_string(), body) {
+            Ok(handle) => {
+                st.handle = Some(handle);
+                self.running.store(true, Ordering::Release);
+                true
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 impl Pipeline {
@@ -156,16 +234,15 @@ impl Pipeline {
     /// The dispatcher thread is **not** spawned here. It is created on
     /// the first call to `submit`.
     pub(crate) fn new(config: PipelineConfig) -> Self {
-        Self {
-            config,
-            inner: Mutex::new(None),
-        }
+        Self::with_spawner(config, spawn_os_thread)
     }
 
-    /// Returns the active configuration.
-    #[allow(dead_code)] // used by Builder integration in checkpoint D
-    pub(crate) fn config(&self) -> PipelineConfig {
-        self.config
+    fn with_spawner(config: PipelineConfig, spawn: SpawnFn) -> Self {
+        Self {
+            config,
+            spawn,
+            fleet: OnceLock::new(),
+        }
     }
 
     /// Submits a batch of pre-resolved ops to the group lane and blocks
@@ -184,8 +261,8 @@ impl Pipeline {
     /// # Errors
     ///
     /// - [`BatchError`] wrapping [`crate::Error::ShutdownInProgress`]
-    ///   when the dispatcher cannot be reached (handle is being
-    ///   dropped, or thread spawn failed).
+    ///   when no dispatcher thread can serve the batch (the OS refused
+    ///   to spawn one for this submit) or the dispatcher exited.
     /// - [`BatchError`] wrapping the underlying [`crate::Error`] when
     ///   an op fails.
     pub(crate) fn submit(
@@ -195,9 +272,8 @@ impl Pipeline {
         grouped: bool,
     ) -> std::result::Result<(), BatchError> {
         let shard = pick_shard(&ops, self.config.dispatcher_shards);
-        let job_tx = match self.dispatcher_sender(shard) {
-            Some(tx) => tx,
-            None => return Err(shutdown_err()),
+        let Some(job_tx) = self.dispatcher_sender(shard) else {
+            return Err(shutdown_err());
         };
 
         let (response_tx, response_rx) = bounded(1);
@@ -227,16 +303,15 @@ impl Pipeline {
     /// [`tokio::sync::oneshot`] so the caller `.await`s without
     /// blocking a tokio worker.
     ///
-    /// **Backpressure under saturation.** When the dispatcher's
-    /// bounded queue is full, this method **does not block the
-    /// tokio worker**. Earlier 0.7.0 versions called
-    /// `crossbeam_channel::Sender::send` (a synchronous block-the-
-    /// thread call) which stalled the entire runtime worker until
-    /// space freed up. The 0.8.0 I round-3 fix uses `try_send` in
-    /// a `tokio::task::yield_now`-retry loop so the runtime can
-    /// repurpose the worker while we wait. Backpressure is
-    /// preserved (the calling task is suspended until space
-    /// appears); the runtime is no longer held hostage.
+    /// **Backpressure under saturation.** The job is offered with a
+    /// non-blocking `try_send`. When the dispatcher's bounded queue is
+    /// full, the blocking `send` is moved to tokio's blocking pool
+    /// (`spawn_blocking`) and awaited: the calling task is suspended
+    /// until space appears, the runtime worker stays free, and no CPU
+    /// is spent polling. (Before 1.1.1 this path spun on `try_send` +
+    /// `yield_now`, burning a worker while the queue stayed full.) It
+    /// needs no timer, so it works on runtimes built without
+    /// `enable_time`.
     #[cfg(feature = "async")]
     pub(crate) async fn submit_async(
         &self,
@@ -245,33 +320,31 @@ impl Pipeline {
         grouped: bool,
     ) -> std::result::Result<(), BatchError> {
         let shard = pick_shard(&ops, self.config.dispatcher_shards);
-        let job_tx = match self.dispatcher_sender(shard) {
-            Some(tx) => tx,
-            None => return Err(shutdown_err()),
+        let Some(job_tx) = self.dispatcher_sender(shard) else {
+            return Err(shutdown_err());
         };
 
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let mut job = BatchJob {
+        let job = BatchJob {
             ops,
             snapshot,
             response: crate::pipeline::group::BatchResponse::Async(response_tx),
             grouped,
         };
 
-        // Try-send retry loop: yields to the runtime when the
-        // dispatcher's bounded queue is full, instead of blocking
-        // the worker on a synchronous `send`. Cooperatively
-        // descheduled — backpressure preserved.
-        loop {
-            match job_tx.try_send(job) {
-                Ok(()) => break,
-                Err(crossbeam_channel::TrySendError::Full(returned)) => {
-                    job = returned;
-                    tokio::task::yield_now().await;
-                }
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+        match job_tx.try_send(job) {
+            Ok(()) => {}
+            Err(crossbeam_channel::TrySendError::Full(job)) => {
+                let tx = job_tx.clone();
+                let sent = tokio::task::spawn_blocking(move || tx.send(job).is_ok())
+                    .await
+                    .unwrap_or(false);
+                if !sent {
                     return Err(shutdown_err());
                 }
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                return Err(shutdown_err());
             }
         }
 
@@ -283,31 +356,46 @@ impl Pipeline {
         }
     }
 
-    /// Returns a clone of the requested shard's job sender, spawning
-    /// the dispatcher fleet if it has not been spawned yet.
+    /// Returns the requested shard's job sender, creating the
+    /// dispatcher fleet on first use and (re)spawning the shard's
+    /// thread if none is running.
     ///
     /// 0.9.3: all N shards are spawned together on the first batch
     /// submit. `shard` is the destination shard index (`< N`) chosen
     /// by [`pick_shard`].
     ///
-    /// Returns `None` only when [`Pipeline::drop`] has already
-    /// taken the inner — at that point the pipeline is shutting down
-    /// and any pending submit must fail with `ShutdownInProgress`.
-    fn dispatcher_sender(&self, shard: usize) -> Option<Sender<BatchJob>> {
-        // Tolerate poisoned mutex by recovering the inner — the lock is
-        // never held across user code or potentially-panicking sections,
-        // so poisoning here means the *prior* OS-level thread death
-        // already happened; recovery is correct.
-        let mut guard = match self.inner.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        if guard.is_none() {
-            *guard = Some(spawn_dispatcher_fleet(self.config));
+    /// Returns `None` when no dispatcher thread can be spawned for the
+    /// shard right now.
+    fn dispatcher_sender(&self, shard: usize) -> Option<&Sender<BatchJob>> {
+        let fleet = self.fleet.get_or_init(|| {
+            let fleet: Vec<Shard> = (0..self.config.dispatcher_shards.max(1))
+                .map(|_| Shard::new(self.config))
+                .collect();
+            let n = fleet.len();
+            for (idx, s) in fleet.iter().enumerate() {
+                // A failure here is retried by the submit below and by
+                // every later submit to that shard.
+                let _ = s.ensure_running(self.config, self.spawn, &shard_name(idx, n));
+            }
+            fleet
+        });
+        let s = fleet.get(shard)?;
+        if s.ensure_running(self.config, self.spawn, &shard_name(shard, fleet.len())) {
+            Some(&s.job_tx)
+        } else {
+            None
         }
-        guard
-            .as_ref()
-            .and_then(|fleet| fleet.get(shard).map(|d| d.job_tx.clone()))
+    }
+}
+
+/// Thread name for shard `idx` of `n`. The single-shard default keeps
+/// the original `fsys-dispatcher` name so observability tooling that
+/// pinned to it doesn't break.
+fn shard_name(idx: usize, n: usize) -> String {
+    if n == 1 {
+        "fsys-dispatcher".to_string()
+    } else {
+        format!("fsys-dispatcher-{idx}")
     }
 }
 
@@ -345,97 +433,48 @@ fn shutdown_err() -> BatchError {
     }
 }
 
-/// 0.9.3: spawns the entire dispatcher fleet (N threads) and returns
-/// one `DispatcherInner` per shard. Each shard has its own bounded
-/// MPMC queue, its own shutdown channel, and its own thread.
-///
-/// If the OS refuses to spawn a thread (rare — out of memory or hit
-/// thread limit), the move-closure containing that shard's receivers
-/// is dropped, and any subsequent `submit` to that shard will see
-/// `Disconnected` and return `ShutdownInProgress`. Other shards
-/// remain operable. The rest of the pipeline degrades without
-/// panicking — same observable contract as pre-0.9.3.
-fn spawn_dispatcher_fleet(config: PipelineConfig) -> Vec<DispatcherInner> {
-    let n = config.dispatcher_shards.max(1);
-    let mut fleet = Vec::with_capacity(n);
-    for shard_idx in 0..n {
-        let (job_tx, job_rx) = bounded::<BatchJob>(config.batch_queue_max);
-        let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
-        let (done_tx, done_rx) = bounded::<()>(1);
-
-        // Distinct thread name per shard for diagnostics; the single-
-        // shard default keeps the original `fsys-dispatcher` name so
-        // observability tooling that pinned to it doesn't break.
-        let name = if n == 1 {
-            "fsys-dispatcher".to_string()
-        } else {
-            format!("fsys-dispatcher-{shard_idx}")
-        };
-        let thread = thread::Builder::new()
-            .name(name)
-            .spawn(move || {
-                group::run_dispatcher(config, job_rx, shutdown_rx, done_tx);
-            })
-            .ok();
-
-        fleet.push(DispatcherInner {
-            job_tx,
-            shutdown_tx,
-            done_rx,
-            thread,
-        });
-    }
-    fleet
-}
-
 impl Drop for Pipeline {
     fn drop(&mut self) {
-        // Tolerate poisoned mutex (see dispatcher_sender for rationale).
-        let mut guard = match self.inner.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        let Some(fleet) = guard.take() else {
+        let Some(fleet) = self.fleet.take() else {
             return;
         };
-        // Drop the guard first so dispatchers (if stalled trying to
-        // acquire something — defensive) are not blocked by us.
-        drop(guard);
 
         // Step 1: signal shutdown to every shard in parallel.
         for shard in &fleet {
             let _ = shard.shutdown_tx.send(());
         }
 
-        // Step 2: drop every shard's producer side so each
-        // dispatcher's `select!` sees `Disconnected` after draining.
-        // We move-out the channels we still need (done_rx, thread)
-        // while letting job_tx and shutdown_tx drop here.
-        let mut done_handles: Vec<(Receiver<()>, Option<JoinHandle<()>>)> =
-            Vec::with_capacity(fleet.len());
+        // Step 2: release every producer-side handle we hold (the job
+        // sender, and the receiver clones kept for respawning), then
+        // wait for each running dispatcher's final ack with a 5 s hard
+        // timeout and join it. On timeout the thread's JoinHandle is
+        // forgotten so `Drop` does not block forever; remaining shards
+        // still get joined cleanly.
         for shard in fleet {
-            let DispatcherInner {
+            let Shard {
                 job_tx,
                 shutdown_tx,
                 done_rx,
+                running: _,
                 thread,
             } = shard;
             drop(job_tx);
             drop(shutdown_tx);
-            done_handles.push((done_rx, thread));
-        }
-
-        // Step 3: wait for each shard's final ack with a 5s hard
-        // timeout, then join. If a timeout elapses for any shard,
-        // forget that thread's JoinHandle so `Drop` does not block
-        // forever; remaining shards still get joined cleanly.
-        for (done_rx, thread_slot) in done_handles {
-            let dispatcher_acked = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
-            if let Some(thread) = thread_slot {
-                if dispatcher_acked {
-                    let _ = thread.join();
+            let ShardThread {
+                handle,
+                job_rx,
+                shutdown_rx,
+                done_tx,
+            } = match thread.into_inner() {
+                Ok(t) => t,
+                Err(p) => p.into_inner(),
+            };
+            drop((job_rx, shutdown_rx, done_tx));
+            if let Some(handle) = handle {
+                if done_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+                    let _ = handle.join();
                 } else {
-                    std::mem::forget(thread);
+                    std::mem::forget(handle);
                 }
             }
         }
@@ -564,12 +603,11 @@ mod tests {
         });
         p.submit(Vec::new(), snapshot_default(), false)
             .expect("submit");
-        let guard = p.inner.lock().unwrap();
-        let fleet = guard.as_ref().expect("fleet must exist");
+        let fleet = p.fleet.get().expect("fleet must exist");
         assert_eq!(fleet.len(), 4);
-        // Every shard must have a live thread handle.
+        // Every shard must have a live thread.
         for shard in fleet.iter() {
-            assert!(shard.thread.is_some());
+            assert!(shard.running.load(Ordering::Acquire));
         }
     }
 
@@ -686,8 +724,10 @@ mod tests {
     fn test_pipeline_new_does_not_spawn_dispatcher() {
         // No batch submitted → dispatcher must not exist.
         let p = Pipeline::new(PipelineConfig::DEFAULT);
-        let guard = p.inner.lock().unwrap();
-        assert!(guard.is_none(), "lazy spawn: dispatcher must not exist yet");
+        assert!(
+            p.fleet.get().is_none(),
+            "lazy spawn: dispatcher must not exist yet"
+        );
     }
 
     #[test]
@@ -696,8 +736,10 @@ mod tests {
         // Empty batch is a degenerate case but should still round-trip.
         let r = p.submit(Vec::new(), snapshot_default(), false);
         assert!(r.is_ok(), "empty batch should succeed: {:?}", r);
-        let guard = p.inner.lock().unwrap();
-        assert!(guard.is_some(), "dispatcher must exist after first submit");
+        assert!(
+            p.fleet.get().is_some(),
+            "dispatcher must exist after first submit"
+        );
     }
 
     #[test]
@@ -865,6 +907,98 @@ mod tests {
         )
         .expect("submit");
         assert_eq!(std::fs::read(&path).unwrap(), b"z");
+    }
+
+    static SPAWN_FAILURES_LEFT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn flaky_spawn(
+        name: String,
+        body: Box<dyn FnOnce() + Send + 'static>,
+    ) -> std::io::Result<JoinHandle<()>> {
+        let left = SPAWN_FAILURES_LEFT.load(Ordering::SeqCst);
+        if left > 0 {
+            SPAWN_FAILURES_LEFT.store(left - 1, Ordering::SeqCst);
+            return Err(std::io::Error::other("injected spawn failure"));
+        }
+        spawn_os_thread(name, body)
+    }
+
+    #[test]
+    fn test_pipeline_retries_dispatcher_spawn_after_failure() {
+        // Before 1.1.1 a failed spawn stored `thread: None` for good and
+        // every later batch on that shard failed with
+        // ShutdownInProgress.
+        SPAWN_FAILURES_LEFT.store(2, Ordering::SeqCst);
+        let p = Pipeline::with_spawner(PipelineConfig::DEFAULT, flaky_spawn);
+        // Fleet init attempt + this submit's retry both fail.
+        let err = p
+            .submit(Vec::new(), snapshot_default(), false)
+            .expect_err("no dispatcher while spawning fails");
+        assert!(matches!(*err.source, crate::Error::ShutdownInProgress));
+        // The OS recovers: the next submit spawns the dispatcher.
+        let path = tmp_path("respawn");
+        let _g = scopeguard_remove(path.clone());
+        p.submit(
+            vec![BatchOp::Write {
+                path: path.clone(),
+                data: b"after-respawn".to_vec(),
+            }],
+            snapshot_default(),
+            false,
+        )
+        .expect("submit after the spawn failure clears");
+        assert_eq!(std::fs::read(&path).unwrap(), b"after-respawn");
+        drop(p); // joins the respawned dispatcher
+    }
+
+    #[test]
+    fn test_pipeline_drop_without_running_dispatcher_does_not_block() {
+        let p = Pipeline::with_spawner(PipelineConfig::DEFAULT, |_, _| {
+            Err(std::io::Error::other("never spawns"))
+        });
+        assert!(p.submit(Vec::new(), snapshot_default(), false).is_err());
+        let start = Instant::now();
+        drop(p);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn test_submit_async_waits_for_queue_space_on_current_thread_runtime() {
+        // A one-slot queue saturated by many async submitters on a
+        // single-threaded runtime: every batch must complete.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime without timers");
+        let p = std::sync::Arc::new(Pipeline::new(PipelineConfig {
+            batch_queue_max: 1,
+            ..PipelineConfig::DEFAULT
+        }));
+        let base = tmp_path("async_full");
+        rt.block_on(async {
+            let mut tasks = Vec::new();
+            for i in 0..32u32 {
+                let p = std::sync::Arc::clone(&p);
+                let path = PathBuf::from(format!("{}_{i}", base.display()));
+                tasks.push(tokio::spawn(async move {
+                    p.submit_async(
+                        vec![BatchOp::Write {
+                            path: path.clone(),
+                            data: i.to_le_bytes().to_vec(),
+                        }],
+                        snapshot_default(),
+                        false,
+                    )
+                    .await
+                    .map(|()| path)
+                }));
+            }
+            for t in tasks {
+                let path = t.await.expect("join").expect("async submit");
+                let _ = std::fs::remove_file(path);
+            }
+        });
     }
 
     #[test]
