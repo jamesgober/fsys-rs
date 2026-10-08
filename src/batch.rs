@@ -128,6 +128,10 @@ impl<'a> Batch<'a> {
     }
 
     /// Queues a copy of `src` to `dst`.
+    ///
+    /// The source is read into memory and published at `dst` through
+    /// the atomic-replace sequence, unlike [`Handle::copy`]; see
+    /// [`Handle::copy_batch`].
     pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&mut self, src: P, dst: Q) -> &mut Self {
         self.ops.push(BatchOp::Copy {
             src: src.as_ref().to_path_buf(),

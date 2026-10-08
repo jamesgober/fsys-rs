@@ -139,9 +139,9 @@ impl Handle {
     /// **What "copy" means here:** this is *not* a file-to-file copy
     /// operation (no source path argument). It is a write that
     /// **copies the existing target's metadata onto the new payload
-    /// before swapping it in** — mode, ACLs, ownership, timestamps. If
-    /// you need a real file-to-file copy, use
-    /// [`std::fs::copy`]; fsys does not provide one.
+    /// before swapping it in** — mode, ACLs, ownership, timestamps. For
+    /// a file-to-file copy use [`Handle::copy`] or
+    /// [`Handle::copy_batch`].
     ///
     /// Implemented as **atomic swap only** — the file at `path` is
     /// either entirely-old or entirely-new at every observable point.
@@ -150,11 +150,13 @@ impl Handle {
     /// existing metadata where the OS supports it and the calling
     /// process has permission:
     ///
-    /// - **Unix:** mode is preserved unconditionally; owner/group is
-    ///   preserved only when the process has `CAP_CHOWN` or
-    ///   equivalent (silently skipped otherwise).
-    /// - **Windows:** ACLs are preserved via `GetSecurityInfo` /
-    ///   `SetSecurityInfo`.
+    /// - **Unix:** mode (including setuid / setgid) is preserved
+    ///   unconditionally; owner/group is preserved only when the
+    ///   process has `CAP_CHOWN` or equivalent (silently skipped
+    ///   otherwise).
+    /// - **Windows:** the DACL is preserved via `GetNamedSecurityInfoW`
+    ///   / `SetNamedSecurityInfoW`; owner / group are copied when the
+    ///   process may set them (silently skipped otherwise).
     /// - **All platforms:** `mtime` and `atime` are preserved.
     ///
     /// If `path` does not exist, `write_copy` behaves identically to
@@ -390,13 +392,25 @@ impl Handle {
     // Copy and metadata
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// Copies `src` to `dst` using a platform-optimised copy primitive.
+    /// Copies `src` to `dst` using the platform's fastest copy
+    /// primitive, returning the number of bytes copied.
     ///
-    /// Currently routes through `std::fs::copy`. Linux
-    /// `copy_file_range(2)` and macOS `clonefile(2)` reflink
-    /// optimisations are filed for a future release (deferred from
-    /// the originally-planned `0.5.0` slot; not part of the `0.6.0`
-    /// scope).
+    /// - **Linux:** `std::fs::copy`, which uses `copy_file_range(2)`
+    ///   (block sharing on filesystems that support it, such as btrfs
+    ///   and XFS with reflink) and falls back to `sendfile` / a
+    ///   buffered copy.
+    /// - **macOS:** `clonefile(2)` copy-on-write clone on APFS when
+    ///   `dst` does not exist yet; otherwise `std::fs::copy`.
+    /// - **Windows:** `FSCTL_DUPLICATE_EXTENTS_TO_FILE` block clone on
+    ///   ReFS; otherwise `std::fs::copy` (`CopyFileExW`).
+    ///
+    /// **Not atomic and not flushed.** `dst` is created or overwritten
+    /// in place: a concurrent reader or a crash mid-copy can observe a
+    /// partially written `dst`, and the copied bytes are not fenced.
+    /// Call [`Handle::sync`] on `dst` when the copy must be durable, or
+    /// use [`Handle::copy_batch`], which publishes `dst` through the
+    /// atomic-replace sequence (at the cost of reading the source into
+    /// memory).
     ///
     /// # Errors
     ///

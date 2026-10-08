@@ -1386,9 +1386,17 @@ impl Handle {
 
     /// Copies every `(src, dst)` pair in `batch` through the group lane.
     ///
-    /// Each copy is implemented as `read(src)` followed by an
-    /// atomic-replace `write(dst)`, identical to solo-lane
-    /// [`Handle::copy`] under the atomic-replace pattern.
+    /// Each copy reads the whole of `src` into memory and then
+    /// publishes it at `dst` through the same atomic-replace sequence
+    /// as [`Handle::write`]: `dst` is either entirely its old contents
+    /// or entirely the copy, and is durable when the batch returns.
+    ///
+    /// This differs from solo-lane [`Handle::copy`], which copies in
+    /// place with the platform's fast copy primitive (reflink /
+    /// `copy_file_range` / `clonefile`), is neither atomic nor flushed,
+    /// and does not hold the file in memory. Size a `copy_batch` source
+    /// to what fits in RAM; use [`Handle::copy`] plus [`Handle::sync`]
+    /// for large files.
     ///
     /// # Latency characteristics
     ///

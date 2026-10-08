@@ -128,7 +128,7 @@ passthrough slot (Linux + Windows). It is `Send + Sync` and
 | `append(path, data)` | Append to an existing file (creates if missing). Not individually flushed; call `Handle::sync` for batched durability. |
 | `read(path)` | Read full file contents into a `Vec<u8>`. |
 | `read_at(path, offset, len)` | Read `len` bytes from `offset`. *(Renamed from `read_range` in 0.7.0.)* |
-| `copy(src, dst)` | File-to-file copy. On APFS uses `clonefile(2)` for instant reflink; on ReFS uses `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. Falls back to `std::fs::copy` on unsupported filesystems. *(0.9.6 reflink fast-path.)* |
+| `copy(src, dst)` | File-to-file copy. On APFS uses `clonefile(2)` for instant reflink; on ReFS uses `FSCTL_DUPLICATE_EXTENTS_TO_FILE`; on Linux `copy_file_range(2)`. Falls back to `std::fs::copy` on unsupported filesystems. Not atomic and not flushed: call `sync(dst)` for durability, or use `copy_batch` for an atomic, durable copy (which reads the source into memory). *(0.9.6 reflink fast-path.)* |
 | `delete(path)` | Unlink a file. |
 | `truncate(path, len)` | Truncate file to `len` bytes. |
 | `rename(from, to)` | Rename a file or directory. |
