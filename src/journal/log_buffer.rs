@@ -110,6 +110,7 @@
 #![allow(dead_code)] // some accessors are reserved for benches / future probes
 
 use crate::journal::format;
+use crate::journal::poison::Poison;
 use crate::platform::{round_up, AlignedBuf};
 use crate::{Error, Result};
 use parking_lot::{Condvar, Mutex, MutexGuard};
@@ -455,8 +456,17 @@ impl LogBuffer {
     ///   the frame format's maximum payload (checked before any
     ///   allocation).
     /// - [`Error::Io`] if a flush this call performs fails, or if
-    ///   the scratch allocation for an oversize record fails.
-    pub(crate) fn append_frame(&self, file: &File, payload: &[u8]) -> Result<(u64, u64)> {
+    ///   the scratch allocation for an oversize record fails. A
+    ///   failed flush poisons `poison`.
+    /// - The poison error if `poison` is set, including when it is
+    ///   set by another thread's failed flush while this call
+    ///   waits.
+    pub(crate) fn append_frame(
+        &self,
+        file: &File,
+        payload: &[u8],
+        poison: &Poison,
+    ) -> Result<(u64, u64)> {
         let frame_size = format::frame_len(payload.len())?;
         // Records that can fit in a slot are encoded before taking
         // the lock to keep the critical section short. Larger ones
@@ -469,6 +479,10 @@ impl LogBuffer {
 
         loop {
             let mut state = self.state.lock();
+            // A failed flush is published under this lock before
+            // waiters are notified, so checking here also covers
+            // threads woken from `flush_done`.
+            poison.check()?;
 
             // Path A — fits in the active slot. Fast path; copy
             // and return.
@@ -493,7 +507,7 @@ impl LogBuffer {
                 }
             }
 
-            // Path B — doesn't fit, and a write is in flight. Any
+            // Path B: does not fit, and a write is in flight. Any
             // write we would issue next (rotation or oversize)
             // covers the sector that write may also cover, so it
             // must wait. The flush owner notifies on completion.
@@ -502,7 +516,7 @@ impl LogBuffer {
                 continue;
             }
 
-            // Path C — rotate. After a rotation the active slot
+            // Path C: rotate. After a rotation the active slot
             // holds only the carried partial sector; if the frame
             // fits behind it, rotate and retry. `tail + frame_size
             // <= capacity` together with the Path A miss implies
@@ -510,14 +524,21 @@ impl LogBuffer {
             // advances `active_flush_pos` and the loop terminates.
             let tail = state.active_len % self.sector_size;
             if tail + frame_size <= self.capacity {
-                self.rotate(state, file)?;
+                self.rotate(state, file, poison)?;
                 continue;
             }
 
-            // Path D — the frame cannot fit in a slot behind the
+            // Path D: the frame cannot fit in a slot behind the
             // carried tail. Write it together with the active
             // slot's contents from a scratch buffer.
-            return self.append_oversize(state, file, payload, frame.as_deref(), frame_size);
+            return self.append_oversize(
+                state,
+                file,
+                payload,
+                frame.as_deref(),
+                frame_size,
+                poison,
+            );
         }
     }
 
@@ -529,7 +550,11 @@ impl LogBuffer {
     /// slot at `active_flush_pos`, advances `active_flush_pos` by
     /// the whole sectors written, and carries the trailing
     /// partial sector into the other slot, which becomes active.
-    fn rotate(&self, mut state: MutexGuard<'_, State>, file: &File) -> Result<()> {
+    ///
+    /// A failed write poisons `poison` before waiters are woken:
+    /// the records in the old slot were already acknowledged and
+    /// are now lost, so no later append or sync may succeed.
+    fn rotate(&self, mut state: MutexGuard<'_, State>, file: &File, poison: &Poison) -> Result<()> {
         debug_assert!(state.flushing.is_none());
         let old_idx = state.active_idx;
         let old_len = state.active_len;
@@ -582,6 +607,9 @@ impl LogBuffer {
             let slice = (*self.bufs[old_idx as usize].get()).as_mut_slice();
             slice[..old_len].fill(0);
         }
+        if let Err(e) = &flush_result {
+            poison.set(e);
+        }
         state.flushing = None;
         let _ = self.flush_done.notify_all();
         drop(state);
@@ -599,7 +627,9 @@ impl LogBuffer {
     /// dropped, the active slot is re-seated at the last sector
     /// boundary of the record and primed with its partial
     /// trailing sector, so concurrent appenders continue right
-    /// after the record while the write runs.
+    /// after the record while the write runs. A failed write
+    /// poisons `poison` (it also carried earlier acknowledged
+    /// records from the active slot).
     fn append_oversize(
         &self,
         mut state: MutexGuard<'_, State>,
@@ -607,6 +637,7 @@ impl LogBuffer {
         payload: &[u8],
         encoded: Option<&[u8]>,
         frame_size: usize,
+        poison: &Poison,
     ) -> Result<(u64, u64)> {
         debug_assert!(state.flushing.is_none());
         let ss = self.sector_size;
@@ -653,6 +684,9 @@ impl LogBuffer {
         let write_result = crate::platform::write_at_direct(file, start_pos, scratch.as_slice());
 
         let mut state = self.state.lock();
+        if let Err(e) = &write_result {
+            poison.set(e);
+        }
         state.flushing = None;
         let _ = self.flush_done.notify_all();
         drop(state);
@@ -679,7 +713,13 @@ impl LogBuffer {
     /// partial-flush syscall. This is the deliberate sync point —
     /// callers asked for "make this durable now" and we honour
     /// that by serialising. Other appenders wait briefly.
-    pub(crate) fn flush_partial(&self, file: &File) -> Result<u64> {
+    ///
+    /// # Errors
+    ///
+    /// - The poison error if `poison` is set (including by an
+    ///   in-flight flush this call waited for).
+    /// - [`Error::Io`] if the write fails; `poison` is set.
+    pub(crate) fn flush_partial(&self, file: &File, poison: &Poison) -> Result<u64> {
         let mut state = self.state.lock();
 
         // Wait for any in-flight write to finish. We need a clean
@@ -688,6 +728,7 @@ impl LogBuffer {
         while state.flushing.is_some() {
             self.flush_done.wait(&mut state);
         }
+        poison.check()?;
 
         let end = state.active_flush_pos + state.active_len as u64;
         if state.active_len == 0 {
@@ -706,11 +747,14 @@ impl LogBuffer {
         // 0.9.6 — partial flushes route through the
         // iouring-aware helper (`flush_slot_to_disk`) which
         // submits via `IORING_OP_WRITE_FIXED` when available.
-        unsafe {
+        let result = unsafe {
             let slice = (*self.bufs[active_idx].get()).as_slice();
-            self.flush_slot_to_disk(file, active_idx as u8, &slice[..aligned], active_flush_pos)?;
+            self.flush_slot_to_disk(file, active_idx as u8, &slice[..aligned], active_flush_pos)
+        };
+        if let Err(e) = &result {
+            poison.set(e);
         }
-        Ok(end)
+        result.map(|()| end)
     }
 
     /// 0.9.6 — Centralised flush dispatcher. Routes via
@@ -813,6 +857,10 @@ mod tests {
 
     static C: AtomicU32 = AtomicU32::new(0);
 
+    /// Shared never-poisoned state for tests that do not inject
+    /// failures. Tests that poison use their own instance.
+    static NO_POISON: Poison = Poison::new();
+
     fn tmp_path(tag: &str) -> PathBuf {
         let n = C.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("fsys_logbuf_{}_{}_{tag}", std::process::id(), n))
@@ -866,7 +914,7 @@ mod tests {
     fn append_frame_fits_in_active_slot() {
         let (path, file, _g) = make_file();
         let buf = LogBuffer::new(4096, 512, 0).unwrap();
-        let (start, end) = buf.append_frame(&file, b"hello").unwrap();
+        let (start, end) = buf.append_frame(&file, b"hello", &NO_POISON).unwrap();
         assert_eq!(start, 0);
         assert_eq!(end, 5 + format::FRAME_OVERHEAD as u64);
         assert_eq!(buf.next_lsn(), end);
@@ -883,12 +931,12 @@ mod tests {
         // 4096 / 112 = 36 records fit; the 37th triggers rotation.
         let payload = vec![0xABu8; 100];
         for _ in 0..36 {
-            let _ = buf.append_frame(&file, &payload).unwrap();
+            let _ = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
         }
         // Before rotation — nothing on disk yet.
         assert_eq!(buf.flushed_through(), 0);
         // 37th append triggers rotation; old slot (slot 0) gets flushed.
-        let (start, _) = buf.append_frame(&file, &payload).unwrap();
+        let (start, _) = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
         // The 37th record starts right after the 36th: no gap.
         assert_eq!(start, 36 * 112);
         // The rotation wrote round_up(4032, 512) = 4096 bytes and
@@ -906,8 +954,8 @@ mod tests {
     fn flush_partial_writes_records_plus_zero_pad() {
         let (path, file, _g) = make_file();
         let buf = LogBuffer::new(4096, 512, 0).unwrap();
-        let _ = buf.append_frame(&file, b"x").unwrap(); // 13-byte frame
-        let frontier = buf.flush_partial(&file).unwrap();
+        let _ = buf.append_frame(&file, b"x", &NO_POISON).unwrap(); // 13-byte frame
+        let frontier = buf.flush_partial(&file, &NO_POISON).unwrap();
         assert_eq!(frontier, 13);
         // Aligned-up to next sector = 512 bytes written.
         let mut f = OpenOptions::new().read(true).open(&path).unwrap();
@@ -926,7 +974,7 @@ mod tests {
         let buf = LogBuffer::new(4096, 512, 0).unwrap();
         // 5000-byte payload → 5012-byte frame, exceeds 4096-byte slot.
         let payload = vec![0xCDu8; 5000];
-        let (start, end) = buf.append_frame(&file, &payload).unwrap();
+        let (start, end) = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
         assert_eq!(start, 0);
         assert_eq!(end, 5012);
         // active_flush_pos lands at the last sector boundary ≤ end:
@@ -951,11 +999,14 @@ mod tests {
         let mut expected_start = 0u64;
         for i in 0..2000u32 {
             let payload = [(i % 251) as u8];
-            let (start, end) = buf.append_frame(&file, &payload).unwrap();
+            let (start, end) = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
             assert_eq!(start, expected_start, "record {i} is not contiguous");
             expected_start = end;
         }
-        assert_eq!(buf.flush_partial(&file).unwrap(), expected_start);
+        assert_eq!(
+            buf.flush_partial(&file, &NO_POISON).unwrap(),
+            expected_start
+        );
         let records = read_all(&path);
         assert_eq!(records.len(), 2000);
         for (i, (lsn, payload)) in records.iter().enumerate() {
@@ -971,12 +1022,12 @@ mod tests {
         // ~3 KiB zero gap here.
         let (path, file, _g) = make_file();
         let buf = LogBuffer::new(4096, 512, 0).unwrap();
-        let (_, e1) = buf.append_frame(&file, &[1u8; 1000]).unwrap();
-        let (s2, e2) = buf.append_frame(&file, &[2u8; 3500]).unwrap();
-        let (s3, e3) = buf.append_frame(&file, b"after").unwrap();
+        let (_, e1) = buf.append_frame(&file, &[1u8; 1000], &NO_POISON).unwrap();
+        let (s2, e2) = buf.append_frame(&file, &[2u8; 3500], &NO_POISON).unwrap();
+        let (s3, e3) = buf.append_frame(&file, b"after", &NO_POISON).unwrap();
         assert_eq!(s2, e1);
         assert_eq!(s3, e2);
-        assert_eq!(buf.flush_partial(&file).unwrap(), e3);
+        assert_eq!(buf.flush_partial(&file, &NO_POISON).unwrap(), e3);
         let payloads: Vec<Vec<u8>> = read_all(&path).into_iter().map(|(_, p)| p).collect();
         assert_eq!(
             payloads,
@@ -991,11 +1042,11 @@ mod tests {
         // prefix so nothing is lost or overlapped.
         let (path, file, _g) = make_file();
         let buf = LogBuffer::new(4096, 512, 0).unwrap();
-        let (_, e1) = buf.append_frame(&file, &[1u8; 100]).unwrap();
-        let (s2, e2) = buf.append_frame(&file, &[2u8; 6000]).unwrap();
-        let (s3, e3) = buf.append_frame(&file, &[3u8; 10]).unwrap();
+        let (_, e1) = buf.append_frame(&file, &[1u8; 100], &NO_POISON).unwrap();
+        let (s2, e2) = buf.append_frame(&file, &[2u8; 6000], &NO_POISON).unwrap();
+        let (s3, e3) = buf.append_frame(&file, &[3u8; 10], &NO_POISON).unwrap();
         assert_eq!((s2, s3), (e1, e2));
-        assert_eq!(buf.flush_partial(&file).unwrap(), e3);
+        assert_eq!(buf.flush_partial(&file, &NO_POISON).unwrap(), e3);
         let payloads: Vec<Vec<u8>> = read_all(&path).into_iter().map(|(_, p)| p).collect();
         assert_eq!(
             payloads,
@@ -1039,7 +1090,7 @@ mod tests {
                         let len = if t == 0 && i % 4 == 0 { 6000 } else { 20 };
                         let mut payload = vec![t; len];
                         payload[..4].copy_from_slice(&i.to_le_bytes());
-                        let (s, e) = buf.append_frame(&file, &payload).unwrap();
+                        let (s, e) = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
                         out.push((s, e, payload));
                     }
                     out
@@ -1049,7 +1100,7 @@ mod tests {
                 .into_iter()
                 .flat_map(|h| h.join().unwrap())
                 .collect();
-            let end = buf.flush_partial(&file).unwrap();
+            let end = buf.flush_partial(&file, &NO_POISON).unwrap();
             all.sort_by_key(|r| r.0);
             let mut cursor = 0u64;
             for (s, e, _) in &all {
@@ -1083,7 +1134,7 @@ mod tests {
         let payload = [0xAAu8; 4];
         // 4 rotations: 32 * 4 + 1 = 129 appends.
         for _ in 0..(32 * 4 + 1) {
-            let _ = buf.append_frame(&file, &payload).unwrap();
+            let _ = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
         }
         // After 4 rotations the active slot's flush_pos = 4*512 = 2048.
         assert_eq!(buf.flushed_through(), 2048);
@@ -1112,7 +1163,9 @@ mod tests {
             let payload = payload.clone();
             handles.push(std::thread::spawn(move || {
                 for _ in 0..per_thread {
-                    let _ = buf.append_frame(&file, &payload).expect("append");
+                    let _ = buf
+                        .append_frame(&file, &payload, &NO_POISON)
+                        .expect("append");
                 }
             }));
         }
@@ -1120,7 +1173,7 @@ mod tests {
             h.join().expect("join");
         }
         // Final sync to push the active slot's tail to disk.
-        let end = buf.flush_partial(&file).expect("partial flush");
+        let end = buf.flush_partial(&file, &NO_POISON).expect("partial flush");
 
         // LSNs are contiguous, so the frontier is exactly the sum
         // of the frame sizes: 8 * 200 * 36 = 57 600 bytes.
@@ -1143,16 +1196,16 @@ mod tests {
         // Fill slot 0 (32 frames of 16 bytes each).
         let payload = [0xCCu8; 4];
         for _ in 0..32 {
-            let _ = buf.append_frame(&file, &payload).unwrap();
+            let _ = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
         }
         // 33rd append triggers rotation: slot 0 → flush, slot 1
         // becomes active with the 33rd frame.
-        let _ = buf.append_frame(&file, &payload).unwrap();
+        let _ = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
         // Now flush_partial of the active (slot 1, with one
         // frame in it). After this returns, the file holds
         // slot 0's full content (512 bytes) followed by slot 1's
         // partial content (16 bytes + zero pad to 512).
-        assert_eq!(buf.flush_partial(&file).unwrap(), 33 * 16);
+        assert_eq!(buf.flush_partial(&file, &NO_POISON).unwrap(), 33 * 16);
         // 512 (slot 0 rotation flush) + 512 (slot 1 partial pad) = 1024.
         assert_eq!(file_len(&path), 1024);
         assert_eq!(read_all(&path).len(), 33);
@@ -1168,7 +1221,7 @@ mod tests {
         let payload = vec![0xDDu8; 100]; // 112-byte frames
         let n = 36 * 5 + 1;
         for _ in 0..n {
-            let _ = buf.append_frame(&file, &payload).unwrap();
+            let _ = buf.append_frame(&file, &payload, &NO_POISON).unwrap();
         }
         // LSNs are contiguous across every rotation.
         assert_eq!(buf.next_lsn(), n as u64 * 112);
@@ -1176,7 +1229,10 @@ mod tests {
         // the start of the active slot's carried tail.
         assert_eq!(buf.flushed_through() % 512, 0);
         assert!(buf.flushed_through() <= buf.next_lsn());
-        assert_eq!(buf.flush_partial(&file).unwrap(), n as u64 * 112);
+        assert_eq!(
+            buf.flush_partial(&file, &NO_POISON).unwrap(),
+            n as u64 * 112
+        );
         assert_eq!(read_all(&path).len(), n);
     }
 }

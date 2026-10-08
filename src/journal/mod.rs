@@ -61,6 +61,7 @@ pub mod backend;
 pub(crate) mod format;
 pub(crate) mod log_buffer;
 pub mod options;
+mod poison;
 pub mod reader;
 
 pub use backend::{JournalBackend, JournalBackendHealth, JournalBackendInfo, JournalBackendKind};
@@ -71,6 +72,7 @@ use crate::{Error, Result};
 use crossbeam_utils::CachePadded;
 use log_buffer::LogBuffer;
 use parking_lot::{Condvar, Mutex as PlMutex};
+use poison::Poison;
 use std::fs::{File, OpenOptions};
 use std::io::Seek;
 use std::path::Path;
@@ -280,6 +282,11 @@ pub struct JournalHandle {
     /// 0.9.7 H-2 — private (not `pub(crate)`): only consulted
     /// inside `do_sync_locked` / `sync_through` in this module.
     sync_mode: options::SyncMode,
+    /// 1.1.1: sticky failure state. Set by the first failed
+    /// write, flush or fsync; every later append and every
+    /// `sync_through` whose target is not already durable then
+    /// returns an error. See the `poison` module docs.
+    poison: Poison,
 }
 
 impl JournalHandle {
@@ -367,6 +374,7 @@ impl JournalHandle {
             log_buffer: None,
             observer: None,
             sync_mode: options.sync_mode,
+            poison: Poison::new(),
         })
     }
 
@@ -459,6 +467,7 @@ impl JournalHandle {
             log_buffer,
             observer: None,
             sync_mode: options.sync_mode,
+            poison: Poison::new(),
         })
     }
 
@@ -511,9 +520,14 @@ impl JournalHandle {
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] on the underlying write failure.
+    /// - [`Error::Io`] on the underlying write failure. The
+    ///   failure poisons the journal (see [`Self::sync_through`]).
     /// - [`Error::Io`] with `InvalidInput` if the record exceeds
-    ///   `FRAME_MAX_PAYLOAD` (256 MiB).
+    ///   `FRAME_MAX_PAYLOAD` (256 MiB). This does not poison the
+    ///   journal; nothing was reserved or written.
+    /// - [`Error::Io`] describing the original failure if the
+    ///   journal was poisoned by an earlier failed write, flush or
+    ///   fsync.
     ///
     /// # Examples
     ///
@@ -568,6 +582,9 @@ impl JournalHandle {
     }
 
     fn append_inner(&self, record: &[u8]) -> Result<Lsn> {
+        // A poisoned journal accepts nothing: an earlier failure may
+        // have left a hole that this record would sit behind.
+        self.poison.check()?;
         if let Some(log_buffer) = &self.log_buffer {
             // Direct-IO log-buffer path.
             // 0.9.5: the LogBuffer is now self-locking
@@ -577,7 +594,7 @@ impl JournalHandle {
             // syscall happens unlocked — appenders into the new
             // active slot proceed concurrently with the flush
             // of the dormant slot.
-            let (_start, end) = log_buffer.append_frame(&self.file, record)?;
+            let (_start, end) = log_buffer.append_frame(&self.file, record, &self.poison)?;
             self.next_lsn.store(end, Ordering::Release);
             #[cfg(feature = "tracing")]
             tracing::trace!(end_lsn = end, "direct append complete");
@@ -672,13 +689,25 @@ impl JournalHandle {
             let stack_slice: &mut [u8] =
                 unsafe { std::slice::from_raw_parts_mut(stack.as_mut_ptr().cast::<u8>(), total) };
             let _ = format::encode_frame_into(record, stack_slice)?;
-            crate::platform::write_at(&self.file, start, stack_slice)?;
+            self.write_reserved(start, stack_slice)?;
         } else {
             let frame = format::encode_frame_owned(record)?;
-            crate::platform::write_at(&self.file, start, &frame)?;
+            self.write_reserved(start, &frame)?;
         }
 
         Ok(Lsn(end))
+    }
+
+    /// Writes `bytes` at the reserved offset `start` (buffered
+    /// mode). A failure leaves a hole at an LSN range later
+    /// appends have already been handed past, so it poisons the
+    /// journal before the error is returned.
+    fn write_reserved(&self, start: u64, bytes: &[u8]) -> Result<()> {
+        let result = crate::platform::write_at(&self.file, start, bytes);
+        if let Err(e) = &result {
+            self.poison.set(e);
+        }
+        result
     }
 
     /// Appends `records` to the journal as a single batched
@@ -721,7 +750,10 @@ impl JournalHandle {
     /// - [`Error::Io`] if any record exceeds the journal's
     ///   maximum payload size (256 MiB), if the total batch
     ///   size overflows `usize`, or if the underlying write
-    ///   fails.
+    ///   fails. Only the write failure poisons the journal.
+    /// - [`Error::Io`] describing the original failure if the
+    ///   journal was poisoned by an earlier failed write, flush or
+    ///   fsync.
     ///
     /// # Examples
     ///
@@ -770,6 +802,7 @@ impl JournalHandle {
     }
 
     fn append_batch_inner(&self, records: &[&[u8]]) -> Result<Lsn> {
+        self.poison.check()?;
         if records.is_empty() {
             return Ok(Lsn(self.next_lsn.load(Ordering::Acquire)));
         }
@@ -827,7 +860,8 @@ impl JournalHandle {
                 None => {
                     let mut last: u64 = self.next_lsn.load(Ordering::Acquire);
                     for record in records {
-                        let (_start, end) = log_buffer.append_frame(&self.file, record)?;
+                        let (_start, end) =
+                            log_buffer.append_frame(&self.file, record, &self.poison)?;
                         last = end;
                     }
                     last
@@ -891,7 +925,7 @@ impl JournalHandle {
         }
         debug_assert_eq!(cursor, total);
 
-        crate::platform::write_at(&self.file, start, &buf)?;
+        self.write_reserved(start, &buf)?;
 
         #[cfg(feature = "tracing")]
         tracing::trace!(end_lsn = end, "buffered append_batch complete");
@@ -916,6 +950,20 @@ impl JournalHandle {
     /// the state mutex — a ~5× reduction in lock-hold time under
     /// 100+ concurrent followers.
     ///
+    /// # Failure handling (1.1.1)
+    ///
+    /// A failed write, flush or fsync poisons the journal. After
+    /// that, `sync_through` returns an error for every target that
+    /// was not already durable before the failure, and
+    /// [`Self::append`] / [`Self::append_batch`] return an error for
+    /// every call. The journal does not retry a failed fsync: on
+    /// Linux the kernel may drop the dirty pages behind a failed
+    /// fsync and report success for a retry, so a retry would
+    /// claim durability for data that is gone. Reopen the journal
+    /// to recover; the reopen scan stops at the first hole or torn
+    /// frame. Before 1.1.1 followers retried the fsync themselves
+    /// and could report success after such a failure.
+    ///
     /// # Edge cases
     ///
     /// - [`Lsn::ZERO`] is the start-of-journal sentinel;
@@ -932,6 +980,9 @@ impl JournalHandle {
     ///   platform-equivalent syscall fails.
     /// - [`Error::Io`] with the inner error reflecting any
     ///   buffer-flush failure on Direct-IO journals.
+    /// - [`Error::Io`] describing the original failure if the
+    ///   journal was poisoned by an earlier failed write, flush or
+    ///   fsync and `lsn` is above the durable frontier.
     ///
     /// # Examples
     ///
@@ -966,7 +1017,9 @@ impl JournalHandle {
 
         // Fast path: the durable frontier already covers our
         // target. The atomic load is unconditionally cheaper
-        // than acquiring the group-commit state mutex.
+        // than acquiring the group-commit state mutex. A target
+        // that became durable before a later failure stays
+        // durable, so this path ignores the poison flag.
         if self.synced_lsn.load(Ordering::Acquire) >= lsn.0 {
             #[cfg(feature = "tracing")]
             tracing::trace!(
@@ -1000,6 +1053,11 @@ impl JournalHandle {
                     );
                     return Ok(());
                 }
+                // A failed leader poisons the journal before it
+                // clears `in_flight` under this lock, so a woken
+                // follower sees the failure here instead of
+                // retrying the fsync itself.
+                self.poison.check()?;
                 if !state.in_flight {
                     state.in_flight = true;
                     leader_start = Instant::now();
@@ -1035,17 +1093,17 @@ impl JournalHandle {
                     .fetch_sub(1, Ordering::AcqRel);
                 // Atomic-load `synced_lsn` (the public atomic
                 // mirror of `state.committed_lsn`, updated by the
-                // leader on commit at line ~997 with `Release`).
-                // If our target is covered, return without ever
-                // re-acquiring the state lock — this is the wake-
-                // stampede fix.
+                // leader on commit with `Release`). If our target
+                // is covered, return without ever re-acquiring
+                // the state lock — this is the wake-stampede fix.
                 if self.synced_lsn.load(Ordering::Acquire) >= lsn.0 {
                     return Ok(());
                 }
                 // Slow path: target not yet covered (a later
                 // append landed after the leader captured its
-                // frontier). Re-acquire the lock and loop to
-                // possibly become the next cycle's leader.
+                // frontier, or the leader failed). Re-acquire the
+                // lock and loop to possibly become the next
+                // cycle's leader.
                 state = self.group_commit.state.lock();
             }
 
@@ -1078,14 +1136,63 @@ impl JournalHandle {
             drop(state);
         }
 
+        // From here on we own `in_flight`. The guard clears it and
+        // wakes followers on every exit path, including an early
+        // `?` return and a panic, so a failed flush can never leave
+        // later callers parked forever (pre-1.1.1, a Direct-IO
+        // flush failure returned before the clear and deadlocked
+        // every later `sync_through`).
+        let mut leader = LeaderGuard {
+            group_commit: &self.group_commit,
+            synced_lsn: &self.synced_lsn,
+            frontier: None,
+        };
+        let outcome = self.flush_and_sync();
+        if let Ok(frontier) = outcome {
+            leader.frontier = Some(frontier);
+        }
+        // 0.9.7 H-16 — advisory snapshot of currently parked
+        // followers for the observer hook.
+        let followers_at_commit = self.group_commit.pending_followers.load(Ordering::Acquire);
+        drop(leader);
+
+        #[cfg(feature = "tracing")]
+        if let Ok(frontier) = outcome {
+            tracing::debug!(new_synced_lsn = frontier, "group-commit fsync completed");
+        }
+
+        // 0.9.2 observer hook — leader-only. Followers returned
+        // early at the `committed_lsn >= lsn.0` check above
+        // without ever reaching this point.
+        if let Some(obs) = self.observer.as_ref() {
+            obs.on_journal_sync(crate::observer::JournalSyncEvent {
+                durable_lsn: match &outcome {
+                    Ok(frontier) => *frontier,
+                    Err(_) => self.synced_lsn.load(Ordering::Acquire),
+                },
+                duration: leader_start.elapsed(),
+                followers_at_commit,
+                error: outcome.is_err(),
+            });
+        }
+
+        outcome.map(|_| ())
+    }
+
+    /// Leader body of [`Self::sync_through`]: pushes buffered
+    /// Direct-IO bytes to the file, then runs the configured
+    /// durability primitive. Returns the frontier the fsync made
+    /// durable. Any failure poisons the journal.
+    fn flush_and_sync(&self) -> Result<u64> {
         // Direct-IO mode: flush any partially buffered records
         // through a sector-aligned positioned write *before* the
         // fsync. 0.9.5: the LogBuffer self-locks and waits for
         // any in-flight dormant-slot flush before issuing the
         // partial flush, so this call is consistent with the
-        // group-commit captured-frontier invariant.
+        // group-commit captured-frontier invariant. A failed
+        // flush poisons the journal inside `flush_partial`.
         if let Some(log_buffer) = &self.log_buffer {
-            let _ = log_buffer.flush_partial(&self.file)?;
+            let _ = log_buffer.flush_partial(&self.file, &self.poison)?;
         }
 
         // Capture the append frontier. We commit only up
@@ -1097,6 +1204,11 @@ impl JournalHandle {
         // which may include later appends).
         let frontier = self.next_lsn.load(Ordering::Acquire);
 
+        // A buffered append that failed after this leader was
+        // elected left a hole below `frontier`; do not fsync and
+        // publish past it.
+        self.poison.check()?;
+
         // The actual fsync — outside both the group-commit
         // state lock and the log-buffer lock. Concurrent
         // appenders may make progress during the call; their
@@ -1104,63 +1216,22 @@ impl JournalHandle {
         // kernel scheduling.
         //
         // 0.9.4: route through `sync_mode`. `Full` (default)
-        // keeps the pre-0.9.4 behaviour bit-for-bit
-        // (`file.sync_data()`); `Barrier` calls
-        // `platform::sync_barrier` which is cheaper on macOS
-        // with PLP, identical on Linux (fdatasync is already
-        // barrier-grade), no-op on Windows. See `SyncMode`
-        // docs for the safety contract.
+        // calls `file.sync_data()`; `Barrier` calls
+        // `platform::sync_barrier`. See `SyncMode` docs for the
+        // per-platform primitives and the safety contract.
         let sync_result = match self.sync_mode {
             options::SyncMode::Full => self.file.sync_data().map_err(Error::Io),
             options::SyncMode::Barrier => crate::platform::sync_barrier(&self.file),
         };
-
-        // Re-acquire state to publish the result. If the fsync
-        // failed, we still clear `in_flight` and notify
-        // followers — they will inherit the error via their
-        // own retry on the next sync_through call. We do NOT
-        // advance `committed_lsn` on failure, so followers
-        // re-evaluate and may become the next-cycle leader
-        // (where they re-attempt the fsync themselves).
-        let followers_at_commit;
-        {
-            let mut state = self.group_commit.state.lock();
-            if sync_result.is_ok() && frontier > state.committed_lsn {
-                state.committed_lsn = frontier;
-                self.synced_lsn.store(frontier, Ordering::Release);
-            }
-            // 0.9.7 H-16 — atomic-load advisory snapshot of
-            // currently parked followers (for the observer
-            // hook). Reading inside the lock window gives a
-            // stable value for the duration of `notify_all`.
-            followers_at_commit = self.group_commit.pending_followers.load(Ordering::Acquire);
-            state.in_flight = false;
-            // `notify_all` returns the count of woken threads;
-            // we don't care for backpressure purposes — every
-            // parked follower needs to re-evaluate its target.
-            let _ = self.group_commit.cv_followers.notify_all();
+        // fsyncgate: after a failed fsync the kernel may have
+        // dropped the dirty pages, and a retry can report success
+        // without writing them. Poison instead of letting a later
+        // leader retry.
+        if let Err(e) = &sync_result {
+            self.poison.set(e);
         }
-
-        #[cfg(feature = "tracing")]
-        if sync_result.is_ok() {
-            tracing::debug!(new_synced_lsn = frontier, "group-commit fsync completed");
-        }
-
-        // 0.9.2 observer hook — leader-only. Followers returned
-        // early at the `committed_lsn >= lsn.0` check above
-        // without ever reaching this point.
-        if let Some(obs) = self.observer.as_ref() {
-            obs.on_journal_sync(crate::observer::JournalSyncEvent {
-                durable_lsn: frontier,
-                duration: leader_start.elapsed(),
-                followers_at_commit,
-                error: sync_result.is_err(),
-            });
-        }
-
-        sync_result
+        sync_result.map(|()| frontier)
     }
-
     /// Returns the highest LSN currently known to be on stable
     /// storage.
     ///
@@ -1374,9 +1445,17 @@ impl Drop for JournalHandle {
         // close — flush whatever's in the log buffer so the
         // partial trailing sector lands on disk before we lose
         // the writer's view of it.
+        // A poisoned journal must not write again: the flush could
+        // land bytes after a hole, and a retried fsync can report
+        // success for pages a failed one dropped.
+        if self.poison.is_set() {
+            return;
+        }
         if let Some(log_buffer) = &self.log_buffer {
             // 0.9.5: self-locking LogBuffer; no outer mutex.
-            let _ = log_buffer.flush_partial(&self.file);
+            // Errors are deliberately ignored: Drop cannot report
+            // them, and `close()` is the error-reporting path.
+            let _ = log_buffer.flush_partial(&self.file, &self.poison);
             let _ = self.file.sync_data();
         }
     }
@@ -1470,6 +1549,35 @@ impl GroupCommit {
             max_batch,
             pending_followers: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+}
+
+/// Owns the group-commit leader role (`in_flight == true`) for the
+/// duration of one [`JournalHandle::sync_through`] leader cycle.
+///
+/// On drop it publishes `frontier` (when the cycle succeeded),
+/// clears `in_flight` and wakes every parked follower, whatever
+/// path the leader leaves by.
+struct LeaderGuard<'a> {
+    group_commit: &'a GroupCommit,
+    synced_lsn: &'a AtomicU64,
+    /// Durable frontier to publish; `None` when the cycle failed.
+    frontier: Option<u64>,
+}
+
+impl Drop for LeaderGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.group_commit.state.lock();
+        if let Some(frontier) = self.frontier {
+            if frontier > state.committed_lsn {
+                state.committed_lsn = frontier;
+                self.synced_lsn.store(frontier, Ordering::Release);
+            }
+        }
+        state.in_flight = false;
+        // Every parked follower must re-evaluate its target; the
+        // woken count is irrelevant.
+        let _ = self.group_commit.cv_followers.notify_all();
     }
 }
 
@@ -2730,5 +2838,276 @@ mod tests {
             h.join().expect("join");
         }
         assert!(j.synced_lsn() >= *lsns.last().unwrap());
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 1.1.1: sticky poison after write / flush / fsync failure
+    //
+    // Failures are injected by swapping the journal's file handle
+    // for one the OS rejects: a read-only handle fails every
+    // positioned write on every platform (EBADF / ACCESS_DENIED),
+    // and fails FlushFileBuffers on Windows. On Unix an fsync
+    // failure is injected with a writable `/dev/null` handle,
+    // whose `fdatasync` returns EINVAL.
+    // ─────────────────────────────────────────────────────────
+
+    fn read_only(path: &Path) -> File {
+        File::open(path).expect("read-only handle")
+    }
+
+    fn writable(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("writable handle")
+    }
+
+    /// A handle whose `sync_data` fails, or `None` on a platform
+    /// with no known way to build one (the caller then skips).
+    /// Windows and Linux always provide one.
+    fn failing_sync_handle(path: &Path) -> Option<File> {
+        #[cfg(windows)]
+        {
+            // FlushFileBuffers needs GENERIC_WRITE; writes through
+            // this handle fail too, so callers only sync with it.
+            let f = read_only(path);
+            assert!(
+                f.sync_data().is_err(),
+                "read-only FlushFileBuffers must fail"
+            );
+            Some(f)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = path;
+            let f = OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .expect("open /dev/null");
+            assert!(f.sync_data().is_err(), "fdatasync on /dev/null must fail");
+            Some(f)
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            let _ = path;
+            let f = OpenOptions::new().write(true).open("/dev/null").ok()?;
+            f.sync_data().is_err().then_some(f)
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
+    fn assert_poisoned<T: std::fmt::Debug>(r: Result<T>) {
+        match r {
+            Err(Error::Io(e)) => assert!(
+                e.to_string().contains("poisoned"),
+                "expected the poison error, got {e}"
+            ),
+            other => panic!("expected the poison error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_buffered_append_write_failure_poisons_journal() {
+        let path = tmp_path("poison_write");
+        let _g = Cleanup(path.clone());
+        let mut j = JournalHandle::open(&path).expect("open");
+        let durable = j.append(b"durable").expect("append");
+        j.sync_through(durable).expect("sync");
+        let acked = j.append(b"acked-not-synced").expect("append");
+
+        j.file = read_only(&path);
+        assert!(
+            j.append(b"fails").is_err(),
+            "write through read-only handle"
+        );
+
+        // Even with a healthy handle back, the journal stays
+        // poisoned: the failed append left a hole at its LSN.
+        j.file = writable(&path);
+        assert_poisoned(j.append(b"later"));
+        assert_poisoned(j.append_batch(&[b"batch" as &[u8]]));
+        assert_poisoned(j.sync_through(acked));
+        // A target that was durable before the failure is still
+        // reported durable.
+        j.sync_through(durable).expect("already durable");
+    }
+
+    #[test]
+    fn test_buffered_batch_write_failure_poisons_journal() {
+        let path = tmp_path("poison_batch");
+        let _g = Cleanup(path.clone());
+        let mut j = JournalHandle::open(&path).expect("open");
+        j.file = read_only(&path);
+        assert!(j.append_batch(&[b"a" as &[u8], b"b"]).is_err());
+        j.file = writable(&path);
+        assert_poisoned(j.append(b"later"));
+    }
+
+    #[test]
+    fn test_sync_failure_poisons_and_is_not_retried() {
+        // fsyncgate: a failed fsync must not be retried by a later
+        // caller, because the retry can succeed without the pages
+        // the failed call dropped.
+        let path = tmp_path("poison_fsync");
+        let _g = Cleanup(path.clone());
+        let mut j = JournalHandle::open_with_options(
+            &path,
+            JournalOptions::new().group_commit_window(None),
+        )
+        .expect("open");
+        let lsn = j.append(b"record").expect("append");
+        let Some(bad) = failing_sync_handle(&path) else {
+            return;
+        };
+        j.file = bad;
+        assert!(j.sync_through(lsn).is_err(), "fsync through bad handle");
+        j.file = writable(&path);
+        assert_poisoned(j.sync_through(lsn));
+        assert_poisoned(j.append(b"after"));
+        assert!(j.synced_lsn() < lsn, "failed sync must not publish");
+    }
+
+    #[test]
+    fn test_sync_failure_followers_get_error_not_success() {
+        // Followers parked behind a leader whose fsync fails must
+        // not report success and must not hang.
+        use std::sync::{Arc, Barrier};
+        let path = tmp_path("poison_followers");
+        let _g = Cleanup(path.clone());
+        let mut j = JournalHandle::open_with_options(
+            &path,
+            JournalOptions::new()
+                .group_commit_window(Some(Duration::from_millis(20)))
+                .group_commit_max_batch(64),
+        )
+        .expect("open");
+        let lsn = j.append(b"record").expect("append");
+        let Some(bad) = failing_sync_handle(&path) else {
+            return;
+        };
+        j.file = bad;
+        let j = Arc::new(j);
+        let gate = Arc::new(Barrier::new(8));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..8 {
+            let j = Arc::clone(&j);
+            let gate = Arc::clone(&gate);
+            let tx = tx.clone();
+            let _ = std::thread::spawn(move || {
+                let _ = gate.wait();
+                let _ = tx.send(j.sync_through(lsn).is_ok());
+            });
+        }
+        drop(tx);
+        for _ in 0..8 {
+            let ok = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("sync_through hung after a failed fsync");
+            assert!(!ok, "a caller reported success after the fsync failed");
+        }
+    }
+
+    #[test]
+    fn test_direct_flush_failure_does_not_deadlock_later_syncs() {
+        // FS-H2: a Direct-IO partial-flush failure returned from
+        // `sync_through` before `in_flight` was cleared, so every
+        // later `sync_through` parked forever as a follower.
+        let path = tmp_path("poison_direct_flush");
+        let _g = Cleanup(path.clone());
+        let mut j = JournalHandle::open_with_options(&path, JournalOptions::new().direct(true))
+            .expect("open direct");
+        let lsn = j.append(b"buffered in the log buffer").expect("append");
+        j.file = read_only(&path);
+        assert!(
+            j.sync_through(lsn).is_err(),
+            "flush through read-only handle"
+        );
+
+        let j = std::sync::Arc::new(j);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let j2 = std::sync::Arc::clone(&j);
+        let _ = std::thread::spawn(move || {
+            let _ = tx.send(j2.sync_through(lsn).is_err());
+        });
+        let failed = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("second sync_through deadlocked after a failed flush");
+        assert!(failed, "second sync_through must report the failure");
+    }
+
+    #[test]
+    fn test_direct_rotation_flush_failure_poisons_later_appends() {
+        // FS-J4: a failed rotation flush lost a slot of
+        // acknowledged records, but only the rotating caller saw
+        // the error; later appends and syncs succeeded past the
+        // hole.
+        let path = tmp_path("poison_rotation");
+        let _g = Cleanup(path.clone());
+        let mut j = JournalHandle::open_with_options(
+            &path,
+            JournalOptions::new().direct(true).log_buffer_kib(4),
+        )
+        .expect("open direct");
+        j.file = read_only(&path);
+        let mut failed = false;
+        for _ in 0..1000 {
+            if j.append(&[0x5A; 100]).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(
+            failed,
+            "a rotation flush through a read-only handle must fail"
+        );
+        j.file = writable(&path);
+        assert_poisoned(j.append(b"later"));
+        assert_poisoned(j.sync_through(j.next_lsn()));
+    }
+
+    #[test]
+    fn test_direct_rotation_failure_wakes_waiting_appenders_with_error() {
+        // Appenders parked behind a failing rotation flush must
+        // wake with the poison error (no hang, no success into a
+        // slot that will never be written).
+        use std::sync::{Arc, Barrier};
+        let path = tmp_path("poison_rotation_waiters");
+        let _g = Cleanup(path.clone());
+        let mut j = JournalHandle::open_with_options(
+            &path,
+            JournalOptions::new().direct(true).log_buffer_kib(4),
+        )
+        .expect("open direct");
+        j.file = read_only(&path);
+        let j = Arc::new(j);
+        let gate = Arc::new(Barrier::new(4));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for t in 0..4u8 {
+            let j = Arc::clone(&j);
+            let gate = Arc::clone(&gate);
+            let tx = tx.clone();
+            let _ = std::thread::spawn(move || {
+                let _ = gate.wait();
+                let mut errors = 0;
+                for _ in 0..200 {
+                    if j.append(&[t; 300]).is_err() {
+                        errors += 1;
+                    }
+                }
+                let _ = tx.send(errors);
+            });
+        }
+        drop(tx);
+        for _ in 0..4 {
+            let _ = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("appender hung after a failed rotation flush");
+        }
+        assert_poisoned(j.append(b"after"));
     }
 }
