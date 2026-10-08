@@ -160,7 +160,7 @@ fn test_direct_journals_reopened_on_one_handle_keep_appending() {
     // close and reopen several Direct journals on one Handle, two of
     // them at once, and check every record.
     let dir = test_dir("journal_reopen");
-    let fs = builder().root(&dir.0).build().expect("handle");
+    let fs = builder().build().expect("handle");
     let opts = || fsys::JournalOptions::new().direct(true);
     let a = dir.0.join("a.wal");
     let b = dir.0.join("b.wal");
@@ -241,7 +241,7 @@ mod async_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_cancelled_journal_appends_leave_intact_records() {
         let dir = test_dir("journal_cancel");
-        let fs = builder().root(&dir.0).build().expect("handle");
+        let fs = builder().build().expect("handle");
         let path = dir.0.join("cancel.wal");
         let log = Arc::new(fs.journal(&path).expect("journal"));
         let mut expected = Vec::new();
