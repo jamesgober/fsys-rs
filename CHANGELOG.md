@@ -67,7 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 **Handle, pipeline and paths**
 
 - Temp file names are unique across processes and restarts (`.fsys-tmp-<pid>-<nonce>.<name>`, hashed for long names): two processes writing the same file no longer collide, a crash mid-write no longer makes every later write to that file fail with `AlreadyExists`, and long file names no longer hit `ENAMETOOLONG`.
-- Windows: root-scoped handles accept absolute paths inside the root (`\\?\` prefix and case differences).
+- Root-scoped handles accept absolute paths inside the root that are spelled differently from the canonical root: the Windows `\\?\` prefix, different case, 8.3 short names (`C:\Users\RUNNER~1\...`), and symlinked ancestors (`/tmp` -> `/private/tmp` on macOS). The canonical-prefix check still decides, so escapes through those spellings stay rejected.
 - `find` no longer follows symlinks out of the root or treats glob characters in the base path as patterns.
 - Direct reads size the buffer from the opened file, not a second path lookup.
 - Observer `on_handle_write` / `on_handle_read` events now fire.
