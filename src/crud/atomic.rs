@@ -59,7 +59,7 @@ impl BufferedFlush {
     fn run(self, file: &File) -> Result<()> {
         match self {
             BufferedFlush::Data => super::fence_data(file),
-            BufferedFlush::Full => platform::sync_full(file),
+            BufferedFlush::Full => super::fence_full(file),
         }
     }
 }
@@ -89,8 +89,11 @@ pub(crate) trait ReplaceHooks {
     fn write_direct_durable(&self, file: &File, data: &[u8]) -> StepResult;
 
     /// Runs after the temp file is durable and closed, immediately
-    /// before the rename.
-    fn before_rename(&self, _temp: &Path) {}
+    /// before the rename. An error aborts the replace (the temp file
+    /// is removed and the target is untouched).
+    fn before_rename(&self, _temp: &Path) -> StepResult {
+        Ok(())
+    }
 }
 
 /// Hooks for callers without handle state (the group lane): Direct
@@ -153,7 +156,9 @@ pub(crate) fn atomic_replace<H: ReplaceHooks>(
 
     write_temp(file, direct_ok, data, plan, hooks).map_err(|(step, e)| step_err(step, e))?;
 
-    hooks.before_rename(&temp);
+    hooks
+        .before_rename(&temp)
+        .map_err(|(step, e)| step_err(step, e))?;
 
     platform::atomic_rename(&temp, target).map_err(|e| step_err("rename", e))?;
     guard.armed = false;
@@ -430,7 +435,7 @@ mod tests {
         fn write_direct_durable(&self, _file: &File, _data: &[u8]) -> StepResult {
             Ok(())
         }
-        fn before_rename(&self, _temp: &Path) {
+        fn before_rename(&self, _temp: &Path) -> StepResult {
             panic!("hook panic for cleanup test");
         }
     }

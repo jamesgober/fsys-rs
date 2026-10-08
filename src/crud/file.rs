@@ -629,9 +629,10 @@ impl ReplaceHooks for WriteCopyHooks<'_> {
         self.solo.write_direct_durable(file, data)
     }
 
-    fn before_rename(&self, temp: &Path) {
-        if let Some(meta) = self.existing {
-            apply_preserved_metadata(temp, self.solo.target, meta);
+    fn before_rename(&self, temp: &Path) -> StepResult {
+        match self.existing {
+            Some(meta) => apply_preserved_metadata(temp, self.solo.target, meta),
+            None => Ok(()),
         }
     }
 }
@@ -802,25 +803,40 @@ fn iouring_read_direct(
 /// reading source attributes from `target` (the path whose metadata
 /// we want to preserve) and `existing_meta`.
 ///
-/// All operations are best-effort — on Unix, `chown` failures
-/// (typically `EPERM` for non-root processes) are silently skipped
-/// per the locked contract. Same logic on Windows for ACL
-/// application.
-fn apply_preserved_metadata(staging: &Path, target: &Path, existing: &std::fs::Metadata) {
-    apply_preserved_metadata_inner(staging, target, existing);
+/// Each attribute is best-effort: on Unix, `chown` failures (typically
+/// `EPERM` for non-root processes) are silently skipped per the locked
+/// contract; on Windows the owner change is skipped when refused while
+/// the DACL is still applied.
+///
+/// On Unix the staging file is then fsynced so the copied metadata is
+/// durable before the rename publishes the file; that fence is the only
+/// error this function reports (step `flush`). On Windows NTFS journals
+/// the security-descriptor and timestamp changes and the rename is
+/// issued with `MOVEFILE_WRITE_THROUGH`; no separate flush is issued
+/// (`FlushFileBuffers` would need a write handle that the copied DACL
+/// may no longer grant).
+fn apply_preserved_metadata(
+    staging: &Path,
+    target: &Path,
+    existing: &std::fs::Metadata,
+) -> StepResult {
+    apply_preserved_metadata_inner(staging, target, existing)
 }
 
 #[cfg(unix)]
-fn apply_preserved_metadata_inner(staging: &Path, _target: &Path, existing: &std::fs::Metadata) {
+fn apply_preserved_metadata_inner(
+    staging: &Path,
+    _target: &Path,
+    existing: &std::fs::Metadata,
+) -> StepResult {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
-    // Mode — unconditional, identical bits as the existing file.
-    let mode = existing.permissions().mode();
-    let _ = std::fs::set_permissions(staging, std::fs::Permissions::from_mode(mode));
-
-    // Owner / group — only succeeds when the process has CAP_CHOWN
-    // or equivalent. Silently skipped on EPERM per D-8.
+    // Owner / group first: an unprivileged chown clears the setuid /
+    // setgid bits on Linux, so applying the mode before the owner
+    // would lose them. Only succeeds when the process has CAP_CHOWN or
+    // equivalent (or the ids already match); silently skipped on EPERM
+    // per D-8.
     let uid = existing.uid();
     let gid = existing.gid();
     if let Ok(c_path) = std::ffi::CString::new(staging.as_os_str().as_encoded_bytes()) {
@@ -832,8 +848,19 @@ fn apply_preserved_metadata_inner(staging: &Path, _target: &Path, existing: &std
         let _ = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
     }
 
+    // Mode, identical bits as the existing file (including setuid /
+    // setgid / sticky, which the chown above may have cleared).
+    let mode = existing.permissions().mode();
+    let _ = std::fs::set_permissions(staging, std::fs::Permissions::from_mode(mode));
+
     // Timestamps (mtime/atime). Best-effort.
     apply_timestamps_unix(staging, existing);
+
+    // Make the copied metadata durable before the rename. `fsync`
+    // works on a read-only descriptor, so the copied mode cannot lock
+    // us out.
+    let file = std::fs::File::open(staging).map_err(|e| ("flush", Error::Io(e)))?;
+    super::fence_full(&file).map_err(|e| ("flush", e))
 }
 
 #[cfg(unix)]
@@ -862,13 +889,20 @@ fn apply_timestamps_unix(staging: &Path, existing: &std::fs::Metadata) {
 }
 
 #[cfg(windows)]
-fn apply_preserved_metadata_inner(staging: &Path, target: &Path, existing: &std::fs::Metadata) {
+fn apply_preserved_metadata_inner(
+    staging: &Path,
+    target: &Path,
+    existing: &std::fs::Metadata,
+) -> StepResult {
+    // Timestamps first: they need a write handle, which the copied
+    // DACL may no longer grant.
     apply_timestamps_windows(staging, existing);
     // ACL preservation: copy the security descriptor from `target`
     // to `staging` via GetNamedSecurityInfoW / SetNamedSecurityInfoW.
     // Best-effort — failures are silent per D-8 (matching the
     // Unix chown-on-EPERM contract).
     apply_acls_windows(target, staging);
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -975,18 +1009,40 @@ fn apply_acls_windows(target: &Path, staging: &Path) {
         return;
     }
 
-    // SAFETY: `staging_w` is NUL-terminated UTF-16; owner/group/dacl
-    // were populated by GetNamedSecurityInfoW above and remain valid
-    // until we LocalFree(sd). SetNamedSecurityInfoW returns an error
-    // code on failure rather than panicking.
+    // The DACL and the owner / group are applied in two calls. Setting
+    // another owner usually needs SeRestorePrivilege; when that is
+    // refused, one combined call would also drop the DACL and leave the
+    // file with default permissions. The DACL goes first, while this
+    // process still owns the new file (an owner can always change the
+    // DACL); the owner / group change is then best-effort.
+    //
+    // SAFETY: `staging_w` is NUL-terminated UTF-16; `dacl` was
+    // populated by GetNamedSecurityInfoW above and stays valid until we
+    // LocalFree(sd). The owner / group arguments are null and ignored
+    // for DACL_SECURITY_INFORMATION. SetNamedSecurityInfoW reports
+    // failure through its return code.
     let _ = unsafe {
         SetNamedSecurityInfoW(
             staging_w.as_ptr() as *mut u16,
             SE_FILE_OBJECT,
-            info_flags,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: as above; `owner` / `group` were populated by
+    // GetNamedSecurityInfoW and stay valid until LocalFree(sd). The
+    // DACL argument is null and ignored for OWNER / GROUP information.
+    let _ = unsafe {
+        SetNamedSecurityInfoW(
+            staging_w.as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION,
             owner,
             group,
-            dacl,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
     };
@@ -997,9 +1053,14 @@ fn apply_acls_windows(target: &Path, staging: &Path) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn apply_preserved_metadata_inner(_staging: &Path, _target: &Path, _existing: &std::fs::Metadata) {
+fn apply_preserved_metadata_inner(
+    _staging: &Path,
+    _target: &Path,
+    _existing: &std::fs::Metadata,
+) -> StepResult {
     // Unsupported platform — no-op. The atomic-rename contract still
     // holds; we just don't preserve metadata.
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1405,6 +1466,34 @@ mod tests {
             .expect("past EOF")
             .is_empty());
         assert!(h.read_at(&path, 3, 0).expect("zero len").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_copy_preserves_setuid_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_path("write_copy_suid");
+        let _g = TmpFile(path.clone());
+        std::fs::write(&path, b"old").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4750)).expect("chmod");
+        let h = handle();
+        let before = super::super::fence_probe::count();
+        h.write_copy(&path, b"new").expect("write_copy");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o4750, "setuid lost: {mode:o}");
+        assert_eq!(std::fs::read(&path).expect("read"), b"new");
+        assert!(
+            super::super::fence_probe::count() > before,
+            "copied metadata must be fenced before the rename"
+        );
+    }
+
+    #[test]
+    fn test_write_copy_to_new_path_behaves_like_write() {
+        let path = tmp_path("write_copy_new");
+        let _g = TmpFile(path.clone());
+        handle().write_copy(&path, b"fresh").expect("write_copy");
+        assert_eq!(std::fs::read(&path).expect("read"), b"fresh");
     }
 
     #[test]

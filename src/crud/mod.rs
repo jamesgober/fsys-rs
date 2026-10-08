@@ -24,6 +24,16 @@ pub(crate) fn fence_data(file: &std::fs::File) -> crate::Result<()> {
     crate::platform::sync_data(file)
 }
 
+/// Full durability fence (`fsync` on Linux, `F_FULLFSYNC` on macOS,
+/// `FlushFileBuffers` on Windows): data and all inode metadata (mode,
+/// owner, timestamps). Counted by `fence_probe` like [`fence_data`].
+#[inline]
+pub(crate) fn fence_full(file: &std::fs::File) -> crate::Result<()> {
+    #[cfg(test)]
+    fence_probe::record_fence();
+    crate::platform::sync_full(file)
+}
+
 /// Makes a directory-entry change (rename, create, unlink) under the
 /// parent of `path` durable: `fsync` on the parent directory on
 /// Linux / macOS, a no-op on Windows (see
