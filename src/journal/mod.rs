@@ -676,12 +676,10 @@ impl JournalHandle {
         //
         // Encode the frame: 12 bytes of overhead (magic +
         // length + crc32c) wrap the user's payload. Uniform
-        // framing is load-bearing — even zero-length records
+        // framing is load-bearing: even zero-length records
         // produce a 12-byte header-only frame so the reader's
-        // forward-iteration invariant holds. We bounds-check the
-        // record length against `FRAME_MAX_PAYLOAD` (256 MiB)
-        // and the total frame size against `usize::MAX` before
-        // any allocation.
+        // forward-iteration invariant holds.
+        //
         // Validate and encode before reserving (1.1.1): nothing can
         // fail between the reservation and the write except the
         // write itself, so an encode or size error never leaves a
