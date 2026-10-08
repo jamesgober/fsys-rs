@@ -19,105 +19,144 @@ use fsys::capability::{
     cache, capabilities, invalidate_capability_cache, probe_capabilities_fresh, Capabilities,
     IoUringFeature, PciAddress, SpdkSkipReason,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Process-global lock for tests that mutate `FSYS_CACHE_DIR`.
-/// Multiple integration-test binaries share `cargo test`'s process,
-/// so without serialisation they would race on the env var.
+/// Serialises every test in this binary that reads or writes the
+/// capability cache. The tests run on parallel threads of one process
+/// and the cache location comes from the process-global
+/// `FSYS_CACHE_DIR`, which `cache::*`, `capabilities()` and
+/// `probe_capabilities_fresh()` read at call time. A cache access that
+/// does not hold this lock can land in another test's private
+/// directory (for example a concurrent `probe_capabilities_fresh`
+/// rewriting the file another test has just invalidated).
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// A directory no other test (in this or any other process) uses.
 fn unique_dir(label: &str) -> std::path::PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("fsys-stress-{label}-{nanos}"))
+    std::env::temp_dir().join(format!(
+        "fsys-stress-{label}-{}-{n}-{nanos}",
+        std::process::id()
+    ))
 }
 
+/// Runs `f` with `FSYS_CACHE_DIR` pointing at a fresh private
+/// directory, holding [`ENV_LOCK`]. The previous value is restored
+/// and the directory removed even if `f` panics.
 fn with_cache_dir<F: FnOnce(&std::path::Path)>(label: &str, f: F) {
-    let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let key = "FSYS_CACHE_DIR";
-    let saved = std::env::var(key).ok();
-    let dir = unique_dir(label);
-    std::env::set_var(key, &dir);
-    f(&dir);
-    let _ = std::fs::remove_dir_all(&dir);
-    match saved {
-        Some(v) => std::env::set_var(key, v),
-        None => std::env::remove_var(key),
+    struct Restore {
+        saved: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
     }
-    drop(guard);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            match self.saved.take() {
+                Some(v) => std::env::set_var(CACHE_DIR_VAR, v),
+                None => std::env::remove_var(CACHE_DIR_VAR),
+            }
+        }
+    }
+    const CACHE_DIR_VAR: &str = "FSYS_CACHE_DIR";
+
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let restore = Restore {
+        saved: std::env::var_os(CACHE_DIR_VAR),
+        dir: unique_dir(label),
+    };
+    std::env::set_var(CACHE_DIR_VAR, &restore.dir);
+    f(&restore.dir);
+    // `restore` drops before `_lock` (reverse declaration order), so
+    // the variable is reset while the lock is still held.
 }
 
 // ──────────────────────────────────────────────────────────────────
 // 1. Concurrent stress
 // ──────────────────────────────────────────────────────────────────
 
+// The first `capabilities()` call in the process may load and store
+// the cache file, so these tests hold the cache lock too.
+
 #[test]
 fn capabilities_returns_same_reference_under_32_thread_contention() {
-    const THREADS: usize = 32;
-    let barrier = Arc::new(Barrier::new(THREADS));
-    let mut handles = Vec::with_capacity(THREADS);
-    for _ in 0..THREADS {
-        let b = Arc::clone(&barrier);
-        handles.push(thread::spawn(move || {
-            b.wait();
-            let p = capabilities() as *const Capabilities;
-            p as usize
-        }));
-    }
-    let mut addrs = Vec::with_capacity(THREADS);
-    for h in handles {
-        addrs.push(h.join().unwrap());
-    }
-    // Every thread must see the same `OnceLock`-backed pointer.
-    let first = addrs[0];
-    for (i, a) in addrs.iter().enumerate() {
-        assert_eq!(
-            *a, first,
-            "thread {i} saw different pointer: {a:#x} vs {first:#x}",
-        );
-    }
+    with_cache_dir("same-ref", |_dir| {
+        const THREADS: usize = 32;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let b = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                b.wait();
+                let p = capabilities() as *const Capabilities;
+                p as usize
+            }));
+        }
+        let mut addrs = Vec::with_capacity(THREADS);
+        for h in handles {
+            addrs.push(h.join().unwrap());
+        }
+        // Every thread must see the same `OnceLock`-backed pointer.
+        let first = addrs[0];
+        for (i, a) in addrs.iter().enumerate() {
+            assert_eq!(
+                *a, first,
+                "thread {i} saw different pointer: {a:#x} vs {first:#x}",
+            );
+        }
+    });
 }
 
 #[test]
 fn capabilities_field_values_stable_across_repeated_reads() {
-    let a = capabilities();
-    for _ in 0..1000 {
-        let b = capabilities();
-        // The `OnceLock` guarantee gives us pointer equality —
-        // but assert field-by-field for clarity.
-        assert_eq!(a.schema_version, b.schema_version);
-        assert_eq!(a.fsys_version, b.fsys_version);
-        assert_eq!(a.kernel_version, b.kernel_version);
-        assert_eq!(a.os_target, b.os_target);
-        assert_eq!(a.io_uring, b.io_uring);
-        assert_eq!(a.spdk_eligible, b.spdk_eligible);
-    }
+    with_cache_dir("stable-reads", |_dir| {
+        let a = capabilities();
+        for _ in 0..1000 {
+            let b = capabilities();
+            // The `OnceLock` guarantee gives us pointer equality,
+            // but assert field-by-field for clarity.
+            assert_eq!(a.schema_version, b.schema_version);
+            assert_eq!(a.fsys_version, b.fsys_version);
+            assert_eq!(a.kernel_version, b.kernel_version);
+            assert_eq!(a.os_target, b.os_target);
+            assert_eq!(a.io_uring, b.io_uring);
+            assert_eq!(a.spdk_eligible, b.spdk_eligible);
+        }
+    });
 }
 
 #[test]
 fn probe_fresh_under_concurrent_invocation_does_not_panic() {
-    // `probe_capabilities_fresh` is allowed to race — multiple
-    // concurrent callers all write the cache file. The
-    // atomic-rename pattern means there's always a coherent file
-    // on disk; the in-memory snapshots are independent owned
-    // values per caller.
-    const THREADS: usize = 8;
-    let barrier = Arc::new(Barrier::new(THREADS));
-    let mut handles = Vec::with_capacity(THREADS);
-    for _ in 0..THREADS {
-        let b = Arc::clone(&barrier);
-        handles.push(thread::spawn(move || {
-            b.wait();
-            let _ = probe_capabilities_fresh();
-        }));
-    }
-    for h in handles {
-        h.join().unwrap();
-    }
+    // `probe_capabilities_fresh` is allowed to race with itself:
+    // concurrent callers all write the cache file, and the
+    // atomic-rename pattern keeps a coherent file on disk; the
+    // in-memory snapshots are independent owned values per caller.
+    // The threads run inside this test's private cache directory so
+    // they cannot write into another test's.
+    with_cache_dir("probe-race", |_dir| {
+        const THREADS: usize = 8;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let b = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                b.wait();
+                let _ = probe_capabilities_fresh();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let loaded = cache::load().expect("load ok");
+        assert!(loaded.is_some(), "racing writers left no valid cache file");
+    });
 }
 
 // ──────────────────────────────────────────────────────────────────
