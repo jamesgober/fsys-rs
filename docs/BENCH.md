@@ -57,7 +57,7 @@ Numbers from one class are not directly comparable to another; the regression ch
 
 ## 0.7.0 native-vs-`spawn_blocking` measurement
 
-[`benches/async_native_vs_blocking.rs`](../benches/async_native_vs_blocking.rs) is the A/B harness for the new native io_uring async substrate. It runs the same async-write workload twice &mdash; once with `FSYS_DISABLE_NATIVE_ASYNC=1` (forces the `spawn_blocking` fallback), once without (allows the native path to engage on Linux + `Method::Direct`).
+[`benches/async_native_vs_blocking.rs`](../benches/async_native_vs_blocking.rs) is the A/B harness for the new native io_uring async substrate. It runs the same 4 KiB `Method::Direct` write twice: once as the sync `Handle::write` on `tokio::task::spawn_blocking` (exactly what the fallback substrate does), once through `write_async` (the native path engages on Linux). `FSYS_DISABLE_NATIVE_ASYNC` is read once per process, so it cannot be toggled between the two groups; set it for the whole run to put both groups on the fallback.
 
 The Linux substrate is required to be at least 1.1&times; faster than `spawn_blocking` to be considered functional (anything below means something went wrong with the ring construction or completion driver). Anything above 1.1&times; is a real win.
 

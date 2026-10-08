@@ -40,9 +40,7 @@ impl Handle {
         // not worth the async machinery.
         #[cfg(target_os = "linux")]
         {
-            if self.active_method() == crate::Method::Direct
-                && std::env::var_os("FSYS_DISABLE_NATIVE_ASYNC").is_none()
-            {
+            if self.active_method() == crate::Method::Direct && !super::native_async_disabled() {
                 if let Some(ring) = self.async_io_uring() {
                     return write_async_native(&self, &ring, &path, &data).await;
                 }
