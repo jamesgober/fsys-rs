@@ -1,31 +1,33 @@
 //! Power-Loss Protection (PLP) detection refinement (0.7.0).
 //!
-//! Per refinement R-2 in `.dev/DECISIONS-0.7.0.md`, this module
-//! upgrades 0.5.0's mostly-`Unknown` PLP detection with two
-//! pragmatic signals:
+//! Per refinement R-2 in `.dev/DECISIONS-0.7.0.md`, PLP detection uses
+//! one signal: a **per-vendor model lookup table** of known
+//! PLP-equipped enterprise drives (Intel D3-S4510/4610, Samsung
+//! PM983/PM9A3/PM1735, Micron 7300/7400/7450, WD/HGST Ultrastar DC
+//! SN-series, Kioxia CD-series). On a hit the probe reports
+//! [`PlpStatus::Yes`]; otherwise `Unknown`. The probe never reports
+//! `No`.
 //!
-//! 1. **Per-vendor model lookup table** — known PLP-equipped
-//!    enterprise drives (Intel D3-S4510/4610, Samsung
-//!    PM983/PM9A3/PM1735, Micron 7300/7400/7450, WD/HGST Ultrastar
-//!    DC SN-series, Kioxia CD-series). On hit, promote `Unknown`
-//!    → [`PlpStatus::Yes`].
-//! 2. **Volatile Write Cache (VWC) fallback on Linux NVMe** — for
-//!    drives not in the table, query NVMe Identify Controller via
-//!    the `nvme_passthrough` plumbing and read the VWC bit.
-//!    `VWC = 0` means "no volatile cache" (writes commit straight
-//!    to media), which is functionally PLP-equivalent.
+//! The lookup runs on Linux (sysfs `vendor` / `model`) and Windows
+//! (`IOCTL_STORAGE_QUERY_PROPERTY` vendor / product strings). The macOS
+//! and fallback probes do not read device identity and always report
+//! `Unknown`.
 //!
-//! ## What's NOT done here (still locked-out)
+//! ## What's NOT done here
 //!
+//! - A Volatile Write Cache (VWC) bit fallback via NVMe Identify
+//!   Controller was planned in R-2 but is not implemented.
 //! - Vendor-specific SMART log-page parsing. Long maintenance
 //!   tail; remains out of scope.
-//! - Runtime re-probing. PLP is sampled at handle-creation time
-//!   and cached; hot-plug isn't supported (F-4 from 0.5.0).
+//! - Runtime re-probing. PLP is sampled once per process and
+//!   cached; hot-plug isn't supported (F-4 from 0.5.0).
+//! - Per-path probing: the probe describes the drive holding the
+//!   process's current directory (see [`crate::hardware::drive`]).
 //!
 //! ## Honesty
 //!
 //! Detection remains best-effort. A drive missing from the table
-//! AND with VWC ambiguous stays `Unknown`. False negatives cost
+//! stays `Unknown`. False negatives cost
 //! performance (Method::Auto picks `Direct + fdatasync` instead
 //! of `Direct + NVMe FLUSH`); they are not correctness failures.
 //! `docs/PLATFORM-NOTES.md` and `docs/API.md` document this.
@@ -51,7 +53,8 @@ use crate::hardware::PlpStatus;
 /// `fdatasync` cycle on an unprotected drive, which IS a
 /// correctness regression. False-negative is the safe direction
 /// of travel.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+// Only the Linux and Windows probes read vendor / model strings.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
 const PLP_DRIVE_TABLE: &[(&str, &str)] = &[
     // Intel / Solidigm enterprise SATA SSDs (D3 series).
     ("INTEL", "SSDSC2KB"),    // D3-S4510 / S4520 family
@@ -86,7 +89,8 @@ const PLP_DRIVE_TABLE: &[(&str, &str)] = &[
 ///
 /// Matching is case-insensitive substring.
 #[must_use]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+// Only the Linux and Windows probes read vendor / model strings.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
 pub(crate) fn lookup_table(vendor: &str, model: &str) -> PlpStatus {
     let v_upper = vendor.to_ascii_uppercase();
     let m_upper = model.to_ascii_uppercase();
@@ -96,25 +100,6 @@ pub(crate) fn lookup_table(vendor: &str, model: &str) -> PlpStatus {
         }
     }
     PlpStatus::Unknown
-}
-
-/// Combines two `PlpStatus` values, taking the more-confident of
-/// the two. `Yes` wins; otherwise `No` wins; otherwise `Unknown`.
-///
-/// Used by the probe to merge multiple signals (table lookup +
-/// VWC fallback + IOCTL probe). Currently single-source on both
-/// platforms (lookup-table only) so this helper is exercised by
-/// unit tests but not yet wired into the probe; reserved for the
-/// VWC-fallback wiring that follows in a future patch (R-2's
-/// "VWC bit fallback" sub-item).
-#[must_use]
-#[allow(dead_code)]
-pub(crate) fn merge(a: PlpStatus, b: PlpStatus) -> PlpStatus {
-    match (a, b) {
-        (PlpStatus::Yes, _) | (_, PlpStatus::Yes) => PlpStatus::Yes,
-        (PlpStatus::No, _) | (_, PlpStatus::No) => PlpStatus::No,
-        _ => PlpStatus::Unknown,
-    }
 }
 
 #[cfg(test)]
@@ -177,27 +162,5 @@ mod tests {
         assert_eq!(lookup_table("", ""), PlpStatus::Unknown);
         assert_eq!(lookup_table("INTEL", ""), PlpStatus::Unknown);
         assert_eq!(lookup_table("", "SSDSC2KB"), PlpStatus::Unknown);
-    }
-
-    #[test]
-    fn merge_yes_wins() {
-        assert_eq!(merge(PlpStatus::Yes, PlpStatus::Unknown), PlpStatus::Yes);
-        assert_eq!(merge(PlpStatus::Unknown, PlpStatus::Yes), PlpStatus::Yes);
-        assert_eq!(merge(PlpStatus::Yes, PlpStatus::No), PlpStatus::Yes);
-        assert_eq!(merge(PlpStatus::No, PlpStatus::Yes), PlpStatus::Yes);
-    }
-
-    #[test]
-    fn merge_no_beats_unknown() {
-        assert_eq!(merge(PlpStatus::No, PlpStatus::Unknown), PlpStatus::No);
-        assert_eq!(merge(PlpStatus::Unknown, PlpStatus::No), PlpStatus::No);
-    }
-
-    #[test]
-    fn merge_unknown_unknown_is_unknown() {
-        assert_eq!(
-            merge(PlpStatus::Unknown, PlpStatus::Unknown),
-            PlpStatus::Unknown
-        );
     }
 }
