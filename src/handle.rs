@@ -50,10 +50,13 @@ use std::sync::Arc as WinArc;
 /// standard fence for their own file instead.
 ///
 /// After the first probe, lookups are a single atomic load (no lock).
+/// Only Linux and Windows have NVMe passthrough paths.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 pub(crate) struct DeviceKeyed<T> {
     slot: std::sync::OnceLock<(u64, Option<std::sync::Arc<T>>)>,
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 impl<T> DeviceKeyed<T> {
     pub(crate) const fn new() -> Self {
         Self {
