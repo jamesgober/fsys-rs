@@ -279,7 +279,9 @@ pub struct JournalHandle {
     /// `SyncMode::Full` (default) calls
     /// `file.sync_data()` (the platform's full media-durability
     /// primitive); `SyncMode::Barrier` calls
-    /// `platform::sync_barrier()` (cheaper on macOS with PLP).
+    /// `platform::sync_barrier()` (cheaper on macOS with PLP; on
+    /// Windows the same flush as `Full` unless the handle is
+    /// write-through).
     /// Captured at journal-open time from
     /// `JournalOptions::sync_mode`.
     ///
@@ -1413,9 +1415,10 @@ impl JournalHandle {
     /// - **macOS:** `fcntl(F_PREALLOCATE)` with contiguous
     ///   allocation; falls back to non-contiguous. Does not
     ///   change the file size.
-    /// - **Windows:** `SetFileInformationByHandle` with
-    ///   `FileAllocationInfo`, which sets the allocation size without
-    ///   changing the end of file.
+    /// - **Windows:** `SetFileInformationByHandle(FileAllocationInfo)`
+    ///   reserves clusters up to `offset + len` without moving EOF;
+    ///   a request already covered by the current allocation is a
+    ///   no-op (never shrinks). `SetFileValidData` is not used.
     /// - **Other platforms:** no-op (succeeds; allocation
     ///   happens on write).
     ///
@@ -2855,8 +2858,8 @@ mod tests {
     fn sync_mode_barrier_round_trips_through_journal() {
         // SyncMode::Barrier goes through platform::sync_barrier.
         // On Linux it's fdatasync (same path); on macOS it's
-        // F_BARRIERFSYNC; on Windows the platform layer decides
-        // (a flush unless the handle is write-through). All return
+        // F_BARRIERFSYNC; on Windows it's FlushFileBuffers unless
+        // the handle is write-through. All return
         // Ok on a healthy fs; the journal's sync_through must
         // complete and advance synced_lsn regardless of the
         // underlying primitive.
