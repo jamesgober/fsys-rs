@@ -139,7 +139,7 @@ impl Handle {
     /// **What "copy" means here:** this is *not* a file-to-file copy
     /// operation (no source path argument). It is a write that
     /// **copies the existing target's metadata onto the new payload
-    /// before swapping it in** — mode, ACLs, ownership, timestamps. For
+    /// before swapping it in**: mode, ACLs, ownership, timestamps. For
     /// a file-to-file copy use [`Handle::copy`] or
     /// [`Handle::copy_batch`].
     ///

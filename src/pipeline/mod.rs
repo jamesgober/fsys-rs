@@ -5,12 +5,10 @@
 //! concern; users interact with it indirectly via `Handle`'s batch
 //! API). The pipeline implements the dual-lane model from `0.4.0`:
 //!
-//! - **Solo lane.** `Handle::write`, `read`, `append`, `write_at`, etc.
-//!   call directly into `crud::file` / `crud::dir` functions (those
-//!   modules are crate-internal). The pipeline is *not consulted*.
-//!   Solo-lane ops have
-//!   exactly the latency they had in `0.3.0` — the pipeline is invisible
-//!   on this path.
+//! - **Solo lane.** `Handle::write`, `read`, `append`, `write_at`,
+//!   `delete`, `copy`, `meta`, `sync`, and the directory calls go
+//!   straight into `crud::file` / `crud::dir`. The pipeline is *not
+//!   consulted*; no code on the solo path may touch it.
 //! - **Group lane.** `Handle::write_batch`, `delete_batch`, `copy_batch`,
 //!   and `Batch::commit` route through this module. Ops are placed on a
 //!   bounded MPMC queue (default 1024 jobs deep) and consumed by a
@@ -22,6 +20,11 @@
 //!   handle (from any thread) run one after another; use
 //!   `Builder::dispatcher_shards` to run batches for different paths
 //!   in parallel.
+//!
+//! Routing is explicit and fixed per call site (decision R-12 in
+//! `.dev/DECISIONS-0.4.0.md`): batch APIs always use the group lane,
+//! everything else the solo lane. There is no automatic promotion of
+//! single ops to batches.
 //!
 //! The dispatcher thread is spawned **lazily** on the first batch
 //! submission: idle handles cost zero threads. On `Pipeline` drop,
@@ -61,9 +64,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::error::BatchError;
 
-mod dispatch;
 mod group;
-mod solo;
 
 use group::BatchJob;
 pub(crate) use group::{BatchOp, HandleSnapshot};

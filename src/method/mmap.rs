@@ -97,7 +97,7 @@ pub(crate) fn write(path: &Path, data: &[u8]) -> Result<()> {
         });
     }
 
-    // Step 1 — create + size the temp file. The name carries the pid
+    // Step 1: create + size the temp file. The name carries the pid
     // and a nonce; an exclusive create retries on the rare collision.
     let (temp, temp_file) = crate::crud::atomic::with_unique_temp(path, |temp| {
         std::fs::OpenOptions::new()

@@ -261,7 +261,7 @@ impl Builder {
     /// [`Handle::delete_batch`](crate::Handle::delete_batch),
     /// [`Handle::copy_batch`](crate::Handle::copy_batch), and
     /// [`crate::Batch::commit`] **block** until space is available
-    /// (decision #4 — bounded queue with blocking submission). The
+    /// (decision #4: bounded queue with blocking submission). The
     /// async batch methods wait without blocking the runtime worker.
     ///
     /// Default: `1024` jobs. Each job carries one batch (a `Vec` of
@@ -506,7 +506,7 @@ impl Builder {
     /// probes the sector size for the root (or current directory), and
     /// validates that no reserved method was requested. The dispatcher
     /// thread, io_uring ring, and NVMe-passthrough slot are all
-    /// constructed lazily on first use — idle handles cost zero
+    /// constructed lazily on first use; idle handles cost zero
     /// threads and zero ring memory.
     ///
     /// # Errors
@@ -612,7 +612,7 @@ pub(crate) fn check_method_selectable(method: Method) -> Result<()> {
         });
     }
 
-    // 1.1.0 — SPDK gating. `Method::Spdk` is runtime-validated:
+    // 1.1.0 SPDK gating. `Method::Spdk` is runtime-validated:
     // the `spdk` Cargo feature must be enabled at compile time AND
     // the capability probe must report `spdk_eligible = true`.
     // The actual backend construction lives in the `fsys-spdk`
@@ -633,7 +633,7 @@ pub(crate) fn check_method_selectable(method: Method) -> Result<()> {
                     .unwrap_or(crate::capability::SpdkSkipReason::NotLinux);
                 return Err(Error::SpdkUnavailable { reason });
             }
-            // Feature on + eligible — but the `fsys-spdk` companion
+            // Feature on + eligible, but the `fsys-spdk` companion
             // crate is in scaffold state in 1.1.0. Surface a clear
             // error rather than running a half-wired handle. This
             // branch goes away when the companion crate ships the
@@ -667,7 +667,7 @@ impl Default for Builder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Workload {
-    /// The library defaults — 128-deep io_uring ring, 1024-deep
+    /// The library defaults: 128-deep io_uring ring, 1024-deep
     /// batch queue. Suitable for general file IO; NOT tuned for
     /// sustained database throughput.
     Default,

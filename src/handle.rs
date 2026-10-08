@@ -12,18 +12,6 @@
 //! spawned lazily on the first batch submission and shut down cleanly
 //! when the `Handle` is dropped — idle handles cost zero threads.
 
-// rustc 1.95 ICE workaround (extension of the 0.5.1 + 0.7.0
-// `linux_iouring.rs` / `completion_driver.rs` pattern). The
-// `async_iouring_slot: Mutex<AsyncIoUringState>` field references
-// `AsyncIoUring`, which transitively touches `io_uring::IoUring`;
-// the dead-code analysis pass on this module then ICEs with
-// `slice index starts at N but ends at M`. Module-level allow
-// skips the buggy lint without affecting correctness — every
-// public item here is live by definition (it's the public Handle
-// API). Filed as part of the io_uring blocker record in
-// `.dev/DECISIONS-0.5.0.md`.
-#![allow(dead_code)]
-
 use crate::batch::Batch;
 use crate::buffer::AlignedBufferPool;
 use crate::error::BatchError;
@@ -103,6 +91,7 @@ impl<T> DeviceKeyed<T> {
 /// first Direct-method op triggers lazy pool allocation (locked
 /// decision #6 in `.dev/DECISIONS-0.5.0.md`).
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // reserved buffer pool: configured but not yet used by an IO path (see crate::buffer)
 pub(crate) struct HandleBufferPoolConfig {
     pub capacity: usize,
     pub block_size: usize,
@@ -167,7 +156,7 @@ pub struct Handle {
     ///
     /// **0.4.0 limitation.** The active method is updated by solo-lane
     /// runtime fallbacks but **not** by group-lane (batch) per-op
-    /// fallbacks — the dispatcher runs without a [`Handle`] reference.
+    /// fallbacks, because the dispatcher runs without a [`Handle`] reference.
     /// Group-lane fallback information surfaces in
     /// [`BatchError::source`] for the failing op. See decision D-5 in
     /// `.dev/DECISIONS-0.4.0.md`.
@@ -179,28 +168,18 @@ pub struct Handle {
     mode: Mode,
     /// Probed logical sector size for aligned Direct IO buffers (bytes).
     sector_size: u32,
-    /// Per-handle pipeline. Owns the lazy group-lane dispatcher thread.
-    /// Declared last so its `Drop` runs after the rest of the state has
-    /// already been read into snapshots — although correctness does not
-    /// depend on field-drop order (the dispatcher consumes only its
-    /// `BatchJob`-supplied [`HandleSnapshot`]s, never the live state).
+    /// Per-handle pipeline. Owns the lazy group-lane dispatcher
+    /// thread(s). Field order does not matter for correctness: the
+    /// dispatcher works only from the [`HandleSnapshot`] carried by each
+    /// job, never from live handle state.
     pipeline: Pipeline,
-    /// Buffer pool config (capacity, block size, alignment). Captured
-    /// at construction and used by [`Handle::buffer_pool`] for lazy
-    /// allocation.
+    /// Reserved buffer-pool configuration (capacity, block size,
+    /// alignment) captured from the Builder for [`Handle::buffer_pool`].
+    #[allow(dead_code)] // reserved buffer pool (see crate::buffer)
     pool_config: HandleBufferPoolConfig,
-    /// Lazy aligned buffer pool. `None` until the first Direct-method
-    /// op leases a buffer; `Some(...)` for the rest of this Handle's
-    /// lifetime. The Mutex is held only briefly during lazy init —
-    /// once the pool is constructed, leasing is lock-free on the
-    /// fast path.
-    /// Lock-free slot — `OnceLock::get()` is a single atomic load
-    /// after first init, so the buffer-pool fast path on every
-    /// Direct write costs zero mutex acquires. The slot is set
-    /// exactly once (lazy init); after that, all reads are
-    /// uncontended atomic loads. (0.8.0 I round-3 perf fix —
-    /// previously `Mutex<Option<AlignedBufferPool>>` cost a mutex
-    /// acquire per Direct op even after init.)
+    /// Reserved aligned buffer pool, built on the first
+    /// [`Handle::buffer_pool`] call. No IO path leases from it in 1.1.x.
+    #[allow(dead_code)] // reserved buffer pool (see crate::buffer)
     pool_slot: std::sync::OnceLock<AlignedBufferPool>,
     /// Linux-only: requested `io_uring` SQ depth (from
     /// [`crate::Builder::io_uring_queue_depth`]). Captured at
@@ -215,7 +194,7 @@ pub struct Handle {
     /// timeout. On kernels / environments that reject the setup
     /// (EPERM on < 5.13 without CAP_SYS_NICE, restricted
     /// sandboxes), `IoUringRing::new` returns the setup error
-    /// and `iouring_slot` caches `None` — the Direct path then
+    /// and `iouring_slot` caches `None`; the Direct path then
     /// falls back to the `pwrite` path cleanly.
     #[cfg(target_os = "linux")]
     iouring_sqpoll_idle_ms: Option<u32>,
@@ -255,6 +234,7 @@ impl Handle {
     /// Creates a `Handle` from raw components.
     ///
     /// This is `pub(crate)` — external callers use [`crate::Builder`].
+    // The io_uring depth / SQPOLL arguments are stored only on Linux.
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     #[allow(clippy::too_many_arguments)] // every arg is load-bearing handle state — splitting would obscure the struct shape
     pub(crate) fn new_raw(
@@ -581,7 +561,7 @@ impl Handle {
     /// ([`Error::AlignmentRequired`]) when the configured
     /// `buffer_pool_count`/`buffer_pool_block_size` is invalid against the
     /// probed sector size.
-    #[allow(dead_code)] // wired into Direct path in 0.5.x patch alongside io_uring lift
+    #[allow(dead_code)] // reserved buffer pool: only the Builder tests lease from it (see crate::buffer)
     pub(crate) fn buffer_pool(&self) -> Result<AlignedBufferPool> {
         // Fast path: post-init read is a single atomic load + Arc clone.
         if let Some(pool) = self.pool_slot.get() {
@@ -1627,20 +1607,18 @@ fn pre_submit_err(index: usize, e: Error) -> BatchError {
     }
 }
 
-// Handle is Send + Sync because AtomicU8 and AtomicU64 are Send + Sync,
-// Option<PathBuf> is Send + Sync, Mode is Copy, and u32 is Copy.
-// The compiler will derive these automatically, but asserting them here
-// makes any future regression a compile error rather than a runtime surprise.
+// Handle is Send + Sync because every field is (atomics, OnceLocks of
+// Send + Sync values, the pipeline, plain Copy data). The compiler
+// derives this automatically; asserting it here makes any future
+// regression a compile error rather than a surprise for callers.
 const _: () = {
-    #[allow(dead_code)]
     fn assert_send<T: Send>() {}
-    #[allow(dead_code)]
     fn assert_sync<T: Sync>() {}
-    #[allow(dead_code)]
     fn check() {
         assert_send::<Handle>();
         assert_sync::<Handle>();
     }
+    let _ = check;
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1882,7 +1860,7 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────
-    // 1.1.1 — root jail vs. dangling symlinks
+    // 1.1.1: root jail vs. dangling symlinks
     // ─────────────────────────────────────────────────────────
 
     struct DirCleanup(PathBuf);

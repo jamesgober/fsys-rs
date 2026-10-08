@@ -98,12 +98,14 @@ pub enum Method {
     /// # Platform-specific behavior
     ///
     /// - **Linux:** `fdatasync(2)`.
-    /// - **macOS:** Falls back to [`Sync`](Method::Sync) (`F_FULLFSYNC`).
-    ///   macOS has no `fdatasync` equivalent. `active_method()` will
-    ///   reflect `Sync` after this fallback.
-    /// - **Windows:** Falls back to [`Sync`](Method::Sync)
-    ///   (`FlushFileBuffers`). Windows has no `fdatasync` equivalent.
-    ///   `active_method()` will reflect `Sync` after this fallback.
+    /// - **macOS:** uses `F_FULLFSYNC`, the same primitive as
+    ///   [`Sync`](Method::Sync); macOS has no `fdatasync` equivalent.
+    ///   `active_method()` keeps reporting `Data`; the primitive is
+    ///   visible through
+    ///   [`Handle::active_durability_primitive`](crate::Handle::active_durability_primitive).
+    /// - **Windows:** uses `FlushFileBuffers`, the same primitive as
+    ///   [`Sync`](Method::Sync); Windows has no `fdatasync` equivalent.
+    ///   `active_method()` keeps reporting `Data`.
     Data = 1,
 
     /// Direct IO — bypasses the OS page cache entirely.
@@ -195,13 +197,17 @@ pub enum Method {
     /// | Linux + NVMe without io_uring | `Data` |
     /// | Linux + SSD | `Data` |
     /// | Linux + HDD or Unknown | `Sync` |
-    /// | macOS + NVMe | `Direct` |
-    /// | macOS + non-NVMe SSD or Unknown | `Sync` |
-    /// | macOS + HDD | `Sync` |
-    /// | Windows + NVMe | `Direct` |
-    /// | Windows + SSD | `Direct` |
-    /// | Windows + HDD or Unknown | `Sync` |
+    /// | macOS (any drive) | `Sync` |
+    /// | Windows (any drive) | `Sync` |
     /// | Hardware probe failed entirely | `Sync` (universal safety) |
+    ///
+    /// The macOS and Windows hardware probes do not detect the drive
+    /// kind yet (they always report it as unknown), so `Auto` resolves
+    /// to `Sync` there. The ladder already maps a detected NVMe drive
+    /// to `Direct` on both (and a detected SATA SSD to `Direct` on
+    /// Windows) for when those probes land; select [`Method::Direct`]
+    /// explicitly to use it today. `Auto` never selects
+    /// [`Method::Mmap`], [`Method::Journal`] or [`Method::Spdk`].
     ///
     /// PLP detection (0.9.2,
     /// [`Handle::is_plp_protected`](crate::Handle::is_plp_protected))
@@ -249,8 +255,8 @@ pub enum Method {
     /// device binding, IOMMU enablement) are documented in
     /// [`docs/SPDK.md`](https://github.com/jamesgober/fsys-rs/blob/main/docs/SPDK.md).
     ///
-    /// See [`Method::Auto`] for how SPDK enters the auto-resolution
-    /// ladder when the feature is enabled and the system is eligible.
+    /// [`Method::Auto`] never resolves to `Spdk`; it must be selected
+    /// explicitly.
     Spdk = 6,
 }
 

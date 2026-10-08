@@ -91,12 +91,12 @@ Soak success criteria:
 - `io_uring_queue_depth(u32)` — Linux io_uring SQ depth. Default
   128. Higher depths help when the workload has many in-flight
   ops; lower depths reduce kernel memory.
-- `buffer_pool_count(usize)`, `buffer_pool_block_size(usize)` —
+- `buffer_pool_count(usize)`, `buffer_pool_block_size(usize)`:
   **reserved**. Accepted and stored, but no IO path uses the buffer
   pool in 1.1.x: each Direct op allocates its own sector-aligned
   buffer, a cost that is small next to the per-write fence. Setting
   them changes neither memory use nor throughput.
-- `batch_size_max(usize)`, `batch_queue_max(usize)` — group-lane
+- `batch_size_max(usize)`, `batch_queue_max(usize)`: group-lane
   dispatcher knobs from 0.4.0: ops taken from the queue per
   dispatcher pass, and queue capacity before submitters block.
   `batch_window_ms(u64)` is still accepted but unused since 1.1.1:

@@ -172,7 +172,7 @@ pub(super) fn run_dispatcher(
             }
         };
 
-        // Step 2 — scoop jobs that are already queued (non-blocking),
+        // Step 2: scoop jobs that are already queued (non-blocking),
         // up to `batch_size_max` ops, and execute them in order.
         //
         // The dispatcher does not wait for more jobs to arrive. Every
