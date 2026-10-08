@@ -35,6 +35,9 @@ jobs:
       - name: Test
         run: cargo test --all-targets --verbose
 
+      - name: Test (async + tracing)
+        run: cargo test --lib --tests --features async,tracing --verbose
+
       - name: Doc test
         run: cargo test --doc --verbose
 

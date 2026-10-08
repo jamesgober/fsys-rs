@@ -5,6 +5,98 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-10-07
+
+**Security, durability and correctness release.** Fixes data-integrity bugs in the Direct-IO, io_uring, journal and batch paths, a root-jail escape, and two RUSTSEC advisories in the dependency tree. Upgrading is recommended for every user, especially on Linux with NVMe + io_uring (the default `Method::Auto` resolution there) and for anyone using `JournalHandle`. No public item was removed or renamed, no signature changed, and the on-disk journal frame format is unchanged (1.1.1 reads every journal 1.1.0 wrote, including the ones 1.1.0's own reader could not). Behavior changes are listed under **Changed**.
+
+### Security
+
+- **Root-jail escape through a dangling symlink.** On a root-scoped `Handle`, a path whose last component was a symlink to a missing target outside the root passed validation, and creating operations (`append`, `write_at`, `sync`, `journal`) created the target outside the root. A path component is now only treated as missing when `lstat` says so; dangling or looping symlinks are rejected with `Error::InvalidPath`.
+- **`memmap2` >= 0.9.11** ([RUSTSEC-2026-0186](https://rustsec.org/advisories/RUSTSEC-2026-0186.html)). fsys only calls the whole-mapping `map` / `flush` APIs and was not exposed, but the requirement keeps downstream lockfiles off the affected releases.
+- **`crossbeam-epoch` 0.9.18 -> 0.9.21** in `Cargo.lock` ([RUSTSEC-2026-0204](https://rustsec.org/advisories/RUSTSEC-2026-0204.html)); dev-only, via `criterion -> rayon`.
+- **Capability cache writes** use a unique private temp file (`create_new`, mode 0600 on Unix), fsync and rename, so a planted symlink in a shared `FSYS_CACHE_DIR` can no longer redirect the write; partial cache files are rejected.
+
+### Fixed
+
+**Direct IO and io_uring (Linux)**
+
+- `Method::Direct` writes, reads and native `write_async` could hit **the wrong file** once a closed fd number was reused: the io_uring fixed-file slot cache was keyed by fd number and never invalidated. The cache is removed; every submission uses the raw fd.
+- Cancelling `write_async`, `JournalHandle::append_async` or `sync_through_async` on the native io_uring path could free buffers the kernel was still reading or writing. The driver now owns in-flight buffers and file descriptors until the final completion.
+- A cancelled `sync_through_async` leader no longer leaves every later sync on that journal hanging.
+- The `sync_through_async` future is now `Send` on Linux (it already was elsewhere).
+- The sync io_uring ring waits for every completion when a signal interrupts the wait, and splits transfers larger than 2 GiB instead of silently truncating them.
+- Native `write_async` removes its temp file when cancelled, falls back to buffered IO when the file system rejects O_DIRECT, and fences data and the final size before the rename.
+
+**Durability**
+
+- Direct writes are now fenced on every path: macOS (`F_FULLFSYNC`), Linux without io_uring (`fdatasync`), and the batch lane (`write_batch`, `Batch::commit*`, `copy_batch`). The trimmed file size is durable before the rename. Previously these paths renamed without any data fence while reporting a durable primitive.
+- Windows: a batch Direct write that fell back to buffered IO returned `Ok` without `FlushFileBuffers`; it now flushes.
+- Windows: `SyncMode::Barrier` flushed nothing for handles not opened write-through, which includes the default buffered journal, so records could be acknowledged while still in the OS cache. Barrier now issues `FlushFileBuffers` unless the handle is write-through.
+- Windows: the parent directory is flushed after an atomic replace (`sync_parent_dir` was a no-op, and `MOVEFILE_WRITE_THROUGH` does not cover same-volume renames).
+- macOS: `F_FULLFSYNC` falls back to `fsync` on file systems that do not support it.
+- `sync_parent_dir` now works for bare file names (syncs the current directory) instead of failing silently.
+- Grouped batches sync the directories of completed operations even when a later operation fails, and deletes now sync their parent directory.
+- NVMe passthrough flush state is cached per device, so writes to another device get the normal fence instead of a flush sent to the wrong controller.
+
+**Journal**
+
+- Direct-IO journals no longer leave zero gaps at log-buffer rotation, and oversize appends no longer race concurrent appends for the same LSNs (overlapping records, lost writes).
+- `sync_through` never reports bytes as durable that were not written before the fsync, in either mode.
+- A failed write, flush or fsync poisons the journal: later appends, and syncs past the durable frontier, return an error, and a failed fsync is never retried. Previously a failed rotation flush silently dropped acknowledged records and followers retried fsync after EIO.
+- Fixed a deadlock of every later `sync_through` after a failed Direct-IO flush.
+- The reader skips the zero gaps 1.1.0 wrote (any length up to 64 MiB, any sector size), so 1.1.0 journals are fully readable; a trailing zero run is a clean end.
+- Both open modes resume at the end of the last clean frame and truncate after it; a buffered reopen no longer appends after a torn or zero-filled tail.
+- `JournalHandle::preallocate` never changes the logical file size.
+- Direct-IO open probes the sector size after creating the file (first-session `EINVAL` on 4Kn drives), handles non-UTF-8 paths on Linux, truncates stale tail bytes on resume, and reads the resume sector correctly on Windows.
+- `JournalReader` bounds its allocations by the file size; `read_at_lsn` validates a frame before allocating for it.
+- Native async journal appends (`append_async` on the io_uring path) now honor the journal's write gate and poison state: a sync leader can no longer publish a frontier over an async append still queued or in the kernel, and a failed, short, cancelled-and-failed or never-submitted async write poisons the journal instead of leaving a hole behind acknowledged records.
+- `next_lsn()` no longer goes backwards under concurrent Direct appends.
+- Removed undefined behavior (uninitialized memory exposed as `&mut [u8]`) in append encoding.
+
+**Platform**
+
+- MSRV: `cargo +1.75 build` works on Windows again.
+- Windows: reads and writes of 4 GiB or more work (no u32 overflow or truncation, no endless loop on a zero-byte write); `read_all_direct` errors on a file shorter than expected; `read_range` no longer moves a shared cursor.
+- Windows: NVMe passthrough FLUSH uses the correct command layout and checks the device status; the PLP probe works without administrator rights; fixed undefined behavior from unaligned struct reads in the hardware probe.
+- Windows: `preallocate` never shrinks an earlier reservation; ReFS reflink handles sizes that are not cluster multiples and removes its partial destination on failure.
+- macOS: `preallocate` no longer grows on every call; `punch_hole` handles unaligned ranges and never extends the file.
+- BSD and other Unix fallbacks use positioned IO, so concurrent journal writes no longer race on a shared file offset.
+- Linux: `write_zeros` falls back to writing zeros where `FALLOC_FL_ZERO_RANGE` is unsupported; the NAWUN/NAWUPF probe finds the NVMe controller.
+- `read_at` / `read_range` no longer allocate the caller's `len` before checking the file size (`usize::MAX` aborted the process).
+
+**Handle, pipeline and paths**
+
+- Temp file names are unique across processes and restarts (`.fsys-tmp-<pid>-<nonce>.<name>`, hashed for long names): two processes writing the same file no longer collide, a crash mid-write no longer makes every later write to that file fail with `AlreadyExists`, and long file names no longer hit `ENAMETOOLONG`.
+- Windows: root-scoped handles accept absolute paths inside the root (`\\?\` prefix and case differences).
+- `find` no longer follows symlinks out of the root or treats glob characters in the base path as patterns.
+- Direct reads size the buffer from the opened file, not a second path lookup.
+- Observer `on_handle_write` / `on_handle_read` events now fire.
+- `set_method(Method::Spdk)` applies the same checks as `build()`.
+- `write_copy` keeps setuid/setgid bits (owner set before mode) and Windows DACLs.
+- A failed dispatcher thread spawn is retried instead of disabling the shard; a full async batch queue no longer busy-spins.
+- Capability cache: no rewrite on every cache hit; macOS/Windows OS updates invalidate the cache; the io_uring feature probe no longer caches transient errors.
+
+### Changed
+
+- **Journal poisoning.** After a failed write, flush or fsync, the journal refuses further appends and syncs past the durable frontier; reopen to recover.
+- **Buffered journal open** of a file with an unrecoverable tail (bad magic or length overflow) fails with `InvalidData` instead of appending after it.
+- **`Handle::sync`** no longer creates missing files (returns `NotFound`) and opens read-only on Unix.
+- **`delete`** syncs the parent directory.
+- **`batch_window_ms`** is accepted but unused: each op carries its own fence, so holding jobs back only added latency.
+- **`write_at`** docs now state it does not flush; call `sync` for durability.
+- **Buffer pool knobs** (`buffer_pool_count`, `buffer_pool_block_size`) are documented as reserved; no IO path uses the pool in 1.1.x.
+- **Windows `SyncMode::Barrier`** on a buffered journal costs the same as `SyncMode::Full`.
+- **`FSYS_DISABLE_NATIVE_ASYNC`** is read once per process by `write_async`.
+- **`async_substrate()`** also reads `FSYS_DISABLE_NATIVE_ASYNC` once per process, so it always matches the substrate `write_async` uses.
+- **Blocking journal calls wait for queued native async writes.** A blocking `sync_through` or `close` issued while native async appends are in flight now waits for them (required for a correct durable frontier). Calling these blocking methods from inside a `current_thread` Tokio runtime that also drives those appends can therefore never complete; use `sync_through_async` there.
+- **`io-uring` 0.6 -> 0.7** (removes the duplicate `bitflags`).
+
+### Documentation
+
+- README history notes that the io_uring registered-file cache (`IORING_REGISTER_FILES`, 0.9.5 / 0.9.7) was removed in 1.1.1.
+
+- Corrected rustdoc and `docs/*.md` claims that described code that does not exist or behaves differently (platform primitives, Barrier, preallocate, mmap read mapping type, PLP probe scope, hardware probe drive, temp naming, batch window).
+
 ## [1.1.0] - 2026-05-18
 
 **Capability cache + SPDK eligibility + journal backend abstraction.** The first minor release in the `1.x` line. Every 1.0 public item is preserved unchanged; 1.1.0 is purely additive.
@@ -2806,7 +2898,12 @@ release-candidate-to-1.0 runway.
 ### Added
 - Initial release. Reserved name on crates.io. No public API.
 
-[Unreleased]: https://github.com/jamesgober/fsys-rs/compare/v0.9.4...HEAD
+[Unreleased]: https://github.com/jamesgober/fsys-rs/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/jamesgober/fsys-rs/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/jamesgober/fsys-rs/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/jamesgober/fsys-rs/compare/v0.9.8...v1.0.0
+[0.9.8]: https://github.com/jamesgober/fsys-rs/compare/v0.9.7...v0.9.8
+[0.9.7]: https://github.com/jamesgober/fsys-rs/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/jamesgober/fsys-rs/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/jamesgober/fsys-rs/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/jamesgober/fsys-rs/compare/v0.9.3...v0.9.4
