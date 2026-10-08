@@ -6,7 +6,7 @@
   BENCHMARKS
 </h1>
 
-`fsys` benchmarks live in [`benches/`](../benches/) and use [Criterion](https://docs.rs/criterion). For tuning knobs (group-lane window, batch size, queue depth, buffer pool) see [`PERFORMANCE.md`](PERFORMANCE.md).
+`fsys` benchmarks live in [`benches/`](../benches/) and use [Criterion](https://docs.rs/criterion). For tuning knobs (group-lane batch size and queue depth, io_uring queue depth, dispatcher shards) see [`PERFORMANCE.md`](PERFORMANCE.md).
 
 ## Running
 
@@ -217,13 +217,21 @@ window). Single-submitter workloads avoid the window tax. **Net:
 no regression for any workload type, ≈ 2× speedup for the bench
 shape.**
 
+> **Since 1.1.1** step 3 is gone: the dispatcher never waits for
+> more jobs. `batch_window_ms` is accepted but unused, because every
+> op carries its own durability fence and the window only added
+> latency. The numbers above predate that change.
+
 `gen_temp_path` was also tightened — replaced
 `format!(".fsys-tmp-{}.{}", n, stem.to_string_lossy().into_owned())`
 + `parent.join(name)` (3 string allocations + 1 PathBuf alloc per
 write) with a direct `OsString` build (1 OsString + 1 PathBuf).
 Stays in `OsStr`-land for non-UTF-8 filenames. The save is
 ~50–100 ns per write — too small to surface on the bench median
-but cumulative across all writes.
+but cumulative across all writes. (Since 1.1.1 the temp name is
+`.fsys-tmp-<pid hex>-<nonce>.<name>`, with `<name>` replaced by a
+hash when the full name would exceed 255 bytes; the counter-only
+form above could collide across processes.)
 
 ---
 
@@ -271,7 +279,7 @@ The atomic-replace primitive caps around 200–500 K writes/sec on bare-metal Li
 | **Tier 2 (shipped 0.9.0)** | Lock-free append. Concurrent `pwrite` directly against `&File` (no mutex on the hot path). 0.9.1 added vectored `append_batch` for ~1.6× per-record reduction. 0.9.5 added the dual-buffer Direct-mode log buffer for multi-core scalable Direct appends. | + 2–5× on multi-threaded workloads vs Tier 1. |
 | **Tier 3 (shipped 0.9.0)** | Native io_uring asynchronous substrate on Linux + `async` feature. `IORING_OP_WRITE` / `IORING_OP_FSYNC(DATASYNC)` SQEs through the per-handle completion driver. No `spawn_blocking` thread-pool hop. | + 1.5–3× on Linux async workloads vs Tier 2. |
 | **Direct-IO mode (shipped 0.9.0)** | Opt-in via `JournalOptions::direct(true)`. Sector-aligned in-memory log buffer; `O_DIRECT` / `F_NOCACHE` / `FILE_FLAG_NO_BUFFERING`; zero-copy DMA into the device. 0.9.6 added `IORING_OP_WRITE_FIXED` for the Direct-mode flush path on Linux. | Best for sustained sequential append workloads where page-cache jitter is observable. |
-| **Tier 4 — io_uring elite path** | **Shipped across 0.9.4–0.9.7.** `IORING_SETUP_COOP_TASKRUN` / `SINGLE_ISSUER` / `DEFER_TASKRUN` setup flags (0.9.4, kernel ≥ 5.19 / 6.0 / 6.1); linked Write+Fsync via `IOSQE_IO_LINK` (0.9.4); `IORING_REGISTER_FILES` for fd slot-upgrade (0.9.5); `IORING_OP_WRITE_FIXED` against pre-registered AlignedBuf slots (0.9.6); `IORING_SETUP_SQPOLL` opt-in (0.9.7, `Builder::sqpoll(idle_ms)`). | 5 M – 10 M ops/s ceiling on bare-metal Linux + NVMe. Measurement pending Phase 9 bare-metal re-run. |
+| **Tier 4 — io_uring elite path** | **Shipped across 0.9.4–0.9.7.** `IORING_SETUP_COOP_TASKRUN` / `SINGLE_ISSUER` / `DEFER_TASKRUN` setup flags (0.9.4, kernel ≥ 5.19 / 6.0 / 6.1); linked Write+Fsync via `IOSQE_IO_LINK` (0.9.4); `IORING_REGISTER_FILES` for fd slot-upgrade (0.9.5, removed in 1.1.1, see the table below); `IORING_OP_WRITE_FIXED` against pre-registered AlignedBuf slots (0.9.6); `IORING_SETUP_SQPOLL` opt-in (0.9.7, `Builder::sqpoll(idle_ms)`). | 5 M – 10 M ops/s ceiling on bare-metal Linux + NVMe. Measurement pending Phase 9 bare-metal re-run. |
 
 The Tier 4 ceiling is the same one Oracle, OceanBase, and PolarDB hit with their internal storage engines — the same Linux primitives are available to any application that uses them correctly. As of 0.9.7 every tier-4 primitive ships in code; the bench numbers documenting the win are the 0.9.8 release-prep deliverable.
 

@@ -28,10 +28,11 @@
 //!
 //! ## Linux + Windows
 //!
-//! `SyncMode::Barrier` is a no-op on Linux and Windows; their
-//! defaults already provide barrier-grade durability (fdatasync,
-//! FlushFileBuffers). This example demonstrates the API; the
-//! actual cheaper primitive only fires on macOS.
+//! On Linux `SyncMode::Barrier` issues the same `fdatasync` as
+//! `SyncMode::Full`. Windows has no barrier primitive: a buffered
+//! journal is flushed with `FlushFileBuffers` exactly like `Full`,
+//! and only a write-through handle skips the flush. This example
+//! demonstrates the API; the cheaper primitive exists only on macOS.
 //!
 //! ## When to use this pattern
 //!
@@ -51,7 +52,8 @@ fn main() -> fsys::Result<()> {
     let fs = Arc::new(fsys::builder().build()?);
 
     // Open the journal with SyncMode::Barrier opted in. On macOS
-    // this changes sync_through's behavior; elsewhere it's a no-op.
+    // this changes sync_through's primitive; elsewhere it syncs
+    // exactly like SyncMode::Full.
     let opts = fsys::JournalOptions::new().sync_mode(fsys::SyncMode::Barrier);
     let log = fs.journal_with(&path, opts)?;
 
@@ -66,7 +68,7 @@ fn main() -> fsys::Result<()> {
     println!("durable through LSN {lsn}");
     println!(
         "platform note: F_BARRIERFSYNC fires only on macOS; \
-         Linux + Windows treat this as a no-op (defaults are already barrier-grade)"
+         Linux and Windows sync exactly as with SyncMode::Full"
     );
 
     // For belt-and-braces durability — and for production WAL

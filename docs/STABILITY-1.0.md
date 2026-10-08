@@ -131,7 +131,7 @@ Anything not reachable through a public path from `lib.rs` is internal. The crat
 
 ### 3.3 Default values
 
-Default values of `Builder` knobs (`buffer_pool_count = 64`, `buffer_pool_block_size = 4096`, `io_uring_queue_depth = 128`, `batch_window_ms = 1`, `batch_size_max = 128`, `batch_queue_max = 1024`, `dispatcher_shards = 1`) are tuning constants, **not API contracts**. They may shift between releases as new workload data informs tuning. Programs that depend on specific defaults should set them explicitly.
+Default values of `Builder` knobs (`buffer_pool_count = 64`, `buffer_pool_block_size = 4096`, `io_uring_queue_depth = 128`, `batch_size_max = 128`, `batch_queue_max = 1024`, `dispatcher_shards = 1`) are tuning constants, **not API contracts**. They may shift between releases as new workload data informs tuning. Programs that depend on specific defaults should set them explicitly. Some knobs are accepted but currently unused: `batch_window_ms` (the dispatcher no longer waits for more jobs since 1.1.1) and the two `buffer_pool_*` knobs (no IO path draws from the pool in 1.1.x).
 
 The same applies to `JournalOptions` defaults (`log_buffer_kib = 64`, `group_commit_window = Some(500 µs)`, `group_commit_max_batch = 8`) and to the active-method selection by `Method::Auto` (the decision ladder in [`METHODS.md`](METHODS.md) may evolve as new hardware classes are surfaced by the probe).
 

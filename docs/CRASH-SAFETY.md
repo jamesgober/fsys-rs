@@ -31,7 +31,7 @@ This holds across:
 ## What happens during a write
 
 ```
-1. Open temp file (`<path>.fsys-tmp-<n>`)
+1. Open temp file (`.fsys-tmp-<pid hex>-<nonce>.<name>` next to the target; the `<name>` part is replaced by a hash when the full name would exceed 255 bytes)
 2. Write data (with the configured durability primitive)
 3. Apply preserved metadata to the temp (write_copy only)
 4. Atomic rename: temp → path

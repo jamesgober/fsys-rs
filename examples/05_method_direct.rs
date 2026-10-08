@@ -28,7 +28,8 @@ fn main() -> fsys::Result<()> {
     let fs = builder().method(Method::Direct).build()?;
     let path = std::env::temp_dir().join("fsys_example_direct.bin");
 
-    // Arbitrary unaligned size — the buffer pool handles alignment.
+    // Arbitrary unaligned size: each Direct write copies the payload
+    // into its own sector-aligned buffer.
     let payload = vec![0xA5u8; 8192 + 73];
     fs.write(&path, &payload)?;
 

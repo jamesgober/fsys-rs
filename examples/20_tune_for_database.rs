@@ -47,8 +47,8 @@ fn main() -> fsys::Result<()> {
         fsys::builder()
             .tune_for(fsys::Workload::Database)
             // After-preset overrides — these layer on top of the
-            // preset's values. Example: keep Database's buffer pool
-            // sizing but raise the dispatcher to 4 shards.
+            // preset's values. Example: keep Database's ring depth
+            // and queue sizing but raise the dispatcher to 4 shards.
             .dispatcher_shards(4)
             .build()?,
     );

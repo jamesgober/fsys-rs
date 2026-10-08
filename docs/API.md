@@ -336,17 +336,23 @@ async fn main() -> fsys::Result<()> {
 
 ### Async method coverage
 
-All sync methods have async siblings:
-- File: `write_async`, `write_copy_async`, `append_async`,
-  `read_async`, `read_at_async`, `delete_async`,
-  `exists_async`, `metadata_async`, `is_file_async`,
-  `is_dir_async`.
+These `Handle` methods have async siblings:
+- File: `write_async`, `write_copy_async`, `write_at_async`,
+  `append_async`, `read_async`, `read_at_async`, `delete_async`,
+  `exists_async`, `meta_async`, `size_async`, `copy_async`,
+  `rename_async`, `truncate_async`.
 - Directory: `mkdir_async`, `mkdir_all_async`, `rmdir_async`,
   `rmdir_all_async`, `list_async`, `scan_async`,
   `scan_all_async`, `count_async`, `count_all_async`,
-  `find_async`.
-- Sync/batch: `sync_async`, `write_batch_async`,
-  `delete_batch_async`, `sync_batch_async`.
+  `find_async`, `is_file_async`, `is_dir_async`.
+- Batch: `write_batch_async`, `delete_batch_async`,
+  `copy_batch_async`.
+- Journal: `JournalHandle::append_async`,
+  `JournalHandle::sync_through_async`.
+
+The remaining methods (for example `sync`, `punch_hole` and
+`write_zeros`) have no async sibling; run them through
+`tokio::task::spawn_blocking`.
 
 ### Calling async ops outside a runtime
 
@@ -667,7 +673,7 @@ let log = fs.journal_with(
 | `.log_buffer_kib(u32)` | `64` | **Per-slot** size in KiB of the dual-buffer Direct-IO log buffer. Total resident memory is `2 × log_buffer_kib`. Clamped to `[4, 65536]`. *(Per-slot semantics: 0.9.5.)* |
 | `.group_commit_window(Option<Duration>)` | `Some(500 µs)` | Leader/follower group-commit wait window. The leader optionally pauses up to `window` for additional followers to enqueue before issuing the fsync, batching durability across more callers. *(0.9.1.)* |
 | `.group_commit_max_batch(u32)` | `8` | Maximum followers the leader will batch before exiting the window-wait early. *(0.9.1.)* |
-| `.sync_mode(SyncMode)` | `SyncMode::Full` | `Full` = `fsync` / `fdatasync` family (default). `Barrier` = macOS `F_BARRIERFSYNC` (10–100× cheaper than `F_FULLFSYNC` on Apple Silicon NVMe; crash-safe **only** on PLP drives or under explicit eventual-`Full`-sync discipline). No-op on Linux + Windows. *(0.9.4.)* |
+| `.sync_mode(SyncMode)` | `SyncMode::Full` | `Full` = `fsync` / `fdatasync` family (default). `Barrier` = macOS `F_BARRIERFSYNC` (10–100× cheaper than `F_FULLFSYNC` on Apple Silicon NVMe; crash-safe **only** on PLP drives or under explicit eventual-`Full`-sync discipline). Same as `Full` on Linux (`fdatasync`); on Windows `FlushFileBuffers` like `Full`, skipped only for write-through handles. *(0.9.4.)* |
 | `.write_lifetime_hint(Option<WriteLifetimeHint>)` | `None` | Linux `F_SET_RW_HINT` fcntl. `Long` clusters journal data into separate NAND blocks on multi-stream NVMe drives, reducing GC write amplification. No-op elsewhere. *(0.9.4.)* |
 
 ### `JournalReader`
@@ -798,7 +804,8 @@ before the `1.0` freeze, and they carry into `1.x` unchanged.
   primitives with `KEEP_SIZE` where applicable.
 - Internal: dual-buffered Direct-mode log buffer
   (`log_buffer_kib` is now per-slot, not total);
-  `IORING_REGISTER_FILES` on both io_uring rings.
+  `IORING_REGISTER_FILES` on both io_uring rings (removed in
+  1.1.1: the fd-keyed slot cache misrouted writes after fd reuse).
 
 ### 0.9.6 — audit + journal-on-io_uring + reflinks
 

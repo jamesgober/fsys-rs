@@ -238,5 +238,6 @@ Drop semantics:
 4. The pipeline's `Drop` joins the dispatcher thread.
 
 Idle handles cost zero threads and zero ring memory — every
-resource (dispatcher, buffer pool, io_uring ring, NVMe passthrough
-access) is lazily allocated on the first op that needs it.
+resource (dispatcher, io_uring ring, NVMe passthrough access) is
+lazily allocated on the first op that needs it. (The buffer pool
+slot is reserved: no IO path draws from it in 1.1.x.)

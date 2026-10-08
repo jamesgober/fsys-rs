@@ -2,8 +2,8 @@
 //!
 //! For any program that does more than a single IO op, build a
 //! `Handle` once and reuse it. The handle owns the resolved method,
-//! the buffer pool, the pipeline dispatcher, and the io_uring slot
-//! (Linux). Constructing it is non-trivial; *using* it is cheap.
+//! the pipeline dispatcher, and the io_uring slot (Linux).
+//! Constructing it is non-trivial; *using* it is cheap.
 //!
 //! `Handle` is `Send + Sync + Clone` — clone freely across threads;
 //! all clones share the same underlying resources via `Arc`.

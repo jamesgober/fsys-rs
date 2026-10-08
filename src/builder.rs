@@ -389,12 +389,13 @@ impl Builder {
     /// `dispatcher_shards = num_cpus::get()` lifts it.
     ///
     /// **When to leave it at 1.** Single-writer workloads,
-    /// latency-sensitive workloads (each shard has its own time
-    /// window, so cross-shard ordering across batches is not
-    /// guaranteed — but it was never guaranteed at the
-    /// pipeline-level anyway), and any workload where batches
-    /// rarely touch distinct paths (sharding by hash collapses to
-    /// one shard when all batches target the same path).
+    /// workloads that rely on batch order (one dispatcher runs
+    /// batches one after another in queue order; shards run
+    /// independently, so batches routed to different shards are
+    /// not ordered relative to each other), and any workload where
+    /// batches rarely touch distinct paths (sharding by hash
+    /// collapses to one shard when all batches target the same
+    /// path).
     ///
     /// Clamped to `1..=64`. The high cap reflects that >64
     /// dispatcher threads per handle is pathological;
