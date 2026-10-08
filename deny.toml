@@ -11,21 +11,21 @@
 yanked = "warn"
 
 [licenses]
-# fsys-rs ships under Apache-2.0 OR MIT. Allow the canonical
-# permissive license set that's compatible with dual licensing.
+# fsys-rs ships under Apache-2.0 OR MIT. Allow only the licenses the
+# dependency graph actually uses, so a new license shows up as a review
+# item instead of passing silently:
+# - Apache-2.0 / MIT: nearly every dependency (dual-licensed).
+# - Unicode-3.0: `unicode-ident`, pulled in by the proc-macro crates
+#   behind the optional `async` (tokio macros) and `tracing` features.
+#   A default-feature `cargo deny check` never sees it, so the
+#   "license not encountered" lint is silenced rather than dropping a
+#   license the feature builds need.
 allow = [
     "Apache-2.0",
     "MIT",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "ISC",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
-    "Zlib",
-    "MPL-2.0",
-    "CC0-1.0",
-    "0BSD",
 ]
+unused-allowed-license = "allow"
 confidence-threshold = 0.93
 
 [bans]
