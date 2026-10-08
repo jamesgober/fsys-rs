@@ -34,7 +34,7 @@ use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU8, Ordering};
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "linux")]
 use std::sync::Mutex;
 
 #[cfg(target_os = "linux")]
@@ -68,21 +68,6 @@ enum IoUringState {
     Disabled,
 }
 
-/// Per-handle NVMe-passthrough capability slot (Linux only).
-///
-/// Same three-state pattern as [`IoUringState`]. The first Direct
-/// op probes via [`crate::platform::linux_iouring::nvme_flush_capable`]
-/// and caches the result. `Active(access)` holds an open
-/// `/dev/nvmeX` handle plus the namespace ID, ready for
-/// `nvme_flush_ioctl` calls. `Disabled` means probing failed; the
-/// Direct path uses `fdatasync` instead.
-#[cfg(target_os = "linux")]
-enum NvmeState {
-    Untried,
-    Active(Arc<NvmeAccess>),
-    Disabled,
-}
-
 /// Per-handle native async io_uring substrate slot (Linux + async
 /// feature only). Same three-state pattern. Constructed on the
 /// first async Direct op. Once `Disabled`, the substrate caches
@@ -96,17 +81,52 @@ enum AsyncIoUringState {
     Disabled,
 }
 
-/// Per-handle NVMe-passthrough capability slot (Windows only).
+/// A capability probed once per handle, for the first storage device a
+/// Direct op touches.
 ///
-/// Mirror of [`NvmeState`] for the Windows IOCTL path. `Active`
-/// holds the resolved volume root (e.g. `\\\\.\\C:`); volume
-/// handles are reopened per-op (matches the Windows convention of
-/// not holding long-lived shared volume handles).
-#[cfg(target_os = "windows")]
-enum NvmeStateWin {
-    Untried,
-    Active(WinArc<WinNvmeAccess>),
-    Disabled,
+/// NVMe passthrough flushes a specific controller / volume. Before
+/// 1.1.1 the handle cached the probe result from the first file's
+/// device and then used it for every later file, so writes to another
+/// device were "flushed" on the wrong one. The cache now remembers the
+/// device key (`st_dev` on Linux, the volume serial number on Windows)
+/// it was probed for; ops on any other device get `None` and use the
+/// standard fence for their own file instead.
+///
+/// After the first probe, lookups are a single atomic load (no lock).
+pub(crate) struct DeviceKeyed<T> {
+    slot: std::sync::OnceLock<(u64, Option<std::sync::Arc<T>>)>,
+}
+
+impl<T> DeviceKeyed<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slot: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Returns the capability for the device identified by `key`,
+    /// running `probe` the first time any device is seen. `None` when
+    /// the probe failed or `key` is not the probed device.
+    pub(crate) fn get(
+        &self,
+        key: u64,
+        probe: impl FnOnce() -> Option<T>,
+    ) -> Option<std::sync::Arc<T>> {
+        let (probed_key, value) = self
+            .slot
+            .get_or_init(|| (key, probe().map(std::sync::Arc::new)));
+        if *probed_key == key {
+            value.clone()
+        } else {
+            None
+        }
+    }
+
+    /// `true` once a probe has succeeded for some device. Does not
+    /// probe.
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(self.slot.get(), Some((_, Some(_))))
+    }
 }
 
 /// Pool configuration captured by [`Builder`] and consumed at
@@ -235,17 +255,16 @@ pub struct Handle {
     /// rest of this Handle's lifetime.
     #[cfg(target_os = "linux")]
     iouring_slot: Mutex<IoUringState>,
-    /// Linux-only: lazy NVMe-passthrough capability slot.
-    /// `Untried` until the first Direct op probes; `Active(...)`
-    /// (with an owned `/dev/nvmeX` handle) or `Disabled` for the
-    /// rest of this Handle's lifetime.
+    /// Linux-only: NVMe-passthrough capability (an owned `/dev/nvmeX`
+    /// handle plus namespace id), probed on the first Direct op and
+    /// keyed by the `st_dev` it was probed for.
     #[cfg(target_os = "linux")]
-    nvme_slot: Mutex<NvmeState>,
-    /// Windows-only: lazy NVMe-passthrough capability slot.
-    /// Same three-state pattern as [`NvmeState`] but caches the
-    /// resolved volume root (handles are reopened per-op).
+    nvme_slot: DeviceKeyed<NvmeAccess>,
+    /// Windows-only: NVMe-passthrough capability (the resolved volume
+    /// root; volume handles are reopened per op), keyed by the volume
+    /// serial number it was probed for.
     #[cfg(target_os = "windows")]
-    nvme_slot_win: Mutex<NvmeStateWin>,
+    nvme_slot_win: DeviceKeyed<WinNvmeAccess>,
     /// Linux + `async` feature only: lazy native io_uring async
     /// substrate slot. New in `0.7.0`.
     #[cfg(all(target_os = "linux", feature = "async"))]
@@ -295,9 +314,9 @@ impl Handle {
             #[cfg(target_os = "linux")]
             iouring_slot: Mutex::new(IoUringState::Untried),
             #[cfg(target_os = "linux")]
-            nvme_slot: Mutex::new(NvmeState::Untried),
+            nvme_slot: DeviceKeyed::new(),
             #[cfg(target_os = "windows")]
-            nvme_slot_win: Mutex::new(NvmeStateWin::Untried),
+            nvme_slot_win: DeviceKeyed::new(),
             #[cfg(all(target_os = "linux", feature = "async"))]
             async_iouring_slot: Mutex::new(AsyncIoUringState::Untried),
             observer,
@@ -346,62 +365,35 @@ impl Handle {
         }
     }
 
-    /// Returns the per-handle Windows NVMe-passthrough access for
-    /// the volume containing `path`, probing on the first call.
-    /// Cached `None` after probe failure.
+    /// Returns the Windows NVMe-passthrough access for the volume that
+    /// holds `file` (whose path is `path`), probing on the first call.
+    /// `None` when the probe failed or `file` lives on a different
+    /// volume than the one probed.
     #[cfg(target_os = "windows")]
-    pub(crate) fn nvme_access_win(&self, path: &Path) -> Option<WinArc<WinNvmeAccess>> {
-        let mut guard = match self.nvme_slot_win.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        match &*guard {
-            NvmeStateWin::Active(a) => return Some(a.clone()),
-            NvmeStateWin::Disabled => return None,
-            NvmeStateWin::Untried => {}
-        }
-        match crate::platform::windows_nvme::nvme_flush_capable(path) {
-            Some(access) => {
-                let arc = WinArc::new(access);
-                *guard = NvmeStateWin::Active(arc.clone());
-                Some(arc)
-            }
-            None => {
-                *guard = NvmeStateWin::Disabled;
-                None
-            }
-        }
+    pub(crate) fn nvme_access_win(
+        &self,
+        file: &std::fs::File,
+        path: &Path,
+    ) -> Option<WinArc<WinNvmeAccess>> {
+        let serial = volume_serial(file)?;
+        self.nvme_slot_win.get(serial, || {
+            crate::platform::windows_nvme::nvme_flush_capable(path)
+        })
     }
 
-    /// Returns the per-handle NVMe passthrough access, probing on
-    /// the first call given an arbitrary file `fd` whose underlying
-    /// block device we want to flush. The probe resolves the fd to
-    /// `/dev/nvmeX` and verifies privilege.
-    ///
-    /// Cached `None` after probe failure so subsequent ops don't
-    /// retry the resolution + open.
+    /// Returns the NVMe passthrough access for the block device that
+    /// holds `file`, probing on the first call. The probe resolves the
+    /// fd to `/dev/nvmeX` and verifies privilege. `None` when the probe
+    /// failed or `file` lives on a different device than the one
+    /// probed.
     #[cfg(target_os = "linux")]
-    pub(crate) fn nvme_access(&self, fd: std::os::fd::RawFd) -> Option<Arc<NvmeAccess>> {
-        let mut guard = match self.nvme_slot.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        match &*guard {
-            NvmeState::Active(a) => return Some(a.clone()),
-            NvmeState::Disabled => return None,
-            NvmeState::Untried => {}
-        }
-        match crate::platform::linux_iouring::nvme_flush_capable(fd) {
-            Some(access) => {
-                let arc = Arc::new(access);
-                *guard = NvmeState::Active(arc.clone());
-                Some(arc)
-            }
-            None => {
-                *guard = NvmeState::Disabled;
-                None
-            }
-        }
+    pub(crate) fn nvme_access(&self, file: &std::fs::File) -> Option<Arc<NvmeAccess>> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let dev = file.metadata().ok()?.dev();
+        self.nvme_slot.get(dev, || {
+            crate::platform::linux_iouring::nvme_flush_capable(file.as_raw_fd())
+        })
     }
 
     /// Returns the canonical name of the durability primitive this
@@ -496,11 +488,7 @@ impl Handle {
     /// in `crud/file.rs`).
     #[cfg(target_os = "linux")]
     fn linux_direct_primitive(&self) -> &'static str {
-        let nvme_active = matches!(
-            *self.nvme_slot.lock().unwrap_or_else(|p| p.into_inner()),
-            NvmeState::Active(_)
-        );
-        if nvme_active {
+        if self.nvme_slot.is_active() {
             return crate::primitive::IO_URING_NVME_FLUSH;
         }
         let ring_active = matches!(
@@ -519,11 +507,7 @@ impl Handle {
     /// NOT trigger probing.
     #[cfg(target_os = "windows")]
     fn windows_direct_primitive(&self) -> &'static str {
-        let nvme_active = matches!(
-            *self.nvme_slot_win.lock().unwrap_or_else(|p| p.into_inner()),
-            NvmeStateWin::Active(_)
-        );
-        if nvme_active {
+        if self.nvme_slot_win.is_active() {
             crate::primitive::FILE_FLAG_WRITE_THROUGH_NVME_IOCTL
         } else {
             crate::primitive::FILE_FLAG_WRITE_THROUGH
@@ -1562,6 +1546,26 @@ impl Handle {
     }
 }
 
+/// Volume serial number of the volume holding `file`, used to key the
+/// Windows NVMe-passthrough cache. `None` if the query fails.
+#[cfg(target_os = "windows")]
+fn volume_serial(file: &std::fs::File) -> Option<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    // SAFETY: `BY_HANDLE_FILE_INFORMATION` is a plain C struct of
+    // integers and `FILETIME`s (also integers); the all-zero bit
+    // pattern is a valid value for it.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` is an open file, so its raw handle is valid for
+    // the duration of the call; `info` is a live, writable struct the
+    // function fills and does not retain. Failure is reported through
+    // the return value.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    (ok != 0).then(|| u64::from(info.dwVolumeSerialNumber))
+}
+
 /// Lexical "is inside the root" pre-filter for the root jail.
 ///
 /// `Builder::build` stores the root in canonical form. On Windows that
@@ -2084,6 +2088,49 @@ mod tests {
             .expect("non-existent tail is allowed");
         assert!(resolved.starts_with(h.root().expect("root")));
         assert!(resolved.ends_with("not/yet/created.bin"));
+    }
+
+    #[test]
+    fn test_device_keyed_probes_once_and_only_serves_the_probed_device() {
+        let slot: DeviceKeyed<u32> = DeviceKeyed::new();
+        assert!(!slot.is_active());
+        let mut probes = 0;
+        assert_eq!(
+            slot.get(7, || {
+                probes += 1;
+                Some(42)
+            })
+            .as_deref(),
+            Some(&42)
+        );
+        assert!(slot.is_active());
+        // Same device: cached value, no second probe.
+        assert_eq!(slot.get(7, || panic!("re-probed")).as_deref(), Some(&42));
+        // Another device: never handed the first device's capability.
+        assert_eq!(slot.get(8, || panic!("re-probed")), None);
+        assert_eq!(probes, 1);
+
+        let failed: DeviceKeyed<u32> = DeviceKeyed::new();
+        assert_eq!(failed.get(1, || None), None);
+        assert!(!failed.is_active());
+        assert_eq!(failed.get(1, || Some(5)), None, "failure is cached");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_volume_serial_is_stable_for_one_volume() {
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("fsys_volserial_a_{}", std::process::id()));
+        let b = dir.join(format!("fsys_volserial_b_{}", std::process::id()));
+        let fa = std::fs::File::create(&a).expect("create a");
+        let fb = std::fs::File::create(&b).expect("create b");
+        let sa = volume_serial(&fa);
+        let sb = volume_serial(&fb);
+        drop((fa, fb));
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+        assert!(sa.is_some());
+        assert_eq!(sa, sb);
     }
 
     #[test]

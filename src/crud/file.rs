@@ -505,13 +505,12 @@ impl Handle {
     fn direct_write_durable(&self, file: &std::fs::File, path: &Path, data: &[u8]) -> StepResult {
         #[cfg(target_os = "linux")]
         {
-            use std::os::fd::AsRawFd;
             if let Some(ring) = self.io_uring_ring() {
                 // Probe NVMe passthrough capability lazily on the
                 // file fd's underlying block device. Returns None
                 // for non-NVMe devices, missing privileges, or when
                 // FSYS_DISABLE_NVME_PASSTHROUGH=1 is set.
-                let nvme = self.nvme_access(file.as_raw_fd());
+                let nvme = self.nvme_access(file);
                 let nvme_ref = nvme.as_deref();
                 let sector = self.sector_size();
                 let needs_trim = needs_trim(data.len(), sector);
@@ -542,7 +541,7 @@ impl Handle {
         // write) but exercises the IOCTL path and surfaces it via
         // `active_durability_primitive()`.
         #[cfg(target_os = "windows")]
-        if let Some(access) = self.nvme_access_win(path) {
+        if let Some(access) = self.nvme_access_win(file, path) {
             // Best-effort: WRITE_THROUGH already provided durability,
             // so a failed controller flush does not fail the write.
             let _ = crate::platform::windows_nvme::nvme_flush(&access);
