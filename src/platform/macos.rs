@@ -418,10 +418,17 @@ pub(crate) fn sync_barrier(file: &File) -> Result<()> {
 /// 0.9.5 — Punches a hole at `[offset, offset + len)` via Apple's
 /// `fcntl(F_PUNCHHOLE)`.
 ///
-/// macOS exposes a structured `fpunchhole_t` payload (8-byte
-/// reserved header + u64 offset + u64 length) instead of the
+/// macOS exposes a structured `fpunchhole_t` payload instead of the
 /// Linux `fallocate` int64-pair argument style. We construct the
 /// payload here and pass it through `fcntl`.
+///
+/// `F_PUNCHHOLE` requires the offset and length to be multiples of the
+/// file system block size and fails with `EINVAL` otherwise. The range
+/// is therefore split: whole blocks inside it are punched, and the
+/// unaligned head and tail are overwritten with zeros, so every byte of
+/// the range reads back as zero afterwards. The range is first clipped to
+/// the current file size, so the call never extends the file (matching
+/// Linux `FALLOC_FL_KEEP_SIZE`).
 ///
 /// Available on macOS 10.12 (Sierra) and later. On older
 /// systems the kernel returns `EOPNOTSUPP`, which we surface as
@@ -430,37 +437,122 @@ pub(crate) fn punch_hole(file: &File, offset: u64, len: u64) -> Result<()> {
     if len == 0 {
         return Ok(());
     }
-    /// Apple's `fpunchhole_t` (from `<sys/fcntl.h>`). Three
-    /// `u32` flag/version fields followed by two `u64` offsets.
-    /// Total 24 bytes.
+    let eof = file.metadata().map_err(Error::Io)?.len();
+    let end = offset.saturating_add(len).min(eof);
+    if offset >= end {
+        return Ok(());
+    }
+    let block = fs_block_size(file)?;
+    let plan = split_punch_range(offset, end, block);
+    if let Some((start, stop)) = plan.punch {
+        punch_aligned(file, start, stop - start)?;
+    }
+    for (start, stop) in plan.zero.into_iter().flatten() {
+        zero_fill(file, start, stop - start)?;
+    }
+    Ok(())
+}
+
+/// How [`punch_hole`] covers `[offset, end)`: the block-aligned middle is
+/// punched, the unaligned head and tail are zero-filled.
+#[derive(Debug, PartialEq, Eq)]
+struct PunchPlan {
+    punch: Option<(u64, u64)>,
+    zero: [Option<(u64, u64)>; 2],
+}
+
+/// Splits `[offset, end)` around the whole `block`-sized blocks it covers.
+fn split_punch_range(offset: u64, end: u64, block: u64) -> PunchPlan {
+    let first_full = offset.div_ceil(block).saturating_mul(block);
+    let last_full = end / block * block;
+    if first_full >= last_full {
+        // No whole block inside the range: zero all of it.
+        return PunchPlan {
+            punch: None,
+            zero: [Some((offset, end)), None],
+        };
+    }
+    let head = (offset < first_full).then_some((offset, first_full));
+    let tail = (last_full < end).then_some((last_full, end));
+    PunchPlan {
+        punch: Some((first_full, last_full)),
+        zero: [head, tail],
+    }
+}
+
+/// File system block size for `file` (`fstatfs` `f_bsize`), the unit
+/// `F_PUNCHHOLE` requires.
+fn fs_block_size(file: &File) -> Result<u64> {
+    // SAFETY: `statfs` is plain old data (integers and integer arrays),
+    // so the all-zero bit pattern is a valid value; `fstatfs` fully
+    // writes it before any field is read.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: the descriptor is borrowed from a live `File`; `st` is a
+    // valid, writable `statfs`.
+    let ret = unsafe { libc::fstatfs(file.as_raw_fd(), &mut st) };
+    if ret != 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    let block = u64::from(st.f_bsize);
+    if block == 0 {
+        return Err(Error::Io(std::io::Error::other(
+            "fstatfs reported a zero block size",
+        )));
+    }
+    Ok(block)
+}
+
+/// Issues `F_PUNCHHOLE` for a block-aligned range.
+fn punch_aligned(file: &File, offset: u64, len: u64) -> Result<()> {
+    /// Apple's `fpunchhole_t` (from `<sys/fcntl.h>`): two `u32`
+    /// fields (`fp_flags`, `reserved`) followed by two `off_t`
+    /// values. Total 24 bytes.
     #[repr(C)]
-    #[derive(Default)]
     struct FPunchHole {
-        fp_flags: u32,  // reserved; must be zero
-        reserved: u32,  // reserved; must be zero
-        fp_offset: u64, // start
-        fp_length: u64, // length
+        fp_flags: u32,          // reserved; must be zero
+        reserved: u32,          // reserved; must be zero
+        fp_offset: libc::off_t, // start
+        fp_length: libc::off_t, // length
     }
     /// Apple's `F_PUNCHHOLE` fcntl number. Defined in the
     /// macOS SDK as 99.
     const F_PUNCHHOLE: libc::c_int = 99;
+    let too_big = || {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "punch_hole range exceeds off_t",
+        ))
+    };
     let payload = FPunchHole {
         fp_flags: 0,
         reserved: 0,
-        fp_offset: offset,
-        fp_length: len,
+        fp_offset: libc::off_t::try_from(offset).map_err(|_| too_big())?,
+        fp_length: libc::off_t::try_from(len).map_err(|_| too_big())?,
     };
     let fd = file.as_raw_fd();
     // SAFETY: fd is a valid open file descriptor; `payload` is a
     // stack-allocated `FPunchHole` matching the kernel's
-    // expected size. fcntl with `F_PUNCHHOLE` reads the
+    // expected layout. fcntl with `F_PUNCHHOLE` reads the
     // structure pointed to by the third argument.
     let ret = unsafe { libc::fcntl(fd, F_PUNCHHOLE, &payload as *const FPunchHole) };
-    if ret == 0 {
+    if ret != -1 {
         Ok(())
     } else {
         Err(Error::Io(std::io::Error::last_os_error()))
     }
+}
+
+/// Overwrites `[offset, offset + len)` with zeros using positioned
+/// writes.
+fn zero_fill(file: &File, offset: u64, len: u64) -> Result<()> {
+    let zeros = [0u8; 8192];
+    let mut done = 0u64;
+    while done < len {
+        let chunk = (len - done).min(zeros.len() as u64) as usize;
+        write_at(file, offset + done, &zeros[..chunk])?;
+        done += chunk as u64;
+    }
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -801,6 +893,56 @@ mod tests {
         preallocate(&f, 0, 512 << 10).expect("smaller");
         assert_eq!(allocated_bytes(&f).expect("blocks"), first);
         assert_eq!(f.metadata().expect("meta").len(), 0, "EOF must not move");
+    }
+
+    #[test]
+    fn test_split_punch_range_aligned_and_unaligned() {
+        // Fully aligned: punch only.
+        assert_eq!(
+            split_punch_range(4096, 12288, 4096),
+            PunchPlan {
+                punch: Some((4096, 12288)),
+                zero: [None, None]
+            }
+        );
+        // Unaligned both ends: zero head and tail around the middle.
+        assert_eq!(
+            split_punch_range(100, 10_000, 4096),
+            PunchPlan {
+                punch: Some((4096, 8192)),
+                zero: [Some((100, 4096)), Some((8192, 10_000))],
+            }
+        );
+        // Inside one block: zero only.
+        assert_eq!(
+            split_punch_range(10, 20, 4096),
+            PunchPlan {
+                punch: None,
+                zero: [Some((10, 20)), None]
+            }
+        );
+    }
+
+    #[test]
+    fn test_punch_hole_unaligned_range_reads_back_zero_and_keeps_size() {
+        let path = tmp_path("punch");
+        let _g = TmpFile(path.clone());
+        std::fs::write(&path, vec![0xAAu8; 64 * 1024]).expect("seed");
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open");
+        punch_hole(&f, 1000, 20_000).expect("punch");
+        // Past EOF: clipped, file size unchanged.
+        punch_hole(&f, 60 * 1024, 1 << 20).expect("punch past eof");
+        drop(f);
+        let data = std::fs::read(&path).expect("read");
+        assert_eq!(data.len(), 64 * 1024);
+        assert!(data[..1000].iter().all(|&b| b == 0xAA));
+        assert!(data[1000..21_000].iter().all(|&b| b == 0));
+        assert!(data[21_000..60 * 1024].iter().all(|&b| b == 0xAA));
+        assert!(data[60 * 1024..].iter().all(|&b| b == 0));
     }
 
     #[test]
