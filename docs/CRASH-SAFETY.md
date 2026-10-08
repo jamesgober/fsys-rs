@@ -142,8 +142,8 @@ the reader sees at the journal tail:
 | `TruncatedHeader` | Last frame's 8-byte header is partial, or a frame position holds zero bytes that are not a 1.1.0 writer gap (a reservation that was never written). Truncate at `position()`. | **Yes** |
 | `TruncatedPayload` | Last frame's payload was cut mid-write (its declared length runs past the end of the file). Truncate at frame start. | **Yes** |
 | `ChecksumMismatch` | Frame decoded but CRC-32C check failed. Truncate at frame start. | **Yes** |
-| `BadMagic` | A frame starts with a non-zero byte but its magic+version doesn't match. Format-level corruption; opening the journal fails with `Error::Io(InvalidData)`. | **No**: operator intervention required |
-| `LengthOverflow` | Frame's declared length exceeds the 256 MiB limit. Same as `BadMagic`. | **No** |
+| `BadMagic` | A frame starts with a non-zero byte but its magic+version doesn't match. Format-level corruption, not a crash artifact; report it. Opening the journal truncates here after saving the tail to a sidecar file (see below). | **Prefix only**: the bytes from `position()` on are kept in the sidecar |
+| `LengthOverflow` | Frame's declared length exceeds the 256 MiB limit. Same as `BadMagic`. | **Prefix only** |
 
 For recoverable tail states, the recovery procedure is:
 
@@ -157,17 +157,53 @@ For recoverable tail states, the recovery procedure is:
 Since 1.1.1 `Handle::journal` / `Handle::journal_with` run steps
 1-5 themselves in both modes: the open scans to the end of the
 last clean frame, truncates the file there (Direct-IO keeps the
-rest of that sector and rewrites it on the next flush) and
-resumes appending at that LSN. Before 1.1.1 a buffered open
-resumed at the raw file length, so records appended after a torn
-tail were unreadable.
+rest of that sector, zero-filled, and rewrites it on the next
+flush) and resumes appending at that LSN. Before 1.1.1 a buffered
+open resumed at the raw file length, so records appended after a
+torn tail were unreadable.
 
-For unrecoverable states (`BadMagic`, `LengthOverflow`), the
-reader does **not** auto-truncate: these indicate format-level
-corruption that may extend beyond the tail. Opening such a
-journal fails with `InvalidData` in both modes (buffered opens
-accepted it before 1.1.1). Surface to a human operator for
-triage.
+#### Corrupt tails and the sidecar file (1.1.3)
+
+The reader itself never truncates and still reports `BadMagic` /
+`LengthOverflow` for what they are. Opening a journal for append
+tolerates every tail state the same way, which is the usual
+write-ahead-log rule: the journal is its valid prefix.
+
+1. The open scans to the clean end, as above.
+2. If the bytes from the clean end to the end of the file are all
+   zero (Direct-IO padding, zero-filled preallocation, a
+   reservation that was never written), they are cut off.
+3. Otherwise they are first copied to a sidecar file in the same
+   directory, `<journal file name>.corrupt-<clean end offset>`
+   (decimal). If that name already holds other bytes, `.1`, `.2`,
+   ... is appended; the file is created with `create_new`, never
+   overwritten, and owner-only (`0o600`) on Unix since it may hold
+   record data. The copy is written in full and synced, and the
+   directory is synced, before the journal is truncated, so a
+   crash between the copy and the truncate loses nothing. The
+   reopen after such a crash finds the identical copy, reuses it,
+   and finishes the truncate without writing a second copy.
+4. The journal is truncated to the clean end, synced, and appends
+   resume there, never after the garbage.
+
+If the copy cannot be made (read-only directory, disk full) the
+open fails with `Error::Io` naming the journal and the sidecar,
+and the journal is left unchanged. With the `tracing` feature the
+open emits a `warn` event for a saved tail (path, clean end,
+discarded bytes, tail state, sidecar path) and a `debug` event for
+a dropped zero tail.
+
+Corruption in the middle of the log followed by later valid frames
+is handled the same way: the reader could never get past the first
+bad frame, so the records after it were already unreachable, and
+they are kept in the sidecar for forensic recovery. A file that is
+not an fsys journal at all (or uses a future frame format) opens
+empty, with its whole content in `<name>.corrupt-0`.
+
+1.1.1 and 1.1.2 refused to open a journal whose scan stopped at
+`BadMagic` or `LengthOverflow` (`InvalidData`), and 1.1.0 refused
+it in Direct-IO mode. 1.1.0 buffered opens accepted it but
+appended after the garbage, where nothing was readable.
 
 #### Zero runs
 
@@ -280,6 +316,14 @@ with file manipulation (torn and zero tails, unwritten holes,
 stale frames past the resume point) and multi-threaded stress
 (oversize appends racing small ones, the durable frontier under
 a slow appender, preallocation racing appends).
+
+`tests/journal_corrupt_tail.rs` (1.1.3) covers the sidecar copy
+for every tail state in both modes: random garbage, CRC mismatch,
+length overflow, torn header, partial frame, mid-log corruption,
+an all-zero tail (no sidecar), a name collision, the state a crash
+between the copy and the truncate leaves, and a read-only
+directory (Unix). Unit tests in `src/journal` stop the open at the
+point between the synced copy and the truncate on every platform.
 
 ## Non-write APIs
 

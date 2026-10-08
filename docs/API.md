@@ -698,7 +698,9 @@ match reader.tail_state() {
         // Recoverable — truncate at reader.position() and resume.
     }
     JournalTailState::BadMagic | JournalTailState::LengthOverflow => {
-        // Format corruption — surface to a human operator.
+        // Format corruption: report it. Opening the journal for
+        // append still resumes at reader.position(), after copying
+        // the rest of the file to a `.corrupt-<offset>` sidecar.
     }
     _ => {}
 }
