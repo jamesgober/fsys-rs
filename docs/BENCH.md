@@ -332,7 +332,7 @@ release-prep bare-metal Linux re-run.
 | io_uring elite flags (`COOP_TASKRUN` / `SINGLE_ISSUER` / `DEFER_TASKRUN`) | 0.9.4 | ~5–15% per-op reduction on supported kernels | covered by all io_uring benches |
 | Linked Write+Fsync via `IOSQE_IO_LINK` | 0.9.4 | ~2× round-trip reduction on durable Direct writes | needs dedicated bench |
 | Dual-buffer Direct-mode log buffer | 0.9.5 | Direct mode: single-core ceiling → multi-core scalable | needs concurrent-append bench |
-| `IORING_REGISTER_FILES` slot-upgrade | 0.9.5 | ~50–200 ns per SQE | not isolable in user-space bench |
+| `IORING_REGISTER_FILES` slot-upgrade | 0.9.5, removed 1.1.1 | none: removed because the fd-keyed slot cache misrouted writes after fd reuse | n/a |
 | `IORING_OP_WRITE_FIXED` Direct journal flush | 0.9.6 | Saves per-SQE kernel buffer pinning | not isolable in user-space bench |
 | APFS `clonefile(2)` / ReFS `FSCTL_DUPLICATE_EXTENTS_TO_FILE` reflinks | 0.9.6 | Multi-GiB clones: seconds → microseconds | filesystem-specific bench needed |
 | GroupCommit wake-stampede fix | 0.9.7 | ~5× lock-hold reduction under 100+ followers | covered by stress test |

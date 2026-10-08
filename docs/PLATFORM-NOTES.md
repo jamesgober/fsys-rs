@@ -66,10 +66,10 @@ elite setup flags the kernel supports:
 | `IORING_SETUP_COOP_TASKRUN` | ≥ 5.19 | Defer completion task work until convenient (reduces IPIs). Pure perf hint. |
 | `IORING_SETUP_SINGLE_ISSUER` | ≥ 6.0 | Kernel-enforced same-task submission. Sync ring only — async substrate disabled because tokio migrates tasks. |
 | `IORING_SETUP_DEFER_TASKRUN` | ≥ 6.1 | Requires `SINGLE_ISSUER`. Sync ring only — needs explicit `io_uring_enter(GETEVENTS)` driving which the async eventfd loop doesn't do. |
-| `IORING_REGISTER_FILES` (0.9.5) | ≥ 5.1 | Pre-register fd-table slots; per-op submissions use `IOSQE_FIXED_FILE`, saving per-SQE kernel-side fd validation. |
+| `IORING_REGISTER_FILES` (0.9.5, removed in 1.1.1) | n/a | No longer used. The slot cache was keyed by fd number and sent writes to the wrong file once a closed fd number was reused; every SQE now carries the caller's raw fd. |
 | `IORING_OP_WRITE_FIXED` (0.9.6) | ≥ 5.6 | Pre-register buffer slots; writes against fixed slots avoid per-SQE kernel buffer pinning. Used by the journal Direct-mode flush path. |
 | `IORING_REGISTER_BUFFERS` (0.9.6) | ≥ 5.1 | Companion to `WRITE_FIXED` — registers the `AlignedBuf` slots. |
-| `IORING_SETUP_SQPOLL` (0.9.7, opt-in) | ≥ 5.13 | Kernel-side polling thread drains the SQ without syscalls. Opt-in via `Builder::sqpoll(idle_ms)`. Requires `CAP_SYS_NICE` on kernels < 5.13. |
+| `IORING_SETUP_SQPOLL` (0.9.7, opt-in) | ≥ 5.13 | Kernel-side polling thread drains the SQ without syscalls. Opt-in via `Builder::sqpoll(idle_ms)`. Requires `CAP_SYS_NICE` on kernels < 5.13. Before 5.11 an SQPOLL ring only accepts registered files, so with raw-fd SQEs each op fails and the Direct path falls back to `pwrite`. |
 
 All flags downgrade gracefully on older kernels; unsupported
 flags are silently omitted and the ring builds with whatever

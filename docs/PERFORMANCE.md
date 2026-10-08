@@ -89,8 +89,11 @@ Soak success criteria:
 `Builder` exposes:
 
 - `io_uring_queue_depth(u32)` — Linux io_uring SQ depth. Default
-  128. Higher depths help when the workload has many in-flight
-  ops; lower depths reduce kernel memory.
+  128. The sync `Method::Direct` ring serves one op at a time per
+  Handle (writes from many threads queue behind each other), so
+  depth only sizes that ring. The native async substrate keeps up
+  to one completion queue's worth of ops (twice the depth) in
+  flight. Lower depths reduce kernel memory.
 - `buffer_pool_count(usize)` — number of aligned buffers in the
   per-handle pool. Default 64.
 - `buffer_pool_block_size(usize)` — size of each buffer (in bytes,
