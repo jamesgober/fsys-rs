@@ -528,26 +528,20 @@ pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
 /// macOS preallocate via `fcntl(F_PREALLOCATE)`. Tries
 /// contiguous allocation first (`F_ALLOCATECONTIG`); falls back
 /// to non-contiguous (`F_ALLOCATEALL`) if the contiguous request
-/// can't be satisfied.
+/// can't be satisfied. The logical file size is not changed.
+///
+/// `F_PEOFPOSMODE` allocates `fst_length` bytes *past the physical end
+/// of file*, i.e. on top of whatever is already allocated (fcntl(2)).
+/// Passing `offset + len` every time therefore grew the file's
+/// allocation on each call. Instead, the bytes already allocated
+/// (`st_blocks * 512` from `fstat`) are subtracted and only the
+/// shortfall up to `offset + len` is requested; a range that is already
+/// covered is a no-op.
 pub(crate) fn preallocate(file: &File, offset: u64, len: u64) -> Result<()> {
     if len == 0 {
         return Ok(());
     }
-    // macOS preallocation goes through `fcntl(F_PREALLOCATE)` with
-    // an `fstore_t` describing the request. The `fst_posmode` field
-    // selects how `fst_offset` is interpreted:
-    //   - `F_PEOFPOSMODE` (3): allocate `fst_length` bytes past the
-    //     current logical EOF. `fst_offset` is unused.
-    //   - `F_VOLPOSMODE`  (4): allocate at a specific volume-physical
-    //     offset (advanced use; typically rejected with EINVAL on
-    //     ordinary files).
-    //
-    // For our semantic — reserve disk extents for an append-only
-    // journal — `F_PEOFPOSMODE` is the correct mode. The caller's
-    // `offset` parameter is interpreted as "additional bytes past
-    // current EOF", which on a fresh / append-only file matches
-    // the Linux `fallocate(offset, len)` behaviour for the usual
-    // calling shape (`preallocate(0, total_journal_size)`).
+    // `fstore_t` from <sys/fcntl.h>.
     #[repr(C)]
     struct Fstore {
         fst_flags: u32,
@@ -561,23 +555,35 @@ pub(crate) fn preallocate(file: &File, offset: u64, len: u64) -> Result<()> {
     const F_ALLOCATEALL: u32 = 0x0000_0004;
     const F_PEOFPOSMODE: i32 = 3;
 
+    let target = offset.checked_add(len).ok_or_else(|| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "preallocate range overflows u64",
+        ))
+    })?;
+    let allocated = allocated_bytes(file)?;
+    let Some(shortfall) = preallocate_shortfall(target, allocated) else {
+        return Ok(());
+    };
+    let fst_length = libc::off_t::try_from(shortfall).map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "preallocate length exceeds off_t",
+        ))
+    })?;
+
     let fd = file.as_raw_fd();
-    // Reserve `offset + len` bytes past current EOF — this covers
-    // both the typical `preallocate(0, total)` case and the
-    // less-common `preallocate(off, len)` case where the caller
-    // wants extents reserved for a region they'll write later.
-    let total_to_reserve = offset.saturating_add(len) as libc::off_t;
     let mut store = Fstore {
         fst_flags: F_ALLOCATECONTIG | F_ALLOCATEALL,
         fst_posmode: F_PEOFPOSMODE,
         fst_offset: 0,
-        fst_length: total_to_reserve,
+        fst_length,
         fst_bytesalloc: 0,
     };
     // SAFETY: fd is valid; F_PREALLOCATE expects an `fstore_t *`
     // and reads/writes only that struct.
     let ret = unsafe { libc::fcntl(fd, F_PREALLOCATE, &mut store) };
-    if ret == 0 {
+    if ret != -1 {
         return Ok(());
     }
     // Contiguous allocation failed — retry without F_ALLOCATECONTIG.
@@ -585,11 +591,25 @@ pub(crate) fn preallocate(file: &File, offset: u64, len: u64) -> Result<()> {
     store.fst_bytesalloc = 0;
     // SAFETY: same as above.
     let ret = unsafe { libc::fcntl(fd, F_PREALLOCATE, &mut store) };
-    if ret == 0 {
+    if ret != -1 {
         Ok(())
     } else {
         Err(Error::Io(std::io::Error::last_os_error()))
     }
+}
+
+/// Bytes still to allocate so the file's allocation reaches `target`, or
+/// `None` when `allocated` already covers it.
+fn preallocate_shortfall(target: u64, allocated: u64) -> Option<u64> {
+    target.checked_sub(allocated).filter(|&n| n > 0)
+}
+
+/// Bytes allocated to `file` on disk: `st_blocks` counts 512-byte units
+/// regardless of the file system block size.
+fn allocated_bytes(file: &File) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata().map_err(Error::Io)?;
+    Ok(meta.blocks().saturating_mul(512))
 }
 
 /// macOS advise — limited surface vs Linux. Sequential / WillNeed
@@ -754,6 +774,33 @@ mod tests {
     #[test]
     fn test_sync_full_on_bad_fd_errors() {
         assert!(full_fsync_fd(-1).is_err());
+    }
+
+    #[test]
+    fn test_preallocate_shortfall() {
+        assert_eq!(preallocate_shortfall(4096, 0), Some(4096));
+        assert_eq!(preallocate_shortfall(4096, 1024), Some(3072));
+        assert_eq!(preallocate_shortfall(4096, 4096), None);
+        assert_eq!(preallocate_shortfall(4096, 8192), None);
+    }
+
+    #[test]
+    fn test_preallocate_repeated_call_does_not_keep_growing() {
+        let path = tmp_path("prealloc");
+        let _g = TmpFile(path.clone());
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open");
+        preallocate(&f, 0, 1 << 20).expect("first");
+        let first = allocated_bytes(&f).expect("blocks");
+        preallocate(&f, 0, 1 << 20).expect("second");
+        preallocate(&f, 0, 512 << 10).expect("smaller");
+        assert_eq!(allocated_bytes(&f).expect("blocks"), first);
+        assert_eq!(f.metadata().expect("meta").len(), 0, "EOF must not move");
     }
 
     #[test]

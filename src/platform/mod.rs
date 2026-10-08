@@ -654,6 +654,10 @@ pub(crate) fn probe_direct_io_available() -> bool {
 /// - **macOS:** `fcntl(fd, F_PREALLOCATE, ...)` with
 ///   `F_ALLOCATECONTIG | F_ALLOCATEALL` flags. Falls back to
 ///   `F_ALLOCATEALL` alone if contiguous allocation fails.
+///   `F_PREALLOCATE` allocates relative to the file's current
+///   allocation, so only the shortfall between `offset + len` and the
+///   bytes already allocated (`st_blocks * 512`) is requested; a range
+///   that is already covered is a no-op.
 /// - **Windows:** `SetFileInformationByHandle(FileAllocationInfo)`
 ///   reserves clusters up to `offset + len` without moving EOF. The
 ///   reservation only grows: a request already covered by the current
