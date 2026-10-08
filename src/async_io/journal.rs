@@ -28,7 +28,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[cfg(all(target_os = "linux", feature = "async"))]
-use crate::async_io::completion_driver::AsyncIoUring;
+use crate::async_io::completion_driver::{AsyncIoUring, FileRef, IoBuf};
 
 /// Default queue depth for journal-owned io_uring rings on Linux.
 /// 256 is large enough to absorb burst append load without backpressure
@@ -184,7 +184,14 @@ impl JournalHandle {
     /// borrowed` on the `--no-default-features --features async`
     /// build (caught by the new feature-matrix CI job, not the
     /// default-features Linux test).
-    async fn append_native(&self, ring: &AsyncIoUring, record: Vec<u8>) -> Result<Lsn> {
+    ///
+    /// 1.1.1: takes `&Arc<Self>` so the op can hold a clone of the
+    /// journal as its file keep-alive, and moves the frame into the
+    /// driver. Once the first poll has queued the write, dropping
+    /// this future cannot free the frame or close the fd while the
+    /// kernel is still writing, and the reserved LSN range is always
+    /// filled.
+    async fn append_native(self: &Arc<Self>, ring: &AsyncIoUring, record: Vec<u8>) -> Result<Lsn> {
         use std::os::fd::AsRawFd;
 
         // Encode the frame on the calling task's stack/heap. The
@@ -192,7 +199,8 @@ impl JournalHandle {
         // less than the kernel-side write latency, so no win
         // pushing it to the io_uring side.
         let frame = crate::journal::format::encode_frame_owned(&record)?;
-        let frame_len = frame.len() as u64;
+        let frame_bytes = frame.len();
+        let frame_len = frame_bytes as u64;
 
         // `Release` (0.9.7 M-2 — was `AcqRel`). Same reasoning
         // as the sync-path equivalent in `journal/mod.rs:604`:
@@ -202,10 +210,15 @@ impl JournalHandle {
         // synchronises-with this `Release`.
         let start = self.next_lsn.fetch_add(frame_len, Ordering::Release);
         let end = start + frame_len;
-        let fd = self.file.as_raw_fd();
-        let n =
-            crate::async_io::iouring_substrate::write_at_native(ring, fd, &frame, start).await?;
-        if n != frame.len() {
+        let file = FileRef::new(Arc::clone(self), |j| j.file.as_raw_fd());
+        let n = crate::async_io::iouring_substrate::write_at_native(
+            ring,
+            file,
+            IoBuf::Vec(frame),
+            start,
+        )
+        .await?;
+        if n != frame_bytes {
             return Err(Error::Io(std::io::Error::other(
                 "native io_uring write returned short count on journal append",
             )));
@@ -225,63 +238,117 @@ impl JournalHandle {
     /// callers naturally arrive on a different timescale than
     /// sync callers, and the io_uring fsync is itself zero-
     /// syscall-cost on the submitter side.
-    // 0.9.6 audit fix: takes `&self` rather than `self: Arc<Self>`
-    // (same E0505 borrow conflict as `append_native` — see its doc
-    // comment for the explanation).
-    async fn sync_through_native(&self, ring: &AsyncIoUring, lsn: Lsn) -> Result<()> {
+    ///
+    /// 1.1.1: the state lock is taken only inside the synchronous
+    /// [`Self::try_lead_group_commit`] helper and in the `Drop` of
+    /// [`LeaderLease`], so no `parking_lot` guard is ever alive across
+    /// an `.await` and the future stays `Send` (it was `!Send` on
+    /// Linux in 1.1.0 because the guard binding spanned the yields).
+    /// The leader role is held by a [`LeaderLease`], so dropping this
+    /// future mid-fsync still clears `in_flight`; in 1.1.0 a cancelled
+    /// leader left it set and every later sync on the journal waited
+    /// forever.
+    async fn sync_through_native(self: &Arc<Self>, ring: &AsyncIoUring, lsn: Lsn) -> Result<()> {
         use std::os::fd::AsRawFd;
 
         let lsn_off = lsn.as_u64();
         loop {
-            // Atomic-load fast path — cheaper than a lock
-            // acquire when the durable frontier already covers
-            // our target.
+            // Atomic-load fast path: cheaper than a lock acquire
+            // when the durable frontier already covers our target.
             if self.synced_lsn.load(Ordering::Acquire) >= lsn_off {
                 return Ok(());
             }
-            // Non-blocking try_lock so the tokio worker isn't
-            // parked on a contended mutex.
-            let mut state = match self.group_commit.state.try_lock() {
-                Some(g) => g,
-                None => {
+            match self.try_lead_group_commit(lsn_off) {
+                LeaderAttempt::Covered => return Ok(()),
+                // Lock contended, or another caller (sync or async)
+                // is running the fsync. Yield; on resume the
+                // synced_lsn fast path or committed_lsn re-check
+                // will likely cover us.
+                LeaderAttempt::Busy => {
                     tokio::task::yield_now().await;
                     continue;
                 }
-            };
-            if state.committed_lsn >= lsn_off {
-                return Ok(());
+                LeaderAttempt::Leader(mut lease) => {
+                    let frontier = self.next_lsn.load(Ordering::Acquire);
+                    let file = FileRef::new(Arc::clone(self), |j| j.file.as_raw_fd());
+                    let result =
+                        crate::async_io::iouring_substrate::fdatasync_native(ring, file).await;
+                    if result.is_ok() {
+                        lease.durable_frontier = Some(frontier);
+                    }
+                    // Publishes the frontier, clears `in_flight` and
+                    // wakes followers.
+                    drop(lease);
+                    return result;
+                }
             }
-            if state.in_flight {
-                // Another caller (sync or async) is running
-                // fsync. Drop the lock and yield; on resume,
-                // the synced_lsn fast path or committed_lsn
-                // re-check will likely cover us.
-                drop(state);
-                tokio::task::yield_now().await;
-                continue;
-            }
-            // Become leader. Mark in_flight, release the lock
-            // before submitting the io_uring SQE so concurrent
-            // followers can observe the in-flight state.
-            state.in_flight = true;
-            drop(state);
-
-            let frontier = self.next_lsn.load(Ordering::Acquire);
-            let fd = self.file.as_raw_fd();
-            let result = crate::async_io::iouring_substrate::fdatasync_native(ring, fd).await;
-
-            // Re-acquire to publish committed_lsn and clear
-            // in_flight; notify any parked sync-path
-            // followers via cv_followers.
-            let mut state = self.group_commit.state.lock();
-            if result.is_ok() && frontier > state.committed_lsn {
-                state.committed_lsn = frontier;
-                self.synced_lsn.store(frontier, Ordering::Release);
-            }
-            state.in_flight = false;
-            let _ = self.group_commit.cv_followers.notify_all();
-            return result;
         }
+    }
+
+    /// Tries to become the group-commit leader for `lsn_off` without
+    /// blocking. On [`LeaderAttempt::Leader`] this caller has set
+    /// `in_flight`; the returned lease clears it when dropped.
+    fn try_lead_group_commit(&self, lsn_off: u64) -> LeaderAttempt<'_> {
+        // Non-blocking try_lock so the tokio worker isn't parked on a
+        // contended mutex.
+        let Some(mut state) = self.group_commit.state.try_lock() else {
+            return LeaderAttempt::Busy;
+        };
+        if state.committed_lsn >= lsn_off {
+            return LeaderAttempt::Covered;
+        }
+        if state.in_flight {
+            return LeaderAttempt::Busy;
+        }
+        // Become leader. The lock is released on return, before the
+        // SQE is submitted, so concurrent followers observe the
+        // in-flight state.
+        state.in_flight = true;
+        LeaderAttempt::Leader(LeaderLease {
+            journal: self,
+            durable_frontier: None,
+        })
+    }
+}
+
+/// Outcome of [`JournalHandle::try_lead_group_commit`].
+#[cfg(all(target_os = "linux", feature = "async"))]
+enum LeaderAttempt<'a> {
+    /// A completed fsync already covers the target LSN.
+    Covered,
+    /// The state lock is contended or another fsync is in flight.
+    Busy,
+    /// This caller set `in_flight` and runs the fsync.
+    Leader(LeaderLease<'a>),
+}
+
+/// The group-commit leader role, held across the async fsync.
+///
+/// Dropping the lease publishes `durable_frontier` (when set),
+/// clears `in_flight` and wakes parked sync-path followers. Because
+/// that happens in `Drop`, it also runs when the leader's future is
+/// cancelled mid-fsync; the next caller then becomes leader and
+/// issues its own fsync.
+#[cfg(all(target_os = "linux", feature = "async"))]
+struct LeaderLease<'a> {
+    journal: &'a JournalHandle,
+    /// LSN covered by a successful fsync. `None` (failed or
+    /// cancelled) publishes nothing.
+    durable_frontier: Option<u64>,
+}
+
+#[cfg(all(target_os = "linux", feature = "async"))]
+impl Drop for LeaderLease<'_> {
+    fn drop(&mut self) {
+        let mut state = self.journal.group_commit.state.lock();
+        if let Some(frontier) = self.durable_frontier {
+            if frontier > state.committed_lsn {
+                state.committed_lsn = frontier;
+                self.journal.synced_lsn.store(frontier, Ordering::Release);
+            }
+        }
+        state.in_flight = false;
+        let _woken = self.journal.group_commit.cv_followers.notify_all();
     }
 }
 
@@ -442,6 +509,89 @@ mod tests {
         .await;
     }
 
+    /// FS-H5: both async journal futures must be `Send` so callers
+    /// can hand them to `tokio::spawn`. In 1.1.0 the Linux native
+    /// path kept a `parking_lot` guard binding alive across `.await`,
+    /// which made `sync_through_async` `!Send` there; this test then
+    /// failed to compile on Linux.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_async_journal_futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        with_timeout(async {
+            let path = tmp_path("send");
+            let _g = Cleanup(path.clone());
+            let fs = builder().build().expect("handle");
+            let log = Arc::new(fs.journal(&path).expect("journal"));
+
+            let append = log.clone().append_async(b"spawned".to_vec());
+            assert_send(&append);
+            let lsn = tokio::spawn(append).await.expect("join").expect("append");
+
+            let sync = log.clone().sync_through_async(lsn);
+            assert_send(&sync);
+            tokio::spawn(sync).await.expect("join").expect("sync");
+            assert!(log.synced_lsn() >= lsn);
+        })
+        .await;
+    }
+
+    /// FS-H1: dropping a `sync_through_async` leader after its first
+    /// poll (fsync submitted, `in_flight` set) must not wedge the
+    /// journal. In 1.1.0 `in_flight` stayed `true` and every later
+    /// sync, async or blocking, waited forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelled_sync_leader_does_not_block_later_syncs() {
+        with_timeout(async {
+            let path = tmp_path("cancel_leader");
+            let _g = Cleanup(path.clone());
+            let fs = builder().build().expect("handle");
+            let log = Arc::new(fs.journal(&path).expect("journal"));
+
+            for round in 0..8u8 {
+                let lsn = log
+                    .clone()
+                    .append_async(vec![round; 128])
+                    .await
+                    .expect("append");
+                {
+                    let fut = log.clone().sync_through_async(lsn);
+                    tokio::pin!(fut);
+                    // Poll the leader exactly once, then drop it.
+                    tokio::select! {
+                        biased;
+                        r = &mut fut => r.expect("leader finished on first poll"),
+                        () = std::future::ready(()) => {}
+                    }
+                }
+
+                let next = log
+                    .clone()
+                    .append_async(vec![round; 64])
+                    .await
+                    .expect("append after cancel");
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    log.clone().sync_through_async(next),
+                )
+                .await
+                .expect("sync_through_async hung after a cancelled leader")
+                .expect("sync_through_async");
+
+                let blocking = log.clone();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    tokio::task::spawn_blocking(move || blocking.sync_through(next)),
+                )
+                .await
+                .expect("sync_through hung after a cancelled leader")
+                .expect("join")
+                .expect("sync_through");
+                assert!(log.synced_lsn() >= next);
+            }
+        })
+        .await;
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn native_iouring_engages_on_linux_when_available() {
@@ -458,17 +608,21 @@ mod tests {
                 .await
                 .expect("append");
 
-            // On a Linux runner with io_uring available, native should
-            // engage. On a Linux runner WITHOUT io_uring (sandboxed CI,
-            // containers without the syscall), it stays inactive.
-            // Both are valid outcomes — the test pins that the field
-            // *transitions* to a defined state (Some(_), not None).
-            // We don't assert specifically true/false because the
-            // runtime environment varies.
+            // The first append settles the substrate choice: the
+            // OnceLock is populated either way, and the native path
+            // is active exactly when this kernel lets us build an
+            // async ring (sandboxed CI without io_uring falls back).
+            assert!(
+                log.native_ring.get().is_some(),
+                "first append_async must settle the substrate choice"
+            );
+            let ring_available = AsyncIoUring::new(8).is_ok();
             let active = log.native_iouring_active();
-            // Just confirm the value is well-defined (either true or
-            // false). The OnceLock should have been populated.
-            assert!(active || !active);
+            assert_eq!(active, ring_available);
+            assert_eq!(
+                log.backend_kind() == crate::JournalBackendKind::KernelIoUring,
+                active
+            );
         })
         .await;
     }

@@ -12,12 +12,14 @@
 //! Two Criterion benchmark groups, both writing the same 4 KiB
 //! payload to a temp file via `Method::Direct`:
 //!
-//! 1. **`async_blocking_write_4k`** — `FSYS_DISABLE_NATIVE_ASYNC=1`
-//!    forces the substrate to `SpawnBlocking`. Every async op
-//!    bounces through `tokio::task::spawn_blocking`.
-//! 2. **`async_native_write_4k`** — env override unset; substrate
-//!    transitions to `NativeIoUring` after the first warmup op.
-//!    Submissions go directly through io_uring.
+//! 1. **`async_blocking_write_4k`**: the sync `Handle::write`
+//!    run through `tokio::task::spawn_blocking`, which is exactly
+//!    what the `SpawnBlocking` substrate does for `write_async`.
+//! 2. **`async_native_write_4k`**: `write_async` with the native
+//!    substrate, which engages after the first warmup op.
+//!    Submissions go directly through io_uring. Run the whole bench
+//!    with `FSYS_DISABLE_NATIVE_ASYNC=1` to force this group onto
+//!    the fallback too (the variable is read once per process).
 //!
 //! Both run on the same machine; the relative speedup is what we
 //! measure. Per D-8, WSL is partially valid for this comparison
@@ -67,15 +69,11 @@ fn build_runtime() -> Runtime {
 
 fn bench_async_blocking_write_4k(c: &mut Criterion) {
     let rt = build_runtime();
-    // Force the SpawnBlocking substrate via env override so the
-    // bench measures the fallback path even on Linux + Direct.
-    // SAFETY: single-threaded bench process; no concurrent env
-    // mutation. Restored at the end of the function.
-    let prior = std::env::var_os("FSYS_DISABLE_NATIVE_ASYNC");
-    unsafe {
-        std::env::set_var("FSYS_DISABLE_NATIVE_ASYNC", "1");
-    }
-
+    // Measure the `spawn_blocking` fallback by running exactly what
+    // that substrate runs: the sync `Handle::write` on tokio's
+    // blocking pool. `FSYS_DISABLE_NATIVE_ASYNC` is read once per
+    // process, so toggling it here would also switch the native
+    // group below to the fallback.
     let fs = Arc::new(builder().method(Method::Direct).build().expect("handle"));
     let payload = vec![0xA5u8; 4096];
 
@@ -87,20 +85,13 @@ fn bench_async_blocking_write_4k(c: &mut Criterion) {
             let fs = fs.clone();
             let payload = payload.clone();
             rt.block_on(async move {
-                let _ = fs.write_async(&path, payload).await;
+                let target = path.clone();
+                let _ = tokio::task::spawn_blocking(move || fs.write(&target, &payload)).await;
                 let _ = std::fs::remove_file(&path);
             });
         });
     });
     group.finish();
-
-    // Restore env. SAFETY: same as set above.
-    unsafe {
-        match prior {
-            Some(v) => std::env::set_var("FSYS_DISABLE_NATIVE_ASYNC", v),
-            None => std::env::remove_var("FSYS_DISABLE_NATIVE_ASYNC"),
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]

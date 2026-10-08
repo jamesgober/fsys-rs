@@ -301,7 +301,7 @@ pub enum Error {
     /// operations on this handle are rejected with this error. The
     /// handle's **sync** operations continue to work normally — only
     /// the native async substrate is poisoned. Construct a fresh
-    /// handle for further async work, or set
+    /// handle for further async work, or start the process with
     /// `FSYS_DISABLE_NATIVE_ASYNC=1` and rely on the
     /// [`spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html)
     /// fallback. Diagnostic detail (e.g. the panic message) is in

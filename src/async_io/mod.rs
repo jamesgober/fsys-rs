@@ -50,6 +50,19 @@ pub(crate) mod completion_driver;
 #[cfg(target_os = "linux")]
 pub(crate) mod iouring_substrate;
 
+/// Whether the `FSYS_DISABLE_NATIVE_ASYNC` override is set.
+///
+/// Read from the environment on the first call and cached for the
+/// life of the process, so the async write hot path does not take
+/// the environment lock and scan `environ` on every call. Set the
+/// variable before the process performs its first async write;
+/// changing it afterwards has no effect on `write_async`.
+#[cfg(target_os = "linux")]
+pub(crate) fn native_async_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("FSYS_DISABLE_NATIVE_ASYNC").is_some())
+}
+
 /// Returns an [`crate::Error::AsyncRuntimeRequired`] error when the
 /// caller invokes an `_async` method outside a tokio runtime.
 ///

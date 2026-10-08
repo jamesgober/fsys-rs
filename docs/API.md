@@ -406,8 +406,11 @@ on Linux + Direct. Useful for:
 - CI runners where io_uring is unavailable but you want
   consistent behaviour.
 
-The override is read once on each `async_substrate()` call —
-no re-export at process start needed.
+`write_async` reads the variable once per process (on its first
+call) and caches the answer, so set it before the first async
+write; changing it later does not move `write_async` between
+substrates. `async_substrate()` still checks the variable on each
+call.
 
 ### Why Linux-only
 

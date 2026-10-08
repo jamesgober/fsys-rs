@@ -56,7 +56,7 @@ prohibited. Diagram reflects the architecture as of **0.9.7**.
 │  Platform: linux / macos / windows          │
 │   atomic-replace, Direct IO, NVMe pass-     │
 │   through, io_uring elite flags + WRITE_    │
-│   FIXED + REGISTER_FILES (0.9.4–0.9.7),     │
+│   FIXED (0.9.4–0.9.6),                      │
 │   APFS clonefile / ReFS reflinks (0.9.6),   │
 │   punch_hole / write_zeros (0.9.5)          │
 └────────┬────────────────────────────────────┘
@@ -127,7 +127,10 @@ prohibited. Diagram reflects the architecture as of **0.9.7**.
   the **native io_uring substrate** (Linux + `Method::Direct`
   + ring active + no `FSYS_DISABLE_NATIVE_ASYNC`) submits
   directly to the per-handle ring and `.await`s a `oneshot`
-  driven by a per-handle completion driver task, while the
+  driven by a per-handle completion driver task. The driver takes
+  ownership of each op's buffer and keeps its file open until the
+  kernel has completed it, so dropping an async future mid-write
+  cannot free memory or close an fd the kernel is still using. The
   **`spawn_blocking` fallback** (every other configuration)
   hops a thread-pool. Read which one a handle uses via
   `Handle::async_substrate()`. Async batch routes through the

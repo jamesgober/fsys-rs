@@ -1,52 +1,45 @@
 //! Linux `io_uring` submission wrapper (owner-thread design).
 //!
-//! ## rustc 1.95 ICE workaround
-//!
-//! rustc 1.95.0 panics during the `dead_code` analysis pass on this
-//! module:
-//!
-//! ```text
-//! thread 'rustc' panicked at library/core/src/slice/index.rs:1031:55:
-//!   slice index starts at 23 but ends at 21
-//! query stack during panic:
-//! #0 [check_mod_deathness] checking deathness of variables in
-//!     module `platform::linux_iouring`
-//! ```
-//!
-//! Empirically the trigger is a combination of `io_uring::IoUring`
-//! references plus our specific module structure — bisection ruled
-//! out individual factors (channel + spawn alone is fine; a single
-//! `&mut io_uring::IoUring` parameter alone reproduces; etc.).
-//! Module-level `#![allow(dead_code)]` skips the buggy lint path
-//! entirely without affecting correctness — every public item in
-//! this module is reachable from `Handle::io_uring_ring`, so there
-//! is no real dead code to suppress. See the historical record in
-//! `.dev/DECISIONS-0.5.0.md`'s "io_uring blocker" section.
-//!
-//! ## Design — owner thread instead of `Mutex<IoUring>`
+//! ## Design: owner thread instead of `Mutex<IoUring>`
 //!
 //! `io_uring::IoUring` is `!Sync` (the SQ/CQ rings are SPSC). The
-//! natural `Mutex<IoUring>` shape was the original blocker for the
-//! 0.5.0 lift; we keep the owner-thread design here because it is
-//! a cleaner architectural fit for a !Sync resource and because it
-//! generalises to a per-thread sharded design in 0.6.0 without an
-//! API break.
+//! ring lives on a dedicated owner thread; callers forward
+//! operations through a bounded `crossbeam_channel` and block on a
+//! per-op reply channel.
 //!
-//! The `io_uring::IoUring` value lives only on the owner thread's
-//! stack frame — never as a struct field, never as a function
-//! parameter at module scope. All submission logic is inlined into
-//! [`owner_loop`]'s match arms.
+//! ## Throughput model
+//!
+//! Each [`IoUringRing`] serves one operation at a time: the owner
+//! thread pushes the op's SQE (two for the linked write + fsync),
+//! calls `submit_and_wait`, reaps the CQEs and replies before it
+//! takes the next op off the channel. Concurrent callers on the same
+//! Handle queue on the channel and are served in arrival order, so
+//! the configured queue depth sizes the ring but does not keep
+//! several ops in flight. What the ring buys over plain `pwrite` +
+//! `fdatasync` is the linked write + fsync chain (one
+//! `io_uring_enter(2)` instead of two syscalls), not parallelism.
 //!
 //! ## Buffer lifetime
 //!
 //! [`IoUringRing::write_at`] / [`IoUringRing::read_at`] forward the
-//! buffer's raw pointer + length through a bounded
-//! `crossbeam_channel`, then **block** on a per-op reply channel.
-//! The kernel completes the operation before the owner thread
-//! signals reply, and the caller's `&[u8]` / `&mut [u8]` borrow is
-//! held alive across the call. This is the standard sync-io_uring
-//! contract — the unsafe blocks in [`owner_loop`] document the
-//! pre-condition explicitly.
+//! buffer's raw pointer + length to the owner thread and **block**
+//! until it replies. The owner thread replies only after the kernel
+//! has posted a CQE for every SQE of the op: `submit_and_wait` is
+//! retried across `EINTR` (a signal can cut the wait short after the
+//! SQE was already consumed), so the caller's `&[u8]` / `&mut [u8]`
+//! borrow always outlives the kernel's use of the memory. If the
+//! kernel refuses a submission outright, the SQEs never left the
+//! submission queue; the owner replies with an error and shuts the
+//! ring down so the stale SQE can never be submitted later.
+//!
+//! ## Large transfers
+//!
+//! One SQE carries at most [`MAX_SQE_LEN`] bytes (the kernel caps a
+//! single read or write at `MAX_RW_COUNT`, just under 2 GiB, in any
+//! case). [`IoUringRing::write_at`], [`IoUringRing::read_at`] and
+//! [`IoUringRing::write_at_fixed`] split larger buffers and loop on
+//! short transfers, so no length is ever truncated into the SQE's
+//! 32-bit length field.
 //!
 //! ## Failure semantics
 //!
@@ -55,22 +48,32 @@
 //! [`Error::IoUringSetupFailed`]. Per locked decision #1 + R-2''' in
 //! `.dev/DECISIONS-0.5.0.md`, callers (the `Method::Direct` backend
 //! in `crud/file.rs`) catch the error and fall back to `O_DIRECT` +
-//! `pwrite` + `fdatasync`. `active_method` is **not** downgraded —
+//! `pwrite` + `fdatasync`. `active_method` is **not** downgraded;
 //! the durability contract is identical.
 
 #![cfg(target_os = "linux")]
-#![allow(dead_code)]
 
 use crate::{Error, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::os::fd::RawFd;
 use std::thread::{self, JoinHandle};
 
+/// Largest byte count placed in a single read/write SQE.
+///
+/// The kernel caps one read or write at `MAX_RW_COUNT`
+/// (`INT_MAX & PAGE_MASK`), so a longer request would come back
+/// short anyway. `0x7fff_0000` is below that cap for every page size
+/// up to 64 KiB and is a multiple of 64 KiB, so a chunk boundary
+/// never breaks `O_DIRECT` sector alignment. It also fits the SQE's
+/// `u32` length field.
+pub(crate) const MAX_SQE_LEN: usize = 0x7fff_0000;
+
 /// Per-handle io_uring submission ring.
 ///
 /// Constructed lazily by [`crate::handle::Handle::io_uring_ring`] on
 /// the first Direct-method op when the configured method matches.
-/// Idle handles cost zero ring memory and no spawned threads.
+/// Idle handles cost zero ring memory and no spawned threads. See
+/// the module docs for the one-op-at-a-time throughput model.
 pub(crate) struct IoUringRing {
     /// Sender for forwarding operations to the owner thread.
     /// `Option` so [`Drop::drop`] can take it (closing the channel)
@@ -82,6 +85,9 @@ pub(crate) struct IoUringRing {
 }
 
 /// Operations the owner thread can execute against the ring.
+///
+/// Every `buf_len` is at most [`MAX_SQE_LEN`]; the public methods on
+/// [`IoUringRing`] split longer buffers before sending.
 enum Op {
     Write {
         fd: RawFd,
@@ -107,12 +113,16 @@ enum Op {
     /// only signals completion of the chain when both have
     /// executed. Halves the durability syscall round-trip vs
     /// submitting two independent SQEs and waiting for each.
+    ///
+    /// The reply carries `(bytes_written, fsync_ran)`. A short write
+    /// breaks the link, the kernel cancels the fsync, and
+    /// `fsync_ran` comes back `false`.
     WriteLinkedFsync {
         fd: RawFd,
         buf_ptr: usize,
         buf_len: usize,
         offset: u64,
-        reply: Sender<Result<usize>>,
+        reply: Sender<Result<(usize, bool)>>,
     },
     /// 0.9.6: register a fixed set of buffers with the ring via
     /// `IORING_REGISTER_BUFFERS`. The kernel pins the buffer
@@ -121,7 +131,7 @@ enum Op {
     /// slot index rather than re-mapping pages every SQE.
     ///
     /// The `iovs` carry (ptr_as_usize, len) tuples. The reply
-    /// is `Result<()>` — the kernel reports success/failure for
+    /// is `Result<()>`: the kernel reports success/failure for
     /// the whole batch, and the caller assumes registered-slot
     /// indices `0..N-1` for the N iovs it passed.
     RegisterBuffers {
@@ -133,9 +143,9 @@ enum Op {
     /// `Op::RegisterBuffers`); `buf_ptr` + `buf_len` must
     /// describe a sub-region within that registered buffer.
     /// The kernel skips per-SQE buffer-page pinning and
-    /// page-table lookups — observable per-submission win for
-    /// the journal hot path that reuses the LogBuffer's two
-    /// AlignedBuf slots thousands of times.
+    /// page-table lookups, which pays off on the journal hot path
+    /// that reuses the LogBuffer's two AlignedBuf slots thousands
+    /// of times.
     WriteFixed {
         fd: RawFd,
         buf_idx: u16,
@@ -163,27 +173,30 @@ impl IoUringRing {
     pub(crate) fn new(queue_depth: u32, sqpoll_idle_ms: Option<u32>) -> Result<Self> {
         // Probe synchronously. Drop the probe ring before spawning;
         // reconstruction in the owner thread is microsecond-scale,
-        // and channel transport of `IoUring` is awkward (it's
-        // `!Sync`, and the cleaner pattern is to keep all
-        // `IoUring`-typed values out of struct fields).
-        // 0.9.4: probe builds with the elite setup flags
+        // and the cleaner pattern is to keep the `!Sync` `IoUring`
+        // value on the owner thread only.
+        //
+        // 0.9.4: the probe builds with the setup flags
         // (`COOP_TASKRUN` / `SINGLE_ISSUER` / `DEFER_TASKRUN`) that
         // the host kernel supports. The probe in
         // `iouring_features::features()` happens at most once per
         // process; ring construction here just calls
         // `apply(&mut builder)` to set the cached bits.
         //
-        // 0.9.7 SQPOLL — when the caller opts in via
-        // `Builder::sqpoll(idle_ms)`, enable `IORING_SETUP_SQPOLL`
+        // 0.9.7 SQPOLL: when the caller opts in via
+        // `Builder::sqpoll(idle_ms)`, enable `IORING_SETUP_SQPOLL`,
         // which spawns a kernel-side polling thread to drain the
         // submission queue without requiring `io_uring_enter`
         // syscalls. May fail with `EPERM` on kernels < 5.13 without
-        // `CAP_SYS_NICE`, in sandboxed containers, or under restrictive
-        // SECCOMP. On setup failure we bubble the error up as
-        // `IoUringSetupFailed` — the caller's `iouring_slot` slot
-        // then flips to `Disabled` and the Direct path falls back
-        // to non-SQPOLL pwrite, same contract as for any other
-        // io_uring setup failure.
+        // `CAP_SYS_NICE`, in sandboxed containers, or under
+        // restrictive SECCOMP. On setup failure we bubble the error
+        // up as `IoUringSetupFailed`; the caller's `iouring_slot`
+        // then flips to `Disabled` and the Direct path falls back to
+        // `pwrite`, same contract as any other io_uring setup
+        // failure. SQPOLL rings before Linux 5.11 only accept
+        // registered files; since every SQE here carries a raw fd,
+        // ops on such kernels fail and the Direct path falls back to
+        // `pwrite` per op.
         let mut probe_builder = io_uring::IoUring::builder();
         super::iouring_features::apply(&mut probe_builder, super::iouring_features::RingMode::Sync);
         if let Some(idle_ms) = sqpoll_idle_ms {
@@ -210,39 +223,46 @@ impl IoUringRing {
         })
     }
 
-    /// Submits a `Write` SQE for `buf` at `offset` on `fd` and waits
-    /// for completion.
+    /// Writes all of `buf` at `offset` on `fd`, one SQE per
+    /// [`MAX_SQE_LEN`] chunk, and returns the number of bytes
+    /// written.
     ///
-    /// The caller's `&[u8]` borrow is held alive across the
-    /// blocking reply receive — the owner thread reads the buffer
-    /// and signals completion before this method returns.
+    /// Short writes are retried for the remainder; the result is
+    /// below `buf.len()` only when the kernel reports zero progress.
+    /// The caller's `&[u8]` borrow is held alive across every
+    /// blocking reply receive.
     pub(crate) fn write_at(&self, fd: RawFd, buf: &[u8], offset: u64) -> Result<usize> {
-        let (rt, rr) = bounded::<Result<usize>>(1);
-        let buf_ptr = buf.as_ptr() as usize;
-        let buf_len = buf.len();
-        self.send(Op::Write {
-            fd,
-            buf_ptr,
-            buf_len,
-            offset,
-            reply: rt,
-        })?;
-        rr.recv().map_err(|_| owner_dead())?
+        let base = buf.as_ptr() as usize;
+        transfer(buf.len(), offset, |start, len, off| {
+            let (rt, rr) = bounded::<Result<usize>>(1);
+            self.send(Op::Write {
+                fd,
+                buf_ptr: base + start,
+                buf_len: len,
+                offset: off,
+                reply: rt,
+            })?;
+            rr.recv().map_err(|_| owner_dead())?
+        })
     }
 
-    /// Submits a `Read` SQE filling `buf` from `offset` on `fd`.
+    /// Fills `buf` from `offset` on `fd`, one SQE per
+    /// [`MAX_SQE_LEN`] chunk, and returns the number of bytes read.
+    ///
+    /// The result is below `buf.len()` only at end of file.
     pub(crate) fn read_at(&self, fd: RawFd, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let (rt, rr) = bounded::<Result<usize>>(1);
-        let buf_ptr = buf.as_mut_ptr() as usize;
-        let buf_len = buf.len();
-        self.send(Op::Read {
-            fd,
-            buf_ptr,
-            buf_len,
-            offset,
-            reply: rt,
-        })?;
-        rr.recv().map_err(|_| owner_dead())?
+        let base = buf.as_mut_ptr() as usize;
+        transfer(buf.len(), offset, |start, len, off| {
+            let (rt, rr) = bounded::<Result<usize>>(1);
+            self.send(Op::Read {
+                fd,
+                buf_ptr: base + start,
+                buf_len: len,
+                offset: off,
+                reply: rt,
+            })?;
+            rr.recv().map_err(|_| owner_dead())?
+        })
     }
 
     /// Submits an `Fsync(DATASYNC)` SQE on `fd`. Equivalent to
@@ -253,51 +273,56 @@ impl IoUringRing {
         rr.recv().map_err(|_| owner_dead())?
     }
 
-    /// 0.9.4: Submits a **linked** `Write` + `Fsync(DATASYNC)`
-    /// pair against `fd` and returns once both have executed.
+    /// 0.9.4: Writes `buf` at `offset` on `fd` and makes it durable
+    /// with `fdatasync` semantics, returning the number of bytes
+    /// written.
     ///
-    /// The two SQEs are pushed back-to-back with the `Write`
-    /// carrying `IOSQE_IO_LINK`; the kernel executes them as a
-    /// single chain and only delivers completions once both
-    /// have run. Equivalent to `write_at(fd, buf, offset)`
-    /// followed by `fdatasync(fd)`, but with **half** the
-    /// `io_uring_enter(2)` round-trips and one merged
-    /// kernel-side completion-processing pass.
+    /// When `buf` fits one SQE the write and an `Fsync(DATASYNC)`
+    /// are submitted as one linked chain (`IOSQE_IO_LINK`), so both
+    /// run for the price of a single `io_uring_enter(2)`. A short
+    /// write breaks the chain and the kernel cancels the fsync; the
+    /// remainder is then written with [`Self::write_at`] and synced
+    /// with [`Self::fdatasync`]. Buffers longer than
+    /// [`MAX_SQE_LEN`] take that unlinked path directly.
     ///
-    /// Returns the number of bytes written (the `Write`'s
-    /// CQE result). The fsync's success/failure is reported as
-    /// part of the chain — on fsync failure, the entire call
-    /// returns an error and the caller MUST assume the fsync
-    /// did not durably commit the write.
-    ///
-    /// The caller's `&[u8]` borrow is held alive across the
-    /// blocking reply receive (same contract as
-    /// [`Self::write_at`]).
+    /// On error the caller MUST assume the data is not durable.
     pub(crate) fn write_at_linked_fsync(
         &self,
         fd: RawFd,
         buf: &[u8],
         offset: u64,
     ) -> Result<usize> {
-        let (rt, rr) = bounded::<Result<usize>>(1);
-        let buf_ptr = buf.as_ptr() as usize;
-        let buf_len = buf.len();
+        if buf.len() > MAX_SQE_LEN {
+            let written = self.write_at(fd, buf, offset)?;
+            self.fdatasync(fd)?;
+            return Ok(written);
+        }
+        let (rt, rr) = bounded::<Result<(usize, bool)>>(1);
         self.send(Op::WriteLinkedFsync {
             fd,
-            buf_ptr,
-            buf_len,
+            buf_ptr: buf.as_ptr() as usize,
+            buf_len: buf.len(),
             offset,
             reply: rt,
         })?;
-        rr.recv().map_err(|_| owner_dead())?
+        let (written, fsync_ran) = rr.recv().map_err(|_| owner_dead())??;
+        if written >= buf.len() {
+            if !fsync_ran {
+                self.fdatasync(fd)?;
+            }
+            return Ok(written);
+        }
+        let rest = self.write_at(fd, &buf[written..], advance(offset, written)?)?;
+        self.fdatasync(fd)?;
+        Ok(written + rest)
     }
 
-    /// 0.9.6 — Register a fixed set of buffers with the ring.
+    /// 0.9.6: Register a fixed set of buffers with the ring.
     ///
     /// Each `(ptr, len)` tuple in `iovs` becomes a registered
     /// buffer slot at index `0..iovs.len()`. The caller is
     /// responsible for keeping the underlying memory alive
-    /// (un-moved, not freed) for the lifetime of the ring —
+    /// (un-moved, not freed) for the lifetime of the ring;
     /// io_uring pins the pages but doesn't take ownership.
     ///
     /// Slot indices `0..iovs.len()` are then usable as the
@@ -305,7 +330,7 @@ impl IoUringRing {
     ///
     /// Returns `Err` on registration failure (kernel rejection,
     /// privilege denial, out-of-resource). On error, no slots
-    /// are partially registered — the call is atomic.
+    /// are partially registered; the call is atomic.
     pub(crate) fn register_buffers(&self, iovs: &[(usize, usize)]) -> Result<()> {
         let (rt, rr) = bounded::<Result<()>>(1);
         self.send(Op::RegisterBuffers {
@@ -315,14 +340,14 @@ impl IoUringRing {
         rr.recv().map_err(|_| owner_dead())?
     }
 
-    /// 0.9.6 — Submit an `IORING_OP_WRITE_FIXED` SQE.
+    /// 0.9.6: Writes all of `buf` with `IORING_OP_WRITE_FIXED`.
     ///
     /// `buf_idx` references a slot previously registered via
-    /// [`Self::register_buffers`]. `buf_ptr` + `buf_len` describe
-    /// a sub-region within that registered buffer — the kernel
-    /// validates that the region fits within the registered
-    /// slot. Saves the per-SQE page-pinning cost of `Op::Write`
-    /// — the buffer pages were pinned once at registration time.
+    /// [`Self::register_buffers`] and `buf` must lie within that
+    /// registered buffer; the kernel validates the range. Saves the
+    /// per-SQE page-pinning cost of `Op::Write` because the pages
+    /// were pinned once at registration time. Chunks and short
+    /// writes are handled like [`Self::write_at`].
     pub(crate) fn write_at_fixed(
         &self,
         fd: RawFd,
@@ -330,18 +355,19 @@ impl IoUringRing {
         buf: &[u8],
         offset: u64,
     ) -> Result<usize> {
-        let (rt, rr) = bounded::<Result<usize>>(1);
-        let buf_ptr = buf.as_ptr() as usize;
-        let buf_len = buf.len();
-        self.send(Op::WriteFixed {
-            fd,
-            buf_idx,
-            buf_ptr,
-            buf_len,
-            offset,
-            reply: rt,
-        })?;
-        rr.recv().map_err(|_| owner_dead())?
+        let base = buf.as_ptr() as usize;
+        transfer(buf.len(), offset, |start, len, off| {
+            let (rt, rr) = bounded::<Result<usize>>(1);
+            self.send(Op::WriteFixed {
+                fd,
+                buf_idx,
+                buf_ptr: base + start,
+                buf_len: len,
+                offset: off,
+                reply: rt,
+            })?;
+            rr.recv().map_err(|_| owner_dead())?
+        })
     }
 
     fn send(&self, op: Op) -> Result<()> {
@@ -359,28 +385,178 @@ impl Drop for IoUringRing {
         // next `rx.recv()` and exits. Then join.
         drop(self.tx.take());
         if let Some(j) = self.join.take() {
+            // The owner thread never panics on its own (every
+            // fallible step replies with an error); if it did, there
+            // is nothing left to clean up and Drop cannot report it.
             let _ = j.join();
         }
     }
 }
 
+/// Splits a `total`-byte transfer starting at file `offset` into
+/// chunks of at most [`MAX_SQE_LEN`] bytes and runs `step(start, len,
+/// file_offset)` for each, continuing after short transfers.
+///
+/// Returns the byte count moved; it is below `total` only when a step
+/// reports zero progress (end of file for reads).
+fn transfer(
+    total: usize,
+    offset: u64,
+    mut step: impl FnMut(usize, usize, u64) -> Result<usize>,
+) -> Result<usize> {
+    let mut done = 0usize;
+    while done < total {
+        let len = (total - done).min(MAX_SQE_LEN);
+        let n = step(done, len, advance(offset, done)?)?;
+        if n == 0 {
+            break;
+        }
+        // A step never reports more than it was asked for; `min`
+        // keeps `done <= total` even if the kernel misbehaves.
+        done += n.min(len);
+    }
+    Ok(done)
+}
+
+/// `offset + done` as a file offset, rejecting overflow.
+fn advance(offset: u64, done: usize) -> Result<u64> {
+    u64::try_from(done)
+        .ok()
+        .and_then(|d| offset.checked_add(d))
+        .ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "io_uring transfer offset overflows u64",
+            ))
+        })
+}
+
+/// SQE length field for a chunk the caller already bounded by
+/// [`MAX_SQE_LEN`].
+fn sqe_len(len: usize) -> u32 {
+    // MAX_SQE_LEN < u32::MAX, so after `min` the conversion cannot
+    // fail; the fallback only keeps this function total.
+    u32::try_from(len.min(MAX_SQE_LEN)).unwrap_or(0)
+}
+
+/// Converts a CQE result into a byte count or the `-errno` it
+/// carries.
+fn cqe_bytes(res: i32) -> Result<usize> {
+    usize::try_from(res).map_err(|_| cqe_error(res))
+}
+
+/// Builds the error for a negative CQE result (`-errno`).
+fn cqe_error(res: i32) -> Error {
+    Error::Io(std::io::Error::from_raw_os_error(res.saturating_neg()))
+}
+
+/// Outcome of [`drive`].
+enum Drive<const N: usize> {
+    /// The kernel posted a CQE for every SQE. Results are indexed by
+    /// SQE position.
+    Done([i32; N]),
+    /// The kernel refused the submission before consuming any SQE.
+    /// The entries may still sit in the submission queue, so the ring
+    /// must not be used again.
+    Rejected(Error),
+}
+
+/// Pushes `entries` as one batch, submits them and blocks until the
+/// kernel has posted a CQE for each.
+///
+/// `submit_and_wait` can return before the CQEs exist: a signal
+/// delivered to the owner thread interrupts the wait after the SQEs
+/// were consumed, and `EAGAIN` / `EBUSY` report transient resource
+/// pressure. All of these are retried, because returning while an
+/// SQE is in flight would let the caller free memory the kernel is
+/// still reading or writing. Only when the kernel refuses the
+/// submission with every SQE still unconsumed (and no SQPOLL thread
+/// could pick it up later) does this return [`Drive::Rejected`].
+///
+/// # Safety
+///
+/// Every buffer an entry points at must stay valid, and must not be
+/// accessed in a conflicting way, until this function returns.
+unsafe fn drive<const N: usize>(
+    ring: &mut io_uring::IoUring,
+    entries: [io_uring::squeue::Entry; N],
+) -> Drive<N> {
+    let mut tagged = entries;
+    for (idx, entry) in tagged.iter_mut().enumerate() {
+        *entry = entry.clone().user_data(idx as u64);
+    }
+    // SAFETY: forwarded from this function's contract; the buffers
+    // stay valid until we return, and we only return once the kernel
+    // has finished with every entry or never consumed any of them.
+    // `push_multiple` pushes all entries or none.
+    if unsafe { ring.submission().push_multiple(&tagged) }.is_err() {
+        return Drive::Rejected(Error::Io(std::io::Error::other(
+            "io_uring submission queue full",
+        )));
+    }
+    let sqpoll = ring.params().is_setup_sqpoll();
+    let mut results = [0i32; N];
+    let mut seen = [false; N];
+    let mut reaped = 0usize;
+    while reaped < N {
+        if let Err(e) = ring.submit_and_wait(N - reaped) {
+            let transient = matches!(
+                e.raw_os_error(),
+                Some(libc::EINTR | libc::EAGAIN | libc::EBUSY)
+            );
+            let none_consumed = ring.submission().len() == N;
+            if !transient && !sqpoll && reaped == 0 && none_consumed {
+                return Drive::Rejected(Error::Io(e));
+            }
+            if !transient {
+                // At least one SQE is in flight, so its buffer is
+                // still in use. Keep waiting instead of replying;
+                // back off so a persistent error does not spin.
+                thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        loop {
+            let next = ring.completion().next();
+            let Some(cqe) = next else { break };
+            let idx = usize::try_from(cqe.user_data()).unwrap_or(usize::MAX);
+            if idx < N && !seen[idx] {
+                seen[idx] = true;
+                results[idx] = cqe.result();
+                reaped += 1;
+            }
+        }
+    }
+    Drive::Done(results)
+}
+
+/// Delivers an op's result to the blocked caller and reports whether
+/// the ring can keep serving ops.
+fn reply_with<T, const N: usize>(
+    reply: Sender<Result<T>>,
+    outcome: Drive<N>,
+    finish: impl FnOnce([i32; N]) -> Result<T>,
+) -> bool {
+    let (result, healthy) = match outcome {
+        Drive::Done(results) => (finish(results), true),
+        Drive::Rejected(e) => (Err(e), false),
+    };
+    // Callers block on the reply until it arrives, so the receiver is
+    // gone only if the calling thread died; there is no one left to
+    // deliver the result to.
+    let _ = reply.send(result);
+    healthy
+}
+
 /// Owner-thread main loop.
 ///
-/// All `io_uring::IoUring` interaction lives here. The mutable ring
-/// is **never** passed as a function parameter to a helper — that
-/// shape triggers the rustc 1.95 `check_mod_deathness` ICE class
-/// (see module docs). Inlining the submit/poll logic per opcode is
-/// the workaround.
+/// All `io_uring::IoUring` interaction lives here and in [`drive`].
+/// Ops are served strictly one at a time (see the module docs).
 fn owner_loop(queue_depth: u32, rx: Receiver<Op>, sqpoll_idle_ms: Option<u32>) {
-    // 0.9.4: build with the same elite setup flags the
-    // `IoUringRing::new` probe accepted. `iouring_features::apply`
-    // reads the process-cached probe result, so this is the same
-    // flag set the probe succeeded with — no second kernel probe
-    // happens here.
-    // 0.9.7 SQPOLL: re-apply the same SQPOLL toggle the probe in
-    // `IoUringRing::new` succeeded with — the probe ring was
-    // dropped before this thread spawned, so we re-build with
-    // the identical setup here.
+    // 0.9.4: build with the same setup flags the `IoUringRing::new`
+    // probe accepted. `iouring_features::apply` reads the
+    // process-cached probe result, so no second kernel probe happens
+    // here. 0.9.7 SQPOLL: re-apply the same SQPOLL toggle; the probe
+    // ring was dropped before this thread spawned.
     let mut builder = io_uring::IoUring::builder();
     super::iouring_features::apply(&mut builder, super::iouring_features::RingMode::Sync);
     if let Some(idle_ms) = sqpoll_idle_ms {
@@ -395,42 +571,17 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>, sqpoll_idle_ms: Option<u32>) {
         Err(_) => return,
     };
 
-    // 0.9.5: `IORING_REGISTER_FILES`. Pre-register a 16-slot sparse
-    // file table at owner startup. Each per-op `fd` is lazily upgraded
-    // to a fixed-file slot via `register_files_update` on first use;
-    // subsequent submissions for the same fd reuse the cached slot
-    // and submit SQEs with `IOSQE_FIXED_FILE` semantics
-    // (`io_uring::types::Fixed`). This saves kernel-side fd
-    // validation on every SQE — a real per-syscall win for rings
-    // that do many ops against a small set of fds (the Direct-method
-    // journal hot path).
-    //
-    // 0.9.6 history: this `initial_register` call was temporarily
-    // disabled during the async-substrate hang investigation because
-    // an early diagnosis blamed `IORING_REGISTER_FILES`. The real
-    // root cause turned out to be `IORING_SETUP_DEFER_TASKRUN` +
-    // `IORING_SETUP_SINGLE_ISSUER` interacting with the async
-    // substrate's eventfd-driven loop and tokio's multi_thread
-    // work-stealing — both now correctly excluded via
-    // `RingMode::Async`. The sync ring (this owner_loop) was never
-    // the cause; its dedicated `std::thread::spawn` thread satisfies
-    // SINGLE_ISSUER and its `submit_and_wait(n)` satisfies
-    // DEFER_TASKRUN.
-    //
-    // 0.9.7 restoration: `initial_register` is back, backed by
-    // explicit slot-upgrade + table-full-fallback test coverage in
-    // this module (`writes_across_many_distinct_fds_complete_correctly`
-    // + `repeated_writes_on_same_fd_round_trip`). The registration
-    // is a single syscall on owner startup; on failure (rare —
-    // kernel < 5.1, sandbox block, container missing the syscall)
-    // the registry stays `registered = false` and every
-    // `try_get_or_register` returns `None` → SQEs fall back to
-    // `io_uring::types::Fd(raw)` cleanly.
-    let mut fd_registry = FdRegistry::new();
-    let _ = fd_registry.initial_register(&ring.submitter());
-
+    // Every SQE carries the caller's raw fd (`types::Fd`). 1.1.1
+    // removed the `IORING_REGISTER_FILES` slot cache that used to
+    // live here: it was keyed by fd number and never invalidated,
+    // so once a file closed and the kernel reused its fd number for
+    // a different file, the cached `types::Fixed(slot)` still
+    // pointed at the old file (the registered table holds its own
+    // reference) and writes landed in the wrong file. The ring is
+    // shared by every op on the Handle, so short-lived temp files
+    // hit this on the second write.
     while let Ok(op) = rx.recv() {
-        match op {
+        let healthy = match op {
             Op::Write {
                 fd,
                 buf_ptr,
@@ -438,47 +589,20 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>, sqpoll_idle_ms: Option<u32>) {
                 offset,
                 reply,
             } => {
-                // 0.9.5 — try the fixed-file fast path first.
-                let entry =
-                    if let Some(slot) = fd_registry.try_get_or_register(&ring.submitter(), fd) {
-                        io_uring::opcode::Write::new(
-                            io_uring::types::Fixed(slot),
-                            buf_ptr as *const u8,
-                            buf_len as u32,
-                        )
-                        .offset(offset)
-                        .build()
-                    } else {
-                        io_uring::opcode::Write::new(
-                            io_uring::types::Fd(fd),
-                            buf_ptr as *const u8,
-                            buf_len as u32,
-                        )
-                        .offset(offset)
-                        .build()
-                    };
-                // SAFETY: The submitter (`IoUringRing::write_at`)
-                // is blocked on `reply.recv()` until we send the
-                // result, holding the caller's `&[u8]` borrow alive
-                // for the duration of this submission. The kernel
-                // reads `buf_len` bytes at `buf_ptr`; both
-                // invariants hold while the submitter waits.
-                let push = unsafe { ring.submission().push(&entry) };
-                if push.is_err() {
-                    let _ = reply.send(Err(io_err("io_uring submission queue full")));
-                    continue;
-                }
-                let result = match ring.submit_and_wait(1) {
-                    Ok(_) => match ring.completion().next() {
-                        Some(c) if c.result() < 0 => {
-                            Err(Error::Io(std::io::Error::from_raw_os_error(-c.result())))
-                        }
-                        Some(c) => Ok(c.result() as usize),
-                        None => Err(io_err("io_uring completion queue empty")),
-                    },
-                    Err(e) => Err(Error::Io(e)),
-                };
-                let _ = reply.send(result);
+                let entry = io_uring::opcode::Write::new(
+                    io_uring::types::Fd(fd),
+                    buf_ptr as *const u8,
+                    sqe_len(buf_len),
+                )
+                .offset(offset)
+                .build();
+                // SAFETY: the submitter (`IoUringRing::write_at`) is
+                // blocked on `reply` until we send, which keeps its
+                // `&[u8]` borrow (at least `buf_len` readable bytes
+                // at `buf_ptr`) alive. `drive` returns only after the
+                // kernel has finished with the SQE.
+                let outcome = unsafe { drive(&mut ring, [entry]) };
+                reply_with(reply, outcome, |[res]| cqe_bytes(res))
             }
 
             Op::Read {
@@ -488,77 +612,31 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>, sqpoll_idle_ms: Option<u32>) {
                 offset,
                 reply,
             } => {
-                // 0.9.5 — fixed-file fast path.
-                let entry =
-                    if let Some(slot) = fd_registry.try_get_or_register(&ring.submitter(), fd) {
-                        io_uring::opcode::Read::new(
-                            io_uring::types::Fixed(slot),
-                            buf_ptr as *mut u8,
-                            buf_len as u32,
-                        )
-                        .offset(offset)
-                        .build()
-                    } else {
-                        io_uring::opcode::Read::new(
-                            io_uring::types::Fd(fd),
-                            buf_ptr as *mut u8,
-                            buf_len as u32,
-                        )
-                        .offset(offset)
-                        .build()
-                    };
-                // SAFETY: same shape as `Op::Write` — submitter
-                // holds the `&mut [u8]` borrow alive across the
-                // blocking reply receive.
-                let push = unsafe { ring.submission().push(&entry) };
-                if push.is_err() {
-                    let _ = reply.send(Err(io_err("io_uring submission queue full")));
-                    continue;
-                }
-                let result = match ring.submit_and_wait(1) {
-                    Ok(_) => match ring.completion().next() {
-                        Some(c) if c.result() < 0 => {
-                            Err(Error::Io(std::io::Error::from_raw_os_error(-c.result())))
-                        }
-                        Some(c) => Ok(c.result() as usize),
-                        None => Err(io_err("io_uring completion queue empty")),
-                    },
-                    Err(e) => Err(Error::Io(e)),
-                };
-                let _ = reply.send(result);
+                let entry = io_uring::opcode::Read::new(
+                    io_uring::types::Fd(fd),
+                    buf_ptr as *mut u8,
+                    sqe_len(buf_len),
+                )
+                .offset(offset)
+                .build();
+                // SAFETY: the submitter (`IoUringRing::read_at`) is
+                // blocked on `reply`, keeping its `&mut [u8]` borrow
+                // (at least `buf_len` writable bytes at `buf_ptr`,
+                // not accessed by anyone else) alive until `drive`
+                // has seen the CQE.
+                let outcome = unsafe { drive(&mut ring, [entry]) };
+                reply_with(reply, outcome, |[res]| cqe_bytes(res))
             }
 
             Op::Fdatasync { fd, reply } => {
-                // 0.9.5 — fixed-file fast path.
-                let entry =
-                    if let Some(slot) = fd_registry.try_get_or_register(&ring.submitter(), fd) {
-                        io_uring::opcode::Fsync::new(io_uring::types::Fixed(slot))
-                            .flags(io_uring::types::FsyncFlags::DATASYNC)
-                            .build()
-                    } else {
-                        io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
-                            .flags(io_uring::types::FsyncFlags::DATASYNC)
-                            .build()
-                    };
-                // SAFETY: no buffer; the fd is alive in the
-                // submitter (file is held open there) for the
-                // duration of this submission.
-                let push = unsafe { ring.submission().push(&entry) };
-                if push.is_err() {
-                    let _ = reply.send(Err(io_err("io_uring submission queue full")));
-                    continue;
-                }
-                let result = match ring.submit_and_wait(1) {
-                    Ok(_) => match ring.completion().next() {
-                        Some(c) if c.result() < 0 => {
-                            Err(Error::Io(std::io::Error::from_raw_os_error(-c.result())))
-                        }
-                        Some(_) => Ok(()),
-                        None => Err(io_err("io_uring completion queue empty")),
-                    },
-                    Err(e) => Err(Error::Io(e)),
-                };
-                let _ = reply.send(result);
+                let entry = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
+                    .flags(io_uring::types::FsyncFlags::DATASYNC)
+                    .build();
+                // SAFETY: the SQE references no memory. The fd stays
+                // open because the submitter holds its file across
+                // the blocking reply receive.
+                let outcome = unsafe { drive(&mut ring, [entry]) };
+                reply_with(reply, outcome, |[res]| cqe_bytes(res).map(|_| ()))
             }
 
             Op::WriteLinkedFsync {
@@ -568,107 +646,47 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>, sqpoll_idle_ms: Option<u32>) {
                 offset,
                 reply,
             } => {
-                // 0.9.4: linked Write + Fsync(DATASYNC). The
-                // Write SQE carries IOSQE_IO_LINK so the
-                // kernel queues the following Fsync to run
-                // only after the Write completes successfully.
-                // We submit both SQEs and wait for both CQEs;
-                // the Write's byte count is the reported result.
-                //
-                // 0.9.5 — both SQEs use the fixed-file slot
-                // when available. The slot is resolved once
-                // and used for both; falling back to raw fd
-                // on the same op if the slot table is full.
-                let (write_entry, fsync_entry) =
-                    if let Some(slot) = fd_registry.try_get_or_register(&ring.submitter(), fd) {
-                        (
-                            io_uring::opcode::Write::new(
-                                io_uring::types::Fixed(slot),
-                                buf_ptr as *const u8,
-                                buf_len as u32,
-                            )
-                            .offset(offset)
-                            .build()
-                            .flags(io_uring::squeue::Flags::IO_LINK),
-                            io_uring::opcode::Fsync::new(io_uring::types::Fixed(slot))
-                                .flags(io_uring::types::FsyncFlags::DATASYNC)
-                                .build(),
-                        )
+                // 0.9.4: linked Write + Fsync(DATASYNC). The Write
+                // SQE carries IOSQE_IO_LINK so the kernel runs the
+                // Fsync only after the Write completes in full.
+                let write_entry = io_uring::opcode::Write::new(
+                    io_uring::types::Fd(fd),
+                    buf_ptr as *const u8,
+                    sqe_len(buf_len),
+                )
+                .offset(offset)
+                .build()
+                .flags(io_uring::squeue::Flags::IO_LINK);
+                let fsync_entry = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
+                    .flags(io_uring::types::FsyncFlags::DATASYNC)
+                    .build();
+                // SAFETY: the submitter blocks on `reply`, keeping
+                // its `&[u8]` borrow (`buf_len` bytes at `buf_ptr`)
+                // alive; `drive` returns only after both CQEs.
+                let outcome = unsafe { drive(&mut ring, [write_entry, fsync_entry]) };
+                reply_with(reply, outcome, |[w, f]| {
+                    // A failed write cancels the fsync; report the
+                    // write's error.
+                    let written = cqe_bytes(w)?;
+                    if f >= 0 {
+                        Ok((written, true))
+                    } else if f == -libc::ECANCELED && written < buf_len {
+                        // Short write broke the link. The caller
+                        // writes the rest and syncs separately.
+                        Ok((written, false))
                     } else {
-                        (
-                            io_uring::opcode::Write::new(
-                                io_uring::types::Fd(fd),
-                                buf_ptr as *const u8,
-                                buf_len as u32,
-                            )
-                            .offset(offset)
-                            .build()
-                            .flags(io_uring::squeue::Flags::IO_LINK),
-                            io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
-                                .flags(io_uring::types::FsyncFlags::DATASYNC)
-                                .build(),
-                        )
-                    };
-                // SAFETY: submitter blocks on `reply.recv()`
-                // holding the caller's `&[u8]` borrow alive
-                // for the duration of this submission; the
-                // kernel reads `buf_len` bytes at `buf_ptr`.
-                // Both invariants hold while the submitter
-                // waits. Pushing two SQEs is atomic per the
-                // io-uring crate's `SubmissionQueue::push`
-                // contract — we hold the queue across both
-                // pushes without yielding.
-                let push_result = unsafe {
-                    let mut sq = ring.submission();
-                    sq.push(&write_entry).and_then(|()| sq.push(&fsync_entry))
-                };
-                if push_result.is_err() {
-                    let _ = reply.send(Err(io_err(
-                        "io_uring submission queue full (linked write+fsync)",
-                    )));
-                    continue;
-                }
-                // Wait for BOTH completions — submit_and_wait(2).
-                let result = match ring.submit_and_wait(2) {
-                    Ok(_) => {
-                        // Drain both CQEs. The completion order
-                        // is the submission order (write first,
-                        // fsync second) when the chain succeeds;
-                        // if the write fails the fsync's CQE
-                        // carries -ECANCELED. Either way, we
-                        // need both before reporting.
-                        let cqe1 = ring.completion().next();
-                        let cqe2 = ring.completion().next();
-                        match (cqe1, cqe2) {
-                            (Some(w), Some(f)) => {
-                                if w.result() < 0 {
-                                    Err(Error::Io(std::io::Error::from_raw_os_error(-w.result())))
-                                } else if f.result() < 0 {
-                                    // Write succeeded but fsync
-                                    // failed — the caller MUST
-                                    // treat the write as not
-                                    // durable. Surface the fsync
-                                    // error.
-                                    Err(Error::Io(std::io::Error::from_raw_os_error(-f.result())))
-                                } else {
-                                    Ok(w.result() as usize)
-                                }
-                            }
-                            _ => Err(io_err(
-                                "io_uring completion queue short on linked write+fsync",
-                            )),
-                        }
+                        // Write landed but fsync failed: the caller
+                        // MUST treat the write as not durable.
+                        Err(cqe_error(f))
                     }
-                    Err(e) => Err(Error::Io(e)),
-                };
-                let _ = reply.send(result);
+                })
             }
 
             Op::RegisterBuffers { iovs, reply } => {
-                // 0.9.6 — IORING_REGISTER_BUFFERS. Pin the
-                // caller's buffer ranges in the kernel's
-                // page-table so subsequent `WriteFixed` SQEs
-                // skip the per-submission page-pinning hop.
+                // 0.9.6: IORING_REGISTER_BUFFERS. Pin the caller's
+                // buffer ranges in the kernel's page-table so
+                // subsequent `WriteFixed` SQEs skip the
+                // per-submission page-pinning hop.
                 let iovec_array: Vec<libc::iovec> = iovs
                     .iter()
                     .map(|(p, l)| libc::iovec {
@@ -682,12 +700,16 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>, sqpoll_idle_ms: Option<u32>) {
                 // lifetime of the ring. The kernel reads
                 // `iovec_array.len()` `iovec` structs, validates
                 // the ranges, and pins the pages. The local
-                // `iovec_array` lives across the syscall — the
+                // `iovec_array` lives across the syscall; the
                 // kernel only needs the iovec descriptors during
                 // the call, not after.
                 let result =
                     unsafe { ring.submitter().register_buffers(&iovec_array) }.map_err(Error::Io);
+                // Same reasoning as in `reply_with`: the submitter
+                // blocks on the reply, so a send failure means it
+                // is gone.
                 let _ = reply.send(result);
+                true
             }
 
             Op::WriteFixed {
@@ -698,155 +720,42 @@ fn owner_loop(queue_depth: u32, rx: Receiver<Op>, sqpoll_idle_ms: Option<u32>) {
                 offset,
                 reply,
             } => {
-                // 0.9.6 — IORING_OP_WRITE_FIXED. Uses a
-                // previously-registered buffer slot; the kernel
-                // skips per-SQE page pinning. Tries the
-                // fixed-file slot for `fd` too — if the
-                // FdRegistry has a slot, double-Fixed win.
-                let entry =
-                    if let Some(slot) = fd_registry.try_get_or_register(&ring.submitter(), fd) {
-                        io_uring::opcode::WriteFixed::new(
-                            io_uring::types::Fixed(slot),
-                            buf_ptr as *const u8,
-                            buf_len as u32,
-                            buf_idx,
-                        )
-                        .offset(offset)
-                        .build()
-                    } else {
-                        io_uring::opcode::WriteFixed::new(
-                            io_uring::types::Fd(fd),
-                            buf_ptr as *const u8,
-                            buf_len as u32,
-                            buf_idx,
-                        )
-                        .offset(offset)
-                        .build()
-                    };
-                // SAFETY: the registered buffer is owned + kept
+                // 0.9.6: IORING_OP_WRITE_FIXED. Uses a previously
+                // registered buffer slot; the kernel skips per-SQE
+                // page pinning.
+                let entry = io_uring::opcode::WriteFixed::new(
+                    io_uring::types::Fd(fd),
+                    buf_ptr as *const u8,
+                    sqe_len(buf_len),
+                    buf_idx,
+                )
+                .offset(offset)
+                .build();
+                // SAFETY: the registered buffer is owned and kept
                 // alive by the caller (LogBuffer holds the
-                // AlignedBuf for its entire lifetime, longer
-                // than this ring). `buf_ptr` + `buf_len`
-                // describe a sub-region of the registered slot
-                // at `buf_idx`; the kernel validates the range.
-                let push = unsafe { ring.submission().push(&entry) };
-                if push.is_err() {
-                    let _ = reply.send(Err(io_err("io_uring submission queue full (WriteFixed)")));
-                    continue;
-                }
-                let result = match ring.submit_and_wait(1) {
-                    Ok(_) => match ring.completion().next() {
-                        Some(c) if c.result() < 0 => {
-                            Err(Error::Io(std::io::Error::from_raw_os_error(-c.result())))
-                        }
-                        Some(c) => Ok(c.result() as usize),
-                        None => Err(io_err("io_uring completion queue empty (WriteFixed)")),
-                    },
-                    Err(e) => Err(Error::Io(e)),
-                };
-                let _ = reply.send(result);
+                // AlignedBuf for its entire lifetime, longer than
+                // this ring), and the submitter blocks on `reply`
+                // until `drive` has seen the CQE. `buf_ptr` +
+                // `buf_len` describe a sub-region of the registered
+                // slot at `buf_idx`; the kernel validates the range.
+                let outcome = unsafe { drive(&mut ring, [entry]) };
+                reply_with(reply, outcome, |[res]| cqe_bytes(res))
             }
+        };
+        if !healthy {
+            // A rejected submission may have left SQEs in the
+            // submission queue that point at memory the caller has
+            // now reclaimed. Stop serving: dropping `rx` makes every
+            // later call fail fast (callers fall back to `pwrite`),
+            // and dropping the ring discards the stale entries
+            // without submitting them.
+            return;
         }
     }
-}
-
-fn io_err(msg: &'static str) -> Error {
-    Error::Io(std::io::Error::other(msg))
 }
 
 fn owner_dead() -> Error {
     Error::Io(std::io::Error::other("io_uring owner thread terminated"))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 0.9.5 — `IORING_REGISTER_FILES` slot registry (owner-thread local)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Maintains a 16-slot sparse file table that's registered with
-/// the ring at owner startup. Per-op fds are lazily upgraded to
-/// fixed-file slots on first use; subsequent submissions for
-/// the same fd reuse the cached slot via the `fd_to_slot`
-/// lookup. SQEs for slotted fds use `types::Fixed(slot)` instead
-/// of `types::Fd(raw)` — the kernel skips per-SQE fd validation,
-/// an observable per-syscall win on the Direct-method journal
-/// hot path that reuses the same fd for thousands of writes.
-///
-/// This is the **synchronous** ring's counterpart to the
-/// `FdRegistry` in `async_io::completion_driver` — same shape,
-/// same fallback semantics. Two structs (no shared helper)
-/// because rustc 1.95's `check_mod_deathness` ICE class
-/// triggers on cross-module references involving `&mut
-/// io_uring::IoUring`; duplicating the type is the workaround
-/// that keeps both modules building cleanly.
-struct FdRegistry {
-    /// The slot table — `-1` for unused, otherwise the
-    /// registered RawFd. Sized to [`SLOT_TABLE_SIZE`].
-    slots: Vec<RawFd>,
-    /// Cache `fd → slot` for O(1) lookup on subsequent ops.
-    fd_to_slot: std::collections::HashMap<RawFd, u32>,
-    /// `true` once the initial `register_files` succeeded.
-    /// Subsequent lazy upgrades use `register_files_update`.
-    registered: bool,
-}
-
-/// Size of the registered-files slot table per ring.
-/// 16 is well above the typical journal workload (1 fd per
-/// journal handle) and keeps the kernel-side memory cost
-/// negligible.
-const SLOT_TABLE_SIZE: usize = 16;
-
-impl FdRegistry {
-    fn new() -> Self {
-        Self {
-            slots: vec![-1; SLOT_TABLE_SIZE],
-            fd_to_slot: std::collections::HashMap::new(),
-            registered: false,
-        }
-    }
-
-    /// Initial sparse registration. Called once at owner
-    /// startup; subsequent `try_get_or_register` calls use
-    /// `register_files_update` instead.
-    ///
-    /// Returns `Ok(())` if registration succeeded. On `Err` the
-    /// registry stays `registered = false` and every
-    /// `try_get_or_register` call returns `None`, causing each
-    /// match arm to fall back to raw-fd SQEs cleanly.
-    fn initial_register(&mut self, submitter: &io_uring::Submitter<'_>) -> std::io::Result<()> {
-        submitter.register_files(&self.slots)?;
-        self.registered = true;
-        Ok(())
-    }
-
-    /// Returns the slot index for `fd`, registering it lazily
-    /// on first use. `None` if (a) the initial registration
-    /// failed, (b) the slot table is full, or (c) the
-    /// per-fd registration update was rejected by the kernel.
-    /// In all three cases the caller falls back to raw-fd
-    /// SQEs.
-    fn try_get_or_register(
-        &mut self,
-        submitter: &io_uring::Submitter<'_>,
-        fd: RawFd,
-    ) -> Option<u32> {
-        if !self.registered {
-            return None;
-        }
-        if let Some(&slot) = self.fd_to_slot.get(&fd) {
-            return Some(slot);
-        }
-        let slot_idx = self.slots.iter().position(|&s| s == -1)?;
-        let update = [fd];
-        let updated = submitter
-            .register_files_update(slot_idx as u32, &update)
-            .ok()?;
-        if updated == 0 {
-            return None;
-        }
-        self.slots[slot_idx] = fd;
-        let _ = self.fd_to_slot.insert(fd, slot_idx as u32);
-        Some(slot_idx as u32)
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1296,32 +1205,75 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────
-    // 0.9.7 — IORING_REGISTER_FILES fd-slot coverage
+    // fd routing coverage
     // ─────────────────────────────────────────────────────────
     //
-    // The sync ring's `FdRegistry` maintains a 16-slot sparse
-    // file table; per-op fds are lazily upgraded via
-    // `register_files_update` on first use and cached for
-    // subsequent submissions. These tests exercise both the
-    // table-allocation path AND the table-full fallback to
-    // raw-fd SQEs.
-    //
-    // Pre-0.9.7 these paths were never directly tested — the
-    // 0.9.5 integration shipped without coverage and the 0.9.6
-    // defensive disable removed them from runtime. The 0.9.7
-    // restoration brings them back with these tests as the
-    // regression guard.
+    // Every SQE carries the caller's raw fd. These tests pin that
+    // writes land in the file the caller passed, across many
+    // distinct fds and across fd-number reuse after close (the
+    // 1.1.0 fixed-file cache got the reuse case wrong).
+
+    /// Opens a raw read-write file for the fd-reuse tests.
+    fn open_rw(path: &std::path::Path) -> std::fs::File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_ring_write_after_fd_number_reuse_targets_new_file() {
+        // Write through fd N to file A, then make fd N refer to file
+        // B (dup2 closes A's descriptor and reuses the number, which
+        // is exactly what close + open does under load) and write
+        // again through the same ring. The second write must land
+        // in B; A must keep its own bytes.
+        let Some(ring) = ring_or_skip() else { return };
+        let path_a = tmp_path("fdreuse_a");
+        let path_b = tmp_path("fdreuse_b");
+        let _ga = Cleanup(path_a.clone());
+        let _gb = Cleanup(path_b.clone());
+        let file_a = open_rw(&path_a);
+        let file_b = open_rw(&path_b);
+        let fd = file_a.as_raw_fd();
+
+        let payload_a = vec![b'A'; 5000];
+        assert_eq!(ring.write_at(fd, &payload_a, 0).expect("write a"), 5000);
+
+        // SAFETY: both descriptors are open and owned by this test.
+        // `dup2` atomically closes `fd` and makes the number refer to
+        // file B's open description; `file_a` still owns the number
+        // and closes it (now pointing at B) on drop, so nothing is
+        // closed twice.
+        let rc = unsafe { libc::dup2(file_b.as_raw_fd(), fd) };
+        assert_eq!(rc, fd, "dup2 failed: {}", std::io::Error::last_os_error());
+
+        let payload_b = vec![b'B'; 3000];
+        assert_eq!(ring.write_at(fd, &payload_b, 0).expect("write b"), 3000);
+        ring.fdatasync(fd).expect("fdatasync");
+        drop(file_a);
+        drop(file_b);
+
+        assert_eq!(
+            std::fs::read(&path_a).unwrap(),
+            payload_a,
+            "file A was overwritten"
+        );
+        assert_eq!(
+            std::fs::read(&path_b).unwrap(),
+            payload_b,
+            "file B missed its write"
+        );
+    }
 
     #[test]
     fn writes_across_many_distinct_fds_complete_correctly() {
-        // Open 20 distinct files (4 over SLOT_TABLE_SIZE = 16)
-        // and write a unique payload to each. With the slot
-        // registry active, the first 16 fds get
-        // `types::Fixed(slot)` SQEs and the remaining 4 fall
-        // back to `types::Fd(raw)`. With the registry inactive
-        // (the slot-table init disabled), every SQE uses
-        // raw-fd. Either path must produce byte-for-byte
-        // correct writes.
+        // Open 20 distinct files and write a unique payload to
+        // each while all of them stay open. Every write must
+        // land byte-for-byte in its own file.
         let Some(ring) = ring_or_skip() else { return };
         const N_FDS: usize = 20;
         const PAYLOAD_LEN: usize = 256;
@@ -1360,20 +1312,15 @@ mod tests {
             );
             assert!(
                 bytes.iter().all(|&b| b == i as u8),
-                "fd {i}: content drift — slot/fd mapping bug"
+                "fd {i}: content drift, bytes routed to the wrong file"
             );
         }
     }
 
     #[test]
     fn repeated_writes_on_same_fd_round_trip() {
-        // 32 writes on a single fd. With the slot registry
-        // active, the first write should register the fd in
-        // slot 0 and the remaining 31 should hit the cached
-        // slot (no further `register_files_update` syscalls).
-        // With the registry inactive, every write uses raw-fd.
-        // Either path must place every payload at the right
-        // offset with no content aliasing.
+        // 32 writes on a single fd. Every payload must land at
+        // its own offset with no content aliasing.
         let Some(ring) = ring_or_skip() else { return };
         const N_WRITES: usize = 32;
         const PAYLOAD_LEN: usize = 64;
@@ -1483,5 +1430,167 @@ mod tests {
         let (nawun, nawupf) = parse_nawun_nawupf(&id);
         assert_eq!(nawun, Some(0));
         assert_eq!(nawupf, Some(0));
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 1.1.1: completion waits and chunking
+    // ─────────────────────────────────────────────────────────
+
+    extern "C" fn ignore_signal(_: libc::c_int) {}
+
+    /// Sends SIGUSR1 to every `fsys-iouring` owner thread in this
+    /// process. A no-op handler is installed first so the signal only
+    /// interrupts blocking syscalls.
+    fn interrupt_owner_threads() -> usize {
+        // SAFETY: `sigaction` is given a zeroed struct with a valid
+        // handler and an empty mask; installing a do-nothing handler
+        // for SIGUSR1 has no effect beyond interrupting syscalls.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = ignore_signal as extern "C" fn(libc::c_int) as usize;
+            assert_eq!(libc::sigemptyset(&mut action.sa_mask), 0);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+        let mut hit = 0;
+        for entry in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+            let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+            if comm.trim() != "fsys-iouring" {
+                continue;
+            }
+            let Some(tid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|t| t.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            // SAFETY: plain syscall on our own process; a stale tid
+            // only yields ESRCH.
+            let rc = unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, libc::SIGUSR1) };
+            if rc == 0 {
+                hit += 1;
+            }
+        }
+        hit
+    }
+
+    #[test]
+    fn test_ring_read_interrupted_by_signal_waits_for_completion() {
+        // A read from an empty pipe stays in flight. Interrupt the
+        // owner thread while it waits, then feed the pipe. The read
+        // must complete with the fed bytes; 1.1.0 replied "completion
+        // queue empty" on the interrupted wait and left the read in
+        // flight against the caller's (by then freed) buffer.
+        let Some(ring) = ring_or_skip() else { return };
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid two-element array for pipe(2).
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        let feeder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let signalled = interrupt_owner_threads();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let msg = b"ping";
+            // SAFETY: `write_fd` is the open write end of the pipe;
+            // `msg` is valid for 4 bytes.
+            let n = unsafe { libc::write(write_fd, msg.as_ptr().cast(), msg.len()) };
+            assert_eq!(n, 4);
+            signalled
+        });
+
+        let mut buf = [0u8; 4];
+        let n = ring
+            .read_at(read_fd, &mut buf, 0)
+            .expect("interrupted read must complete");
+        let signalled = feeder.join().unwrap();
+        // SAFETY: both pipe ends are open and owned by this test.
+        unsafe {
+            assert_eq!(libc::close(read_fd), 0);
+            assert_eq!(libc::close(write_fd), 0);
+        }
+        assert!(signalled >= 1, "no fsys-iouring thread found to interrupt");
+        assert_eq!(n, 4);
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[test]
+    fn test_transfer_splits_at_max_sqe_len() {
+        let total = 2 * MAX_SQE_LEN + 5;
+        let mut calls = Vec::new();
+        let done = transfer(total, 100, |start, len, off| {
+            calls.push((start, len, off));
+            Ok(len)
+        })
+        .unwrap();
+        assert_eq!(done, total);
+        assert_eq!(
+            calls,
+            vec![
+                (0, MAX_SQE_LEN, 100),
+                (MAX_SQE_LEN, MAX_SQE_LEN, 100 + MAX_SQE_LEN as u64),
+                (2 * MAX_SQE_LEN, 5, 100 + 2 * MAX_SQE_LEN as u64),
+            ]
+        );
+        assert!(u32::try_from(MAX_SQE_LEN).is_ok());
+        assert_eq!(sqe_len(usize::MAX), MAX_SQE_LEN as u32);
+    }
+
+    #[test]
+    fn test_transfer_short_steps_resume_at_next_byte() {
+        let mut calls = Vec::new();
+        let done = transfer(10, 0, |start, len, off| {
+            calls.push((start, len, off));
+            Ok(len.min(4))
+        })
+        .unwrap();
+        assert_eq!(done, 10);
+        assert_eq!(calls, vec![(0, 10, 0), (4, 6, 4), (8, 2, 8)]);
+    }
+
+    #[test]
+    fn test_transfer_zero_progress_returns_short_count() {
+        let mut steps = 0;
+        let done = transfer(10, 0, |_, len, _| {
+            steps += 1;
+            Ok(if steps == 1 { len.min(3) } else { 0 })
+        })
+        .unwrap();
+        assert_eq!(done, 3);
+        assert_eq!(steps, 2);
+    }
+
+    #[test]
+    fn test_transfer_empty_input_makes_no_calls() {
+        let done = transfer(0, 0, |_, _, _| panic!("no step expected")).unwrap();
+        assert_eq!(done, 0);
+    }
+
+    #[test]
+    fn test_transfer_step_error_propagates() {
+        let err = transfer(10, 0, |_, _, _| Err(io_error_for_test())).unwrap_err();
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn test_advance_offset_overflow_returns_err() {
+        assert_eq!(advance(5, 7).unwrap(), 12);
+        assert!(advance(u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn test_cqe_bytes_negative_maps_to_errno() {
+        assert_eq!(cqe_bytes(17).unwrap(), 17);
+        match cqe_bytes(-libc::EBADF) {
+            Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EBADF)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    fn io_error_for_test() -> Error {
+        Error::Io(std::io::Error::other("step failed"))
     }
 }

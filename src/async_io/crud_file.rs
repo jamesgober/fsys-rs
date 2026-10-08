@@ -1,7 +1,9 @@
 //! Async file CRUD wrappers.
 //!
 //! Each method here is a thin [`tokio::task::spawn_blocking`] over
-//! the corresponding sync method on [`crate::Handle`]. See
+//! the corresponding sync method on [`crate::Handle`], except
+//! `write_async` on Linux with `Method::Direct`, which runs the same
+//! atomic-replace sequence through the native io_uring substrate. See
 //! [`crate::async_io`] for the design rationale.
 
 use crate::handle::Handle;
@@ -34,17 +36,14 @@ impl Handle {
 
         // Native io_uring substrate path (Linux + Direct + ring
         // available + no env override). Routes the write +
-        // fdatasync hot path through native io_uring, bypassing
-        // the spawn_blocking thread-pool hop. Open + rename stay
-        // synchronous on the calling task — they're sub-µs and
-        // not worth the async machinery.
+        // fdatasync through native io_uring, bypassing the
+        // spawn_blocking thread-pool hop. Open + rename stay
+        // synchronous on the calling task.
         #[cfg(target_os = "linux")]
         {
-            if self.active_method() == crate::Method::Direct
-                && std::env::var_os("FSYS_DISABLE_NATIVE_ASYNC").is_none()
-            {
+            if self.active_method() == crate::Method::Direct && !super::native_async_disabled() {
                 if let Some(ring) = self.async_io_uring() {
-                    return write_async_native(&self, &ring, &path, &data).await;
+                    return write_async_native(&self, &ring, &path, data).await;
                 }
             }
         }
@@ -215,151 +214,142 @@ fn join_error_to_io(e: tokio::task::JoinError) -> Error {
     )))
 }
 
-/// Native io_uring `write_async` implementation. Routes the inner
-/// write + fdatasync through the per-handle native substrate; open
-/// and rename stay on the calling task as direct sync calls (they
-/// are sub-µs and not worth the async machinery).
+/// Native io_uring `write_async` implementation, following the same
+/// atomic-replace sequence as the sync [`Handle::write`]:
 ///
-/// This is a Linux-only path and only invoked when the substrate
-/// has been confirmed `NativeIoUring`. Failures here surface as
-/// `Error::AtomicReplaceFailed { step, source }` matching the
-/// sync `Handle::write` shape — callers cannot distinguish native
-/// vs spawn_blocking errors by variant.
+/// 1. Open a temp file next to the target (`O_DIRECT` when the
+///    handle uses it). If the filesystem rejects `O_DIRECT` (tmpfs,
+///    some FUSE mounts), the active method drops to
+///    [`crate::Method::Data`] and this write continues buffered,
+///    exactly like the sync path.
+/// 2. Write the payload through the ring. The buffer and a
+///    keep-alive for the temp file move into the driver (see
+///    `completion_driver`), so cancellation cannot free memory the
+///    kernel is still using.
+/// 3. For `O_DIRECT`, trim the sector padding with `set_len` on the
+///    same handle.
+/// 4. `fdatasync` through the ring. This fence covers the data and
+///    the final file size, and it completes before the rename.
+/// 5. Rename over the target, then sync the parent directory
+///    (best-effort, as in the sync path).
+///
+/// A guard removes the temp file on every early return and when the
+/// future is dropped before the rename, so a cancelled `write_async`
+/// leaves the target untouched and no `.fsys-tmp-*` file behind.
+/// Open and rename stay synchronous on the calling task.
+///
+/// Failures surface as `Error::AtomicReplaceFailed { step, source }`
+/// matching the sync `Handle::write` shape.
 #[cfg(target_os = "linux")]
 async fn write_async_native(
     handle: &Handle,
     ring: &crate::async_io::completion_driver::AsyncIoUring,
     path: &Path,
-    data: &[u8],
+    data: Vec<u8>,
 ) -> Result<()> {
+    use crate::async_io::completion_driver::{FileRef, IoBuf};
     use crate::async_io::iouring_substrate::{fdatasync_native, write_at_native};
     use std::os::fd::AsRawFd;
+
+    let failed = |step: &'static str| {
+        move |e: Error| Error::AtomicReplaceFailed {
+            step,
+            source: as_io_error(e),
+        }
+    };
 
     // Resolve path against handle root (rejects escapes).
     let resolved = handle.resolve_path(path)?;
     let temp = Handle::gen_temp_path(&resolved);
 
-    // Open temp file synchronously. The Direct path uses
-    // O_DIRECT when supported; we don't try to open async because
-    // tokio's fs::File doesn't support O_DIRECT cleanly and the
-    // open syscall is sub-µs anyway.
     let (file, direct_ok) =
-        crate::platform::open_write_new(&temp, handle.use_direct()).map_err(|e| {
-            Error::AtomicReplaceFailed {
-                step: "open_temp",
-                source: as_io_error(e),
-            }
-        })?;
-
-    if handle.use_direct() && !direct_ok {
-        // O_DIRECT was rejected by the filesystem (tmpfs etc.).
-        // Update the handle's active method so the next call falls
-        // through the spawn_blocking branch in `write_async`. For
-        // THIS op, surface the rejection as an error — the caller
-        // can retry, and the retry will not take the native path.
-        handle.update_active_method(crate::Method::Data);
-        drop(file);
-        let _ = std::fs::remove_file(&temp);
-        return Err(Error::AtomicReplaceFailed {
-            step: "open_temp",
-            source: std::io::Error::other(
-                "O_DIRECT unsupported on this filesystem; active_method downgraded to Data — retry",
-            ),
-        });
-    }
-
-    // Empty input — skip buffer alloc + native write entirely.
-    // The temp file is already at size 0; we still need fdatasync
-    // to ensure the inode is durable before the rename.
-    if data.is_empty() {
-        if let Err(e) = fdatasync_native(ring, file.as_raw_fd()).await {
-            drop(file);
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "fdatasync_native",
-                source: as_io_error(e),
-            });
-        }
-        drop(file);
-        if let Err(e) = crate::platform::atomic_rename(&temp, &resolved) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "rename",
-                source: as_io_error(e),
-            });
-        }
-        let _ = crate::platform::sync_parent_dir(&resolved);
-        return Ok(());
-    }
-
-    // Compute aligned length for Direct IO.
-    let sector_size = handle.sector_size() as usize;
-    let aligned_len = data.len().div_ceil(sector_size).saturating_mul(sector_size);
-    let mut buf = crate::platform::AlignedBuf::new(aligned_len, sector_size).map_err(|e| {
-        Error::AtomicReplaceFailed {
-            step: "alloc_aligned_buf",
-            source: as_io_error(e),
-        }
-    })?;
-    buf.as_mut_slice()[..data.len()].copy_from_slice(data);
-
-    // Native write: io_uring SQE for IORING_OP_WRITE.
-    let n = match write_at_native(ring, file.as_raw_fd(), buf.as_slice(), 0).await {
-        Ok(n) => n,
-        Err(e) => {
-            drop(file);
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "write_native",
-                source: as_io_error(e),
-            });
-        }
+        crate::platform::open_write_new(&temp, handle.use_direct()).map_err(failed("open_temp"))?;
+    let mut temp_guard = TempFileGuard {
+        path: &temp,
+        armed: true,
     };
-    if n != aligned_len {
-        drop(file);
-        let _ = std::fs::remove_file(&temp);
-        return Err(Error::AtomicReplaceFailed {
-            step: "write_native_short",
-            source: std::io::Error::other("native io_uring write returned short count"),
-        });
+    if handle.use_direct() && !direct_ok {
+        handle.update_active_method(crate::Method::Data);
     }
 
-    // Native fdatasync: io_uring SQE for IORING_OP_FSYNC + DATASYNC.
-    if let Err(e) = fdatasync_native(ring, file.as_raw_fd()).await {
-        drop(file);
-        let _ = std::fs::remove_file(&temp);
-        return Err(Error::AtomicReplaceFailed {
-            step: "fdatasync_native",
-            source: as_io_error(e),
-        });
+    // The driver holds a clone of this `Arc` as the fd keep-alive
+    // while an op is in flight.
+    let file = Arc::new(file);
+    let file_ref = || FileRef::new(Arc::clone(&file), |f| f.as_raw_fd());
+
+    let data_len = data.len();
+    if data_len > 0 {
+        let (buf, submit_len) = if direct_ok {
+            let sector_size = handle.sector_size() as usize;
+            let aligned_len = data_len.div_ceil(sector_size).saturating_mul(sector_size);
+            let mut buf = crate::platform::AlignedBuf::new(aligned_len, sector_size)
+                .map_err(failed("alloc_aligned_buf"))?;
+            buf.as_mut_slice()[..data_len].copy_from_slice(&data);
+            drop(data);
+            (IoBuf::Aligned(buf), aligned_len)
+        } else {
+            (IoBuf::Vec(data), data_len)
+        };
+        let written = write_at_native(ring, file_ref(), buf, 0)
+            .await
+            .map_err(failed("write_native"))?;
+        if written != submit_len {
+            return Err(Error::AtomicReplaceFailed {
+                step: "write_native_short",
+                source: std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "native io_uring write made no progress before the end of the payload",
+                ),
+            });
+        }
+        if submit_len != data_len {
+            // `O_DIRECT` wrote whole sectors; trim the padding on the
+            // same handle (ftruncate) before the durability fence.
+            file.set_len(data_len as u64)
+                .map_err(|source| Error::AtomicReplaceFailed {
+                    step: "truncate",
+                    source,
+                })?;
+        }
     }
 
-    // Drop the O_DIRECT fd. Reopen buffered solely to truncate to
-    // the actual data length (matching the sync Direct path).
+    // Durability fence: data and size are on stable storage before
+    // the rename publishes the file.
+    fdatasync_native(ring, file_ref())
+        .await
+        .map_err(failed("fdatasync_native"))?;
     drop(file);
-    if let Err(e) = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&temp)
-        .and_then(|f| f.set_len(data.len() as u64))
-    {
-        let _ = std::fs::remove_file(&temp);
-        return Err(Error::AtomicReplaceFailed {
-            step: "truncate",
-            source: e,
-        });
-    }
 
-    // Atomic rename — synchronous, sub-µs.
-    if let Err(e) = crate::platform::atomic_rename(&temp, &resolved) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(Error::AtomicReplaceFailed {
-            step: "rename",
-            source: as_io_error(e),
-        });
-    }
+    crate::platform::atomic_rename(&temp, &resolved).map_err(failed("rename"))?;
+    temp_guard.armed = false;
 
+    // Best-effort, as in the sync path: the rename already happened,
+    // so a failed directory sync cannot be undone or retried here.
     let _ = crate::platform::sync_parent_dir(&resolved);
     Ok(())
+}
+
+/// Removes a `write_async` temp file unless the write reached its
+/// rename. Runs on early returns and when the future is dropped
+/// mid-write.
+#[cfg(target_os = "linux")]
+struct TempFileGuard<'a> {
+    path: &'a Path,
+    armed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TempFileGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort, like the sync path: the caller sees the
+            // original error (or nothing, if the future was
+            // cancelled); a leftover temp file is the only cost of a
+            // failed unlink. An in-flight write to the unlinked inode
+            // is harmless.
+            let _ = std::fs::remove_file(self.path);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

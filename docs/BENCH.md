@@ -57,7 +57,7 @@ Numbers from one class are not directly comparable to another; the regression ch
 
 ## 0.7.0 native-vs-`spawn_blocking` measurement
 
-[`benches/async_native_vs_blocking.rs`](../benches/async_native_vs_blocking.rs) is the A/B harness for the new native io_uring async substrate. It runs the same async-write workload twice &mdash; once with `FSYS_DISABLE_NATIVE_ASYNC=1` (forces the `spawn_blocking` fallback), once without (allows the native path to engage on Linux + `Method::Direct`).
+[`benches/async_native_vs_blocking.rs`](../benches/async_native_vs_blocking.rs) is the A/B harness for the new native io_uring async substrate. It runs the same 4 KiB `Method::Direct` write twice: once as the sync `Handle::write` on `tokio::task::spawn_blocking` (exactly what the fallback substrate does), once through `write_async` (the native path engages on Linux). `FSYS_DISABLE_NATIVE_ASYNC` is read once per process, so it cannot be toggled between the two groups; set it for the whole run to put both groups on the fallback.
 
 The Linux substrate is required to be at least 1.1&times; faster than `spawn_blocking` to be considered functional (anything below means something went wrong with the ring construction or completion driver). Anything above 1.1&times; is a real win.
 
@@ -332,7 +332,7 @@ release-prep bare-metal Linux re-run.
 | io_uring elite flags (`COOP_TASKRUN` / `SINGLE_ISSUER` / `DEFER_TASKRUN`) | 0.9.4 | ~5–15% per-op reduction on supported kernels | covered by all io_uring benches |
 | Linked Write+Fsync via `IOSQE_IO_LINK` | 0.9.4 | ~2× round-trip reduction on durable Direct writes | needs dedicated bench |
 | Dual-buffer Direct-mode log buffer | 0.9.5 | Direct mode: single-core ceiling → multi-core scalable | needs concurrent-append bench |
-| `IORING_REGISTER_FILES` slot-upgrade | 0.9.5 | ~50–200 ns per SQE | not isolable in user-space bench |
+| `IORING_REGISTER_FILES` slot-upgrade | 0.9.5, removed 1.1.1 | none: removed because the fd-keyed slot cache misrouted writes after fd reuse | n/a |
 | `IORING_OP_WRITE_FIXED` Direct journal flush | 0.9.6 | Saves per-SQE kernel buffer pinning | not isolable in user-space bench |
 | APFS `clonefile(2)` / ReFS `FSCTL_DUPLICATE_EXTENTS_TO_FILE` reflinks | 0.9.6 | Multi-GiB clones: seconds → microseconds | filesystem-specific bench needed |
 | GroupCommit wake-stampede fix | 0.9.7 | ~5× lock-hold reduction under 100+ followers | covered by stress test |
