@@ -2009,6 +2009,17 @@ mod tests {
         // `root` is the caller's plain `C:\...` form.
         let plain = root.join("plain.bin");
         h.write(&plain, b"plain").expect("absolute in-root write");
+
+        // The journal entry points resolve paths the same way.
+        let wal = root.join("absolute.wal");
+        drop(
+            h.journal_with(&wal, crate::JournalOptions::new())
+                .expect("journal_with on an absolute in-root path"),
+        );
+        drop(
+            h.journal(&wal)
+                .expect("journal on an absolute in-root path"),
+        );
         assert_eq!(std::fs::read(&plain).expect("read"), b"plain");
 
         // Different case of the same (case-insensitive) directory.
