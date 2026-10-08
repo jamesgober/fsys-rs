@@ -5,6 +5,16 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3] - 2026-10-08
+
+**Journal open regression fix.** fsys 1.1.1 made `Handle::journal` / `Handle::journal_with` refuse a journal whose resume scan stopped at a bad magic or an oversized frame length (`Error::Io(InvalidData)`), where 1.1.0 opened it. Consumers that recover the valid prefix of a journal followed by garbage could no longer open it. 1.1.3 opens it again, without appending after the garbage and without destroying it. No public item was added, removed or changed, and the on-disk journal format is unchanged.
+
+### Fixed
+
+- **Opening a journal with a corrupt tail works again** (regression from 1.1.1). In both buffered and Direct-IO mode, whatever stopped the resume scan (torn or truncated frame, zero run, CRC mismatch, bad magic, length overflow), the journal opens at the end of the last valid frame and appends continue right after it. `JournalReader` still reports `BadMagic` and `LengthOverflow` as before.
+- **The discarded tail is kept in a sidecar file.** Before truncating, a tail that is not all zero bytes is copied to `<journal file name>.corrupt-<clean end offset>` in the journal's directory (`.1`, `.2`, ... appended when that name holds other bytes; created with `create_new`, owner-only on Unix). The copy is written in full and synced, and the directory is synced, before the journal is truncated and synced, so a crash in between loses nothing; the reopen after such a crash reuses the identical copy instead of writing a second one. Corruption in the middle of the log followed by later valid frames is treated as a corrupt tail: those frames were already unreachable through the reader and are kept in the sidecar. All-zero tails (Direct-IO padding, zero-filled preallocation) are truncated without a sidecar. If the sidecar cannot be written (for example a read-only directory), the open fails with `Error::Io` and the journal is left unchanged. With the `tracing` feature a saved tail is reported as a `warn` event.
+- Direct-IO opens that cut a non-zero tail now zero the rest of the kept resume sector, so an open followed by a close without appends no longer leaves the corrupt bytes for the next open to find.
+
 ## [1.1.2] - 2026-10-07
 
 **Dependency swap: `memmap2` -> `mmap-io`.** `Method::Mmap` now maps files through the first-party [`mmap_io::raw`](https://docs.rs/mmap-io/1.1.0/mmap_io/raw/) layer instead of `memmap2`. No public API, behavior or on-disk change.
@@ -2906,7 +2916,8 @@ release-candidate-to-1.0 runway.
 ### Added
 - Initial release. Reserved name on crates.io. No public API.
 
-[Unreleased]: https://github.com/jamesgober/fsys-rs/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/jamesgober/fsys-rs/compare/v1.1.3...HEAD
+[1.1.3]: https://github.com/jamesgober/fsys-rs/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/jamesgober/fsys-rs/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/jamesgober/fsys-rs/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jamesgober/fsys-rs/compare/v1.0.0...v1.1.0
