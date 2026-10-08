@@ -162,7 +162,7 @@ pub(crate) fn atomic_replace<H: ReplaceHooks>(
         // Best-effort: the rename already published the new contents,
         // so reporting `AtomicReplaceFailed` here would wrongly tell
         // the caller the replace did not happen.
-        let _ = platform::sync_parent_dir(target);
+        let _ = super::sync_parent(target);
     }
     Ok(())
 }

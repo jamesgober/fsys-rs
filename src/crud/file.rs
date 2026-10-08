@@ -289,6 +289,11 @@ impl Handle {
     /// This operation is **idempotent**: if the file does not exist,
     /// `Ok(())` is returned.
     ///
+    /// After a successful unlink the parent directory is synced
+    /// (`fsync` on Linux / macOS; implicit on Windows), so the removal
+    /// survives a crash once this call returns. The directory sync is
+    /// best-effort: the unlink has already happened when it runs.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidPath`] if `path` escapes the handle root.
@@ -296,7 +301,10 @@ impl Handle {
     pub fn delete(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = self.resolve_path(path.as_ref())?;
         match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                let _ = super::sync_parent(&path);
+                Ok(())
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(Error::Io(e)),
         }
@@ -660,7 +668,7 @@ fn iouring_write_direct(
             )));
         }
         #[cfg(test)]
-        super::fence_probe::record();
+        super::fence_probe::record_fence();
         return Ok(true);
     }
     let n = ring.write_at(file.as_raw_fd(), buf.as_slice(), 0)?;
@@ -685,7 +693,7 @@ fn iouring_fence(
 ) -> Result<()> {
     use std::os::fd::AsRawFd;
     #[cfg(test)]
-    super::fence_probe::record();
+    super::fence_probe::record_fence();
     match nvme {
         Some(access) => crate::platform::linux_iouring::nvme_flush_ioctl(
             access.char_dev.as_raw_fd(),
@@ -1014,6 +1022,16 @@ mod tests {
         assert!(!path.exists());
         // Delete again — still Ok.
         h.delete(&path).expect("delete already deleted");
+    }
+
+    #[test]
+    fn test_delete_syncs_parent_directory() {
+        let path = tmp_path("delete_dir_sync");
+        let h = handle();
+        h.write(&path, b"x").expect("write");
+        let before = super::super::fence_probe::dir_syncs();
+        h.delete(&path).expect("delete");
+        assert_eq!(super::super::fence_probe::dir_syncs(), before + 1);
     }
 
     #[test]

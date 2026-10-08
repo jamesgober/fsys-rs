@@ -176,7 +176,7 @@ pub(crate) fn write(path: &Path, data: &[u8]) -> Result<()> {
     }
 
     // Step 6 — best-effort parent-dir sync (no-op on Windows).
-    let _ = crate::platform::sync_parent_dir(path);
+    let _ = crate::crud::sync_parent(path);
 
     Ok(())
 }

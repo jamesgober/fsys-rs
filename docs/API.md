@@ -293,19 +293,23 @@ let fs = fsys::builder()
 
 `Batch` is the type returned by `Handle::batch()` for the
 fluent batch-builder ergonomics. Operations accumulate via
-`.write(path, data)` / `.delete(path)` / `.sync(path)` /
-`.copy(src, dst)` and flush on `.commit()` (best-effort) or
-`.commit_grouped()` (atomic).
+`.write(path, data)` / `.delete(path)` / `.copy(src, dst)` and
+are submitted by `.commit()` or `.commit_grouped()`.
 
-For programmatic batch construction, prefer
-`Handle::write_batch(Vec<BatchOp>)` directly.
+For batches already collected in a slice, `Handle::write_batch(&[(path, data)])`,
+`Handle::delete_batch(&[path])` and `Handle::copy_batch(&[(src, dst)])`
+skip the builder.
+
+Ops run in submission order; the first failure stops the batch and
+the ops completed before it stay applied and durable (they are not
+rolled back). Neither variant makes the batch atomic as a whole.
 
 ### `commit` vs `commit_grouped` (0.9.3)
 
 | Method | Semantics |
 |---|---|
-| `commit()` | Best-effort. Each op runs through the dispatcher individually; failures surface a `BatchError` but successful ops are preserved. |
-| `commit_grouped()` | **Atomic-batch fsync.** Amortises parent-directory `fsync` across the entire batch — one syscall per unique parent directory instead of one per op. Right choice for bulk-load / SST-flush / checkpoint workloads where the batch is the durability unit. *(0.9.3.)* |
+| `commit()` | Each op syncs its parent directory as soon as it completes, so every op is durable before the next one starts. |
+| `commit_grouped()` | Amortises the parent-directory `fsync`: one per unique parent directory, issued after the last op (also when a later op failed, for the ops that completed). Until the call returns, a crash can leave any subset of the batch visible, each file entirely old or entirely new. Right choice for bulk-load / SST-flush / checkpoint workloads where the batch is the durability unit. *(0.9.3.)* |
 
 `BatchError` is the error type returned by partial-failure
 batches. Per the 0.9.6 H-4 audit, its fields are private; use

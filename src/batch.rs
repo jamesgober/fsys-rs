@@ -197,17 +197,24 @@ impl<'a> Batch<'a> {
     /// no-op (directory durability is implicit), so this method
     /// is observably equivalent to [`Self::commit`] on Windows.
     ///
-    /// **The trade-off.** Under regular `commit`, every op is
-    /// individually durable on return (including its dirent
-    /// update). Under `commit_grouped`, ops are durable *as a
-    /// set* on return — a crash mid-batch may leave a prefix of
-    /// the renames visible while the dirent updates have not yet
-    /// landed on the journal. The per-op data is on disk
-    /// regardless (its data fsync still happened), so on the
-    /// next fsync/reboot the filesystem journal replays the
-    /// dirent updates. Callers that need per-op dirent
-    /// durability (rare — usually only when each op IS a
-    /// transaction commit) should use [`Self::commit`].
+    /// **The trade-off.** Under regular `commit`, every op's
+    /// directory entry is synced as soon as the op completes.
+    /// Under `commit_grouped`, the directory syncs run after the
+    /// last op of the batch, so the ops become durable *as a set*
+    /// when the call returns. A crash before that point can leave
+    /// any subset of the batch's renames and deletes visible after
+    /// reboot: each file is entirely its old or entirely its new
+    /// contents (every write's data was fenced before its rename),
+    /// but which ops survived is not defined. Callers that need
+    /// each op durable before the next one starts (usually only
+    /// when each op IS a transaction commit) should use
+    /// [`Self::commit`].
+    ///
+    /// When an op fails, the batch stops there and the directories
+    /// of the ops that completed before it are still synced before
+    /// the error is returned, so those ops are durable just as
+    /// under [`Self::commit`]. Deletes take part in the grouped
+    /// directory sync too.
     ///
     /// **When to use it.** Bulk loads, SST flushes, database
     /// checkpoint emissions — any workload where the batch is

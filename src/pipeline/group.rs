@@ -37,7 +37,6 @@ use crossbeam_channel::{select, Receiver, Sender};
 use crate::crud::atomic::{atomic_replace, BufferedFlush, PlatformHooks, ReplacePlan};
 use crate::error::BatchError;
 use crate::method::Method;
-use crate::platform;
 use crate::{Error, Result};
 
 use super::PipelineConfig;
@@ -313,12 +312,12 @@ where
         let mut completed: usize = 0;
         let mut failure: Option<(usize, Error)> = None;
         // 0.9.3: accumulate one representative file path per
-        // unique parent directory in grouped mode. After all
-        // ops succeed, we issue one `sync_parent_dir` per
-        // unique parent rather than the N-per-op cost the
-        // regular path incurs. The map's key is the parent
-        // directory; the value is some file path inside it that
-        // `sync_parent_dir` (which takes a file path and
+        // unique parent directory in grouped mode. After the job
+        // finishes, one parent-directory sync is issued per unique
+        // parent of the ops that completed, rather than the
+        // N-per-op cost the regular path incurs. The map's key is
+        // the parent directory; the value is some file path inside
+        // it that `sync_parent` (which takes a file path and
         // internally `.parent()`s it) can consume directly.
         // Only populated when `grouped == true`.
         let mut grouped_parents: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
@@ -335,7 +334,9 @@ where
                     BatchOp::Copy { dst, .. } => {
                         dst.parent().map(|p| (PathBuf::from(p), dst.clone()))
                     }
-                    BatchOp::Delete { .. } => None,
+                    BatchOp::Delete { path } => {
+                        path.parent().map(|p| (PathBuf::from(p), path.clone()))
+                    }
                 }
             } else {
                 None
@@ -362,18 +363,22 @@ where
             }
         }
 
-        // 0.9.3 grouped commit: if every op succeeded, issue
-        // exactly one `sync_parent_dir` per unique parent
-        // directory. This collapses the N-per-op cost of the
+        // 0.9.3 grouped commit: issue exactly one parent-directory
+        // sync per unique parent directory of the ops that
+        // completed. This collapses the N-per-op cost of the
         // regular path into one-per-unique-dir, which for the
         // typical "all ops in the batch live under the same
         // directory" workload is just one syscall total.
-        // Best-effort, matching pre-0.9.3 semantics where
-        // `sync_parent_dir` errors were swallowed by
-        // `execute_write`.
-        if grouped && failure.is_none() {
+        //
+        // The syncs run even when a later op failed: the batch
+        // contract is that ops completed before the failure are
+        // durable, and their renames / unlinks are only durable
+        // once their directories are synced. Best-effort, matching
+        // the per-op path where a directory-sync error does not
+        // undo an already-published rename.
+        if grouped {
             for repr in grouped_parents.values() {
-                let _ = platform::sync_parent_dir(repr);
+                let _ = crate::crud::sync_parent(repr);
             }
         }
 
@@ -399,7 +404,7 @@ where
 fn execute_op(op: BatchOp, snapshot: &HandleSnapshot, grouped: bool) -> Result<()> {
     match op {
         BatchOp::Write { path, data } => execute_write(&path, &data, snapshot, grouped),
-        BatchOp::Delete { path } => execute_delete(&path),
+        BatchOp::Delete { path } => execute_delete(&path, grouped),
         BatchOp::Copy { src, dst } => execute_copy(&src, &dst, snapshot, grouped),
     }
 }
@@ -430,9 +435,19 @@ fn execute_write(path: &Path, data: &[u8], snapshot: &HandleSnapshot, grouped: b
 }
 
 /// Idempotent delete: missing-file is `Ok(())`.
-fn execute_delete(path: &Path) -> Result<()> {
+///
+/// A successful unlink is made durable by syncing the parent directory
+/// (per op, or once per directory in grouped mode). Best-effort, like
+/// the write path: the unlink has already happened when the directory
+/// sync runs.
+fn execute_delete(path: &Path, grouped: bool) -> Result<()> {
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if !grouped {
+                let _ = crate::crud::sync_parent(path);
+            }
+            Ok(())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Error::Io(e)),
     }
@@ -509,14 +524,14 @@ mod tests {
     fn test_execute_delete_idempotent_on_missing_file() {
         let path = tmp_path("delete_missing");
         // No file created.
-        execute_delete(&path).expect("delete missing should succeed");
+        execute_delete(&path, false).expect("delete missing should succeed");
     }
 
     #[test]
     fn test_execute_delete_removes_existing_file() {
         let path = tmp_path("delete_existing");
         std::fs::write(&path, b"x").unwrap();
-        execute_delete(&path).expect("delete");
+        execute_delete(&path, false).expect("delete");
         assert!(!path.exists());
     }
 
@@ -722,6 +737,89 @@ mod tests {
             r_ok.is_ok(),
             "second job should succeed despite first job's panic"
         );
+    }
+
+    #[test]
+    fn test_execute_delete_syncs_parent_directory() {
+        let path = tmp_path("delete_dir_sync");
+        std::fs::write(&path, b"x").unwrap();
+        let before = crate::crud::fence_probe::dir_syncs();
+        execute_delete(&path, false).expect("delete");
+        assert_eq!(crate::crud::fence_probe::dir_syncs(), before + 1);
+        // Missing file: nothing changed, nothing to sync.
+        execute_delete(&path, false).expect("delete missing");
+        assert_eq!(crate::crud::fence_probe::dir_syncs(), before + 1);
+    }
+
+    #[test]
+    fn test_grouped_job_syncs_completed_dirs_even_when_a_later_op_fails() {
+        // Ops that complete before a failure are documented as
+        // durable; in grouped mode that requires the per-directory
+        // sync to run for them even though the job failed.
+        let ok = tmp_path("grouped_partial_ok");
+        let _g = TmpFile(ok.clone());
+        let bad_dir = tmp_path("grouped_partial_bad");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let job = BatchJob {
+            ops: vec![
+                BatchOp::Write {
+                    path: ok.clone(),
+                    data: b"ok".to_vec(),
+                },
+                BatchOp::Write {
+                    path: bad_dir.clone(),
+                    data: b"fails: target is a directory".to_vec(),
+                },
+            ],
+            snapshot: snapshot(),
+            response: BatchResponse::Sync(tx),
+            grouped: true,
+        };
+        let before = crate::crud::fence_probe::dir_syncs();
+        process_jobs_with(vec![job], execute_op);
+        let _ = std::fs::remove_dir_all(&bad_dir);
+        let err = rx.recv().unwrap().expect_err("op 1 fails");
+        assert_eq!((err.failed_at, err.completed), (1, 1));
+        assert_eq!(
+            crate::crud::fence_probe::dir_syncs(),
+            before + 1,
+            "the completed op's directory must be synced"
+        );
+        assert_eq!(std::fs::read(&ok).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn test_grouped_job_syncs_each_directory_once() {
+        let a = tmp_path("grouped_once_a");
+        let b = tmp_path("grouped_once_b");
+        let d = tmp_path("grouped_once_del");
+        let _ga = TmpFile(a.clone());
+        let _gb = TmpFile(b.clone());
+        std::fs::write(&d, b"x").unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let job = BatchJob {
+            ops: vec![
+                BatchOp::Write {
+                    path: a.clone(),
+                    data: b"a".to_vec(),
+                },
+                BatchOp::Write {
+                    path: b.clone(),
+                    data: b"b".to_vec(),
+                },
+                BatchOp::Delete { path: d.clone() },
+            ],
+            snapshot: snapshot(),
+            response: BatchResponse::Sync(tx),
+            grouped: true,
+        };
+        let before = crate::crud::fence_probe::dir_syncs();
+        process_jobs_with(vec![job], execute_op);
+        rx.recv().unwrap().expect("job succeeds");
+        // All three paths share the temp directory.
+        assert_eq!(crate::crud::fence_probe::dir_syncs(), before + 1);
+        assert!(!d.exists());
     }
 
     #[test]
