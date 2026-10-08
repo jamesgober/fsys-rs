@@ -5,25 +5,32 @@
 //!
 //! ## Atomicity
 //!
-//! Writes go through the same atomic-replace pattern fsys uses
-//! elsewhere ([`crate::Handle::write_copy`]): write to a temporary
-//! file alongside the destination, then rename over the destination.
-//! A crash mid-write leaves either the old file or the new file —
-//! never a partially-written one.
+//! Writes go through an atomic-replace pattern: the document is written
+//! to a uniquely named temporary file in the cache directory (created
+//! with `create_new`, so an existing file or symlink at that name is
+//! never opened or followed; mode `0600` on Unix), flushed with
+//! `sync_all`, then renamed over `capabilities.toml`. A crash leaves
+//! either the old file or the new one, never a partial file. The
+//! directory itself is not fsynced, so after a crash the rename may not
+//! have happened, which only costs a re-probe.
 //!
 //! ## Trust boundary
 //!
-//! The cache is treated as untrusted on read. We parse defensively,
-//! validate every field against the live system, and treat parse
-//! errors as "cache missing" (which re-probes rather than failing).
-//! A maliciously crafted cache file cannot cause fsys to make
-//! incorrect backend selections — every claimed capability is
-//! either verified live or already validated by the consuming code.
+//! The cache is parsed defensively: unparseable files, files missing any
+//! schema key, out-of-range integers, and stale entries (see
+//! [`super`]) all read as "no cache" and trigger a re-probe rather than
+//! an error. The *values* of a well-formed, fresh cache are not
+//! re-verified against the live system: anyone who can write the cache
+//! file (the current user, or whoever controls `FSYS_CACHE_DIR`) can
+//! change what [`super::capabilities()`] reports, including
+//! `spdk_eligible`. Keep the cache directory private to the user that
+//! runs fsys.
 
 use super::toml_lite::{Document, Value};
 use super::types::{Capabilities, HardwareSummary, IoUringFeature, PciAddress, SpdkSkipReason};
-use std::io;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 /// Maximum age of a cached entry before it is considered stale, in
 /// seconds. Mirrors [`super::CAPABILITY_CACHE_MAX_AGE_DAYS`].
@@ -124,23 +131,62 @@ pub fn store(caps: &Capabilities) -> io::Result<()> {
     };
     std::fs::create_dir_all(parent)?;
     let doc = capabilities_to_document(caps);
-    let tmp = path.with_extension("toml.tmp");
-    // Write-then-rename atomic-replace. On rename failure (typically
-    // EXDEV across mount points, or the destination being held open
-    // by another process on Windows) we explicitly clean up the
-    // temp file rather than leaving a stale artefact next to the
-    // cache. This keeps the cache directory tidy under partial-
-    // write failure scenarios — relevant on Windows where the
-    // antivirus or backup software occasionally takes a brief
-    // exclusive lock on freshly-renamed files.
-    std::fs::write(&tmp, doc.serialize())?;
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        // Best-effort cleanup; if the rename failed we may also
-        // fail to remove, in which case the original error wins.
-        let _ = std::fs::remove_file(&tmp);
+    let (tmp, mut file) = create_unique_temp(parent)?;
+    // Write, flush to stable storage, then rename over the destination.
+    // On any failure (disk full, EXDEV, the destination held open by
+    // another process on Windows) the temp file is removed rather than
+    // left next to the cache.
+    let written = file
+        .write_all(doc.serialize().as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &path)) {
+        // Best-effort cleanup; if the removal also fails, the original
+        // error is the one worth reporting.
+        let _cleanup = std::fs::remove_file(&tmp);
         return Err(e);
     }
     Ok(())
+}
+
+/// Creates a new, uniquely named temporary file in `dir` for [`store`].
+///
+/// The name combines the process id, a timestamp and a process-wide
+/// counter, so concurrent writers (threads or processes) never share a
+/// temp file. `create_new` fails instead of opening an existing file or
+/// following a symlink planted at that name. On Unix the file is created
+/// with mode `0600`; on Windows it inherits the ACL of the per-user
+/// cache directory (`%LOCALAPPDATA%`), which has no mode bits to set.
+fn create_unique_temp(dir: &Path) -> io::Result<(PathBuf, File)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    for _ in 0..16 {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = dir.join(format!(
+            "capabilities.toml.{}.{nanos}.{n}.tmp",
+            std::process::id()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        let _ = options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(f) => return Ok((candidate, f)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a unique capability cache temp file",
+    ))
 }
 
 /// Deletes the cache file.
@@ -283,63 +329,47 @@ fn capabilities_to_document(caps: &Capabilities) -> Document {
     doc
 }
 
+/// Rebuilds a [`Capabilities`] from a parsed cache document.
+///
+/// Every key the writer emits is required: a missing key, a value of the
+/// wrong kind, or an integer outside its field's range returns `None`, so
+/// a truncated or hand-edited file is treated as "no cache" and
+/// re-probed instead of being filled in with defaults.
 fn document_to_capabilities(doc: &Document) -> Option<Capabilities> {
-    let schema_version = doc.root_int("schema_version")? as u32;
+    let schema_version = u32::try_from(doc.root_int("schema_version")?).ok()?;
     let fsys_version = doc.root_string("fsys_version")?;
     let kernel_version = doc.root_string("kernel_version")?;
     let os_target = doc.root_string("os_target")?;
-    let probed_at_unix_secs = doc.root_int("probed_at_unix_secs")? as u64;
+    let probed_at_unix_secs = u64::try_from(doc.root_int("probed_at_unix_secs")?).ok()?;
 
-    let io_uring = doc
-        .section_bool("capabilities", "io_uring")
-        .unwrap_or(false);
-    let io_uring_feature_strs = doc
-        .section_strings("capabilities", "io_uring_features")
-        .unwrap_or_default();
-    let io_uring_features: Vec<IoUringFeature> = io_uring_feature_strs
+    let io_uring = doc.section_bool("capabilities", "io_uring")?;
+    let io_uring_features: Vec<IoUringFeature> = doc
+        .section_strings("capabilities", "io_uring_features")?
         .iter()
         .filter_map(|s| IoUringFeature::from_str_canonical(s))
         .collect();
-    let nvme_passthrough = doc
-        .section_bool("capabilities", "nvme_passthrough")
-        .unwrap_or(false);
-    let direct_io = doc
-        .section_bool("capabilities", "direct_io")
-        .unwrap_or(false);
-    let plp_detected = doc
-        .section_bool("capabilities", "plp_detected")
-        .unwrap_or(false);
-    let spdk_eligible = doc
-        .section_bool("capabilities", "spdk_eligible")
-        .unwrap_or(false);
-    let spdk_skip_reason_strs = doc
-        .section_strings("capabilities", "spdk_skip_reasons")
-        .unwrap_or_default();
-    let spdk_skip_reasons: Vec<SpdkSkipReason> = spdk_skip_reason_strs
+    let nvme_passthrough = doc.section_bool("capabilities", "nvme_passthrough")?;
+    let direct_io = doc.section_bool("capabilities", "direct_io")?;
+    let plp_detected = doc.section_bool("capabilities", "plp_detected")?;
+    let spdk_eligible = doc.section_bool("capabilities", "spdk_eligible")?;
+    let spdk_skip_reasons: Vec<SpdkSkipReason> = doc
+        .section_strings("capabilities", "spdk_skip_reasons")?
         .iter()
         .filter_map(|s| skip_reason_from_token(s))
         .collect();
-    let device_strs = doc
-        .section_strings("capabilities", "spdk_eligible_devices")
-        .unwrap_or_default();
-    let spdk_eligible_devices: Vec<PciAddress> = device_strs
+    let spdk_eligible_devices: Vec<PciAddress> = doc
+        .section_strings("capabilities", "spdk_eligible_devices")?
         .iter()
         .filter_map(|s| PciAddress::parse(s))
         .collect();
 
-    let drive_type = doc
-        .section_string("hardware", "drive_type")
-        .unwrap_or_else(|| "unknown".to_string());
-    let optimal_block_size = doc
-        .section_int("hardware", "optimal_block_size")
-        .unwrap_or(0) as u32;
-    let queue_depth = doc.section_int("hardware", "queue_depth").unwrap_or(1) as u32;
-    let sector_size_logical = doc
-        .section_int("hardware", "sector_size_logical")
-        .unwrap_or(512) as u32;
-    let sector_size_physical = doc
-        .section_int("hardware", "sector_size_physical")
-        .unwrap_or(512) as u32;
+    let section_u32 =
+        |key: &str| -> Option<u32> { u32::try_from(doc.section_int("hardware", key)?).ok() };
+    let drive_type = doc.section_string("hardware", "drive_type")?;
+    let optimal_block_size = section_u32("optimal_block_size")?;
+    let queue_depth = section_u32("queue_depth")?;
+    let sector_size_logical = section_u32("sector_size_logical")?;
+    let sector_size_physical = section_u32("sector_size_physical")?;
 
     let hardware = HardwareSummary {
         drive_type,
@@ -686,6 +716,78 @@ mod tests {
             assert!(matches!(load(), Ok(None)));
             // Idempotent — second invalidate on a missing file is Ok.
             invalidate().expect("invalidate idempotent");
+        });
+    }
+
+    #[test]
+    fn test_document_missing_any_key_is_rejected() {
+        let full = capabilities_to_document(&fixture_caps()).serialize();
+        assert!(document_to_capabilities(&Document::parse(&full).expect("parse")).is_some());
+        // Drop each `key = value` line in turn; every key is required.
+        let lines: Vec<&str> = full.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains(" = ") {
+                continue;
+            }
+            let partial: String = lines
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, l)| format!("{l}\n"))
+                .collect();
+            let doc = Document::parse(&partial).expect("parse partial");
+            assert!(
+                document_to_capabilities(&doc).is_none(),
+                "cache without `{line}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_document_rejects_out_of_range_integers() {
+        let text = capabilities_to_document(&fixture_caps())
+            .serialize()
+            .replace("queue_depth = 64", "queue_depth = -1");
+        let doc = Document::parse(&text).expect("parse");
+        assert!(document_to_capabilities(&doc).is_none());
+    }
+
+    #[test]
+    fn test_store_leaves_only_the_cache_file() {
+        with_cache_dir("tidy", |dir| {
+            let caps = fixture_caps();
+            store(&caps).expect("store 1");
+            store(&caps).expect("store 2");
+            let names: Vec<String> = std::fs::read_dir(dir)
+                .expect("read_dir")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(names, vec!["capabilities.toml".to_string()]);
+        });
+    }
+
+    #[test]
+    fn test_create_unique_temp_never_reuses_a_name() {
+        with_cache_dir("unique", |dir| {
+            std::fs::create_dir_all(dir).expect("mkdir");
+            let (a, fa) = create_unique_temp(dir).expect("a");
+            let (b, fb) = create_unique_temp(dir).expect("b");
+            assert_ne!(a, b);
+            drop((fa, fb));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_store_creates_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        with_cache_dir("mode", |dir| {
+            store(&fixture_caps()).expect("store");
+            let mode = std::fs::metadata(dir.join("capabilities.toml"))
+                .expect("meta")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
         });
     }
 
