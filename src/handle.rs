@@ -1122,10 +1122,21 @@ impl Handle {
             }
         }
 
-        // Pass 2 — lexical `starts_with(root)` check on the
-        // normalised path. Cheap; rejects obvious escapes before
-        // we touch the filesystem.
-        if !rootpath::starts_with(&resolved, root) {
+        // Pass 2: lexical `starts_with(root)` check on the normalised
+        // path. Cheap; rejects obvious escapes before we touch the
+        // filesystem.
+        //
+        // An absolute path can name a location inside the root through
+        // a spelling that differs from the canonical root: a Windows
+        // 8.3 short name (`RUNNER~1` for `runneradmin`), a symlinked
+        // ancestor (`/tmp` -> `/private/tmp` on macOS), or a junction.
+        // The lexical check cannot tell those from a real escape, so for
+        // absolute paths a lexical miss defers to the canonical-prefix
+        // check in Pass 3, which is authoritative and skips the fast
+        // path below. Relative paths are joined to the canonical root,
+        // so a lexical miss there is a real `..` escape.
+        let lexically_inside = rootpath::starts_with(&resolved, root);
+        if !lexically_inside && !path.is_absolute() {
             return Err(Error::InvalidPath {
                 path: path.to_owned(),
                 reason: "path escapes the handle root (lexical)".into(),
@@ -1156,7 +1167,7 @@ impl Handle {
         // The slow path (Pass 3 below) handles the remaining cases
         // — nested writes (`subdir/file.txt`), reads of paths with
         // symlinks anywhere in the chain, etc.
-        if let Some(parent) = resolved.parent() {
+        if let Some(parent) = resolved.parent().filter(|_| lexically_inside) {
             if parent == root.as_path() {
                 match std::fs::symlink_metadata(&resolved) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1249,8 +1260,14 @@ impl Handle {
                         });
                     }
                     // Defensive: if we've popped past the canonical
-                    // root, the path can't be inside.
-                    if !rootpath::starts_with(&existing_prefix, root) {
+                    // root, the path can't be inside. Only meaningful
+                    // when the path is spelled like the root; an
+                    // absolute path that reached Pass 3 through another
+                    // spelling (short name, symlinked ancestor) is
+                    // decided by the canonical check once an existing
+                    // ancestor is found, and the walk always ends at one
+                    // (the volume root exists).
+                    if lexically_inside && !rootpath::starts_with(&existing_prefix, root) {
                         return Err(Error::InvalidPath {
                             path: path.to_owned(),
                             reason: "no canonical ancestor lies within the handle root".into(),
@@ -2019,6 +2036,121 @@ mod tests {
             Err(Error::InvalidPath { .. })
         ));
         assert!(!missing_dir.exists());
+    }
+
+    /// Returns the 8.3 short form of an existing path, or `None` when the
+    /// volume does not generate short names (the result equals the input).
+    #[cfg(windows)]
+    fn short_path(path: &Path) -> Option<PathBuf> {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: `wide` is NUL-terminated and outlives the call; `buf`
+        // is a writable buffer of `buf.len()` u16s, and that length is
+        // what we pass, so the API never writes past it. The return
+        // value is the number of u16s written (excluding NUL), or 0 on
+        // failure, or a required size larger than the buffer.
+        let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
+            as usize;
+        if n == 0 || n >= buf.len() {
+            return None;
+        }
+        let short = PathBuf::from(OsString::from_wide(&buf[..n]));
+        (short != path).then_some(short)
+    }
+
+    // GitHub's Windows runners expose TEMP through an 8.3 short name
+    // (`C:\Users\RUNNER~1\...`). The handle stores its root in canonical
+    // long form, so an absolute in-root path spelled with a short name
+    // used to fail the lexical prefilter.
+    #[cfg(windows)]
+    #[test]
+    fn test_absolute_in_root_path_with_short_name_is_accepted() {
+        let (root, outside, _g) = jail_dirs("shortname");
+        let Some(short_root) = short_path(&root) else {
+            // Short-name generation is disabled on this volume; the case
+            // cannot occur here.
+            return;
+        };
+        let h = crate::Builder::new()
+            .method(Method::Sync)
+            .root(&root)
+            .build()
+            .expect("build");
+
+        let target = short_root.join("short.bin");
+        h.write(&target, b"short")
+            .expect("short-name in-root write");
+        assert_eq!(
+            std::fs::read(root.join("short.bin")).expect("read"),
+            b"short"
+        );
+
+        // A short-name spelling of a directory outside the root is still
+        // rejected by the canonical-prefix check.
+        if let Some(short_outside) = short_path(&outside) {
+            assert!(matches!(
+                h.write(short_outside.join("escape.bin"), b"x"),
+                Err(Error::InvalidPath { .. })
+            ));
+            assert!(!outside.join("escape.bin").exists());
+        }
+    }
+
+    // On Unix an absolute path can reach the root through a symlinked
+    // ancestor (macOS: `/tmp` -> `/private/tmp`). The lexical prefilter
+    // must defer to the canonical check instead of rejecting it.
+    #[cfg(unix)]
+    #[test]
+    fn test_absolute_in_root_path_through_symlinked_ancestor_is_accepted() {
+        let (root, outside, _g) = jail_dirs("symancestor");
+        let base = root.parent().expect("base").to_path_buf();
+        let alias = base.join("alias");
+        assert!(make_link(&base, &alias), "create alias symlink");
+
+        let h = crate::Builder::new()
+            .method(Method::Sync)
+            .root(&root)
+            .build()
+            .expect("build");
+
+        let via_alias = alias.join("root").join("via_alias.bin");
+        h.write(&via_alias, b"alias")
+            .expect("in-root write via alias");
+        assert_eq!(
+            std::fs::read(root.join("via_alias.bin")).expect("read"),
+            b"alias"
+        );
+
+        // `write` does not create parent directories; the leaf is the
+        // not-yet-existing tail the canonical walk has to re-attach.
+        std::fs::create_dir(root.join("n1")).expect("mkdir n1");
+        let nested = alias.join("root").join("n1").join("n2.bin");
+        h.write(&nested, b"nested")
+            .expect("nested in-root write via alias");
+        assert_eq!(
+            std::fs::read(root.join("n1").join("n2.bin")).expect("read"),
+            b"nested"
+        );
+
+        // The same alias pointing at a sibling of the root must still be
+        // rejected, and nothing may be created outside the root.
+        let escape = alias.join("outside").join("escape.bin");
+        assert!(matches!(
+            h.write(&escape, b"x"),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(!outside.join("escape.bin").exists());
+
+        // Relative `..` escapes keep failing the lexical check.
+        assert!(matches!(
+            h.write("../outside/rel.bin", b"x"),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(!outside.join("rel.bin").exists());
     }
 
     #[cfg(windows)]
