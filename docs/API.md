@@ -262,7 +262,6 @@ let fs = fsys::builder()
     .method(Method::Direct)
     .root("/data")
     .mode(Mode::Prod)
-    .batch_window_ms(2)
     .batch_size_max(256)
     .batch_queue_max(2048)
     .buffer_pool_count(128)
@@ -276,9 +275,9 @@ let fs = fsys::builder()
 | `method(Method)` | `Auto` | Durability strategy. |
 | `root(P)` | `None` | Path-scope enforcement. Paths that escape the root are rejected with `Error::InvalidPath`. |
 | `mode(Mode)` | `Auto` | Dev/Prod profile. |
-| `batch_window_ms(u64)` | `1` | Group-lane time threshold. |
-| `batch_size_max(usize)` | `128` | Group-lane count threshold. |
-| `batch_queue_max(usize)` | `1024` | Group-lane queue capacity. |
+| `batch_window_ms(u64)` | — | Accepted, unused since 1.1.1: the dispatcher no longer waits for more jobs (each op has its own fence, so waiting only added latency). |
+| `batch_size_max(usize)` | `128` | Ops the dispatcher takes from the queue per pass. `0` = one job per pass. |
+| `batch_queue_max(usize)` | `1024` | Group-lane queue capacity; submitters block when full. `0` = rendezvous queue. |
 | `buffer_pool_count(usize)` | `64` | Number of aligned buffers in the per-handle pool. *(Renamed from `buffer_pool_size` in 0.7.0.)* |
 | `buffer_pool_block_size(usize)` | `4096` | Per-buffer size in bytes. *(Renamed from `buffer_pool_block` in 0.7.0.)* |
 | `io_uring_queue_depth(u32)` | `128` | Linux io_uring SQ depth. |

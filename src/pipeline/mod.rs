@@ -13,11 +13,15 @@
 //!   on this path.
 //! - **Group lane.** `Handle::write_batch`, `delete_batch`, `copy_batch`,
 //!   and `Batch::commit` route through this module. Ops are placed on a
-//!   bounded MPMC queue and consumed by a per-handle dispatcher thread
-//!   that accumulates batches under a hybrid time-or-count window
-//!   (defaults: 1 ms / 128 ops / 1024-deep queue), executes them in
-//!   strict submission order, and reports per-batch results back to the
-//!   caller.
+//!   bounded MPMC queue (default 1024 jobs deep) and consumed by a
+//!   per-handle dispatcher thread that executes them in strict
+//!   submission order and reports per-batch results back to the
+//!   caller. The dispatcher never waits for more work: each op has its
+//!   own fence, so there is no fsync to share by delaying a batch.
+//!   With the default single dispatcher, all batches submitted to one
+//!   handle (from any thread) run one after another; use
+//!   `Builder::dispatcher_shards` to run batches for different paths
+//!   in parallel.
 //!
 //! The dispatcher thread is spawned **lazily** on the first batch
 //! submission: idle handles cost zero threads. On `Pipeline` drop,
@@ -65,19 +69,16 @@ pub(crate) use group::{BatchOp, HandleSnapshot};
 
 /// Configuration knobs for the group-lane pipeline.
 ///
-/// Set by the [`crate::Builder`] (`batch_window_ms`, `batch_size_max`,
-/// `batch_queue_max`, `dispatcher_shards`). Defaults: 1 ms window,
-/// 128 ops per batch, 1024-deep queue, 1 dispatcher (single-thread
-/// per handle, identical to pre-0.9.3 behaviour).
+/// Set by the [`crate::Builder`] (`batch_size_max`, `batch_queue_max`,
+/// `dispatcher_shards`). Defaults: 128 ops per dispatcher pass,
+/// 1024-deep queue, 1 dispatcher (single-thread per handle, identical
+/// to pre-0.9.3 behaviour).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PipelineConfig {
-    /// Maximum time the dispatcher waits for additional jobs after the
-    /// first one arrives, before forcing a flush. Counted in
-    /// milliseconds.
-    pub batch_window_ms: u64,
-    /// Maximum number of accumulated ops per batch flush. The
-    /// dispatcher flushes when *either* the time window expires or this
-    /// count is reached, whichever comes first.
+    /// Upper bound on the ops the dispatcher takes from the queue in
+    /// one pass (it always takes at least one job). `0` means one job
+    /// per pass. Jobs run in queue order either way; the bound only
+    /// limits how much work a pass picks up at once.
     pub batch_size_max: usize,
     /// Bounded queue capacity. When the queue is full, callers
     /// submitting a batch *block* until space is available (decision #4
@@ -99,10 +100,9 @@ pub(crate) struct PipelineConfig {
 }
 
 impl PipelineConfig {
-    /// Default configuration. 1 ms window, 128 ops per batch, 1024-deep
-    /// queue per shard, 1 shard (single dispatcher).
+    /// Default configuration. 128 ops per pass, 1024-deep queue per
+    /// shard, 1 shard (single dispatcher).
     pub const DEFAULT: PipelineConfig = PipelineConfig {
-        batch_window_ms: 1,
         batch_size_max: 128,
         batch_queue_max: 1024,
         dispatcher_shards: 1,
@@ -484,7 +484,6 @@ mod tests {
     #[test]
     fn test_pipeline_config_default_matches_prompt() {
         let c = PipelineConfig::default();
-        assert_eq!(c.batch_window_ms, 1);
         assert_eq!(c.batch_size_max, 128);
         assert_eq!(c.batch_queue_max, 1024);
         // 0.9.3: default shard count = 1 (single-dispatcher).
@@ -794,6 +793,78 @@ mod tests {
         assert_eq!(err.completed, 1, "completed count");
         // Op 0 (good write) is durable; op 2 (never) was not attempted.
         assert_eq!(std::fs::read(&good).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn test_pipeline_dispatches_queued_jobs_without_waiting() {
+        // Two submitters racing used to make the dispatcher hold the
+        // second job for the batch window although nothing was shared
+        // between the jobs. A long window must not delay completion.
+        use std::sync::Arc;
+        let p = Arc::new(Pipeline::new(PipelineConfig::DEFAULT));
+        p.submit(Vec::new(), snapshot_default(), false)
+            .expect("spawn");
+        let start = Instant::now();
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let p = Arc::clone(&p);
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        p.submit(Vec::new(), snapshot_default(), false)
+                            .expect("submit");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("join");
+        }
+        // 100 empty jobs with no wait complete far below a second.
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_pipeline_with_rendezvous_queue_executes_batches() {
+        // batch_queue_max(0) gives a zero-capacity (rendezvous) queue:
+        // each submit hands its job directly to the dispatcher.
+        let p = Pipeline::new(PipelineConfig {
+            batch_queue_max: 0,
+            ..PipelineConfig::DEFAULT
+        });
+        let path = tmp_path("rendezvous");
+        let _g = scopeguard_remove(path.clone());
+        for i in 0..3u8 {
+            p.submit(
+                vec![BatchOp::Write {
+                    path: path.clone(),
+                    data: vec![i],
+                }],
+                snapshot_default(),
+                false,
+            )
+            .expect("submit through rendezvous queue");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn test_pipeline_with_zero_batch_size_executes_batches() {
+        let p = Pipeline::new(PipelineConfig {
+            batch_size_max: 0,
+            ..PipelineConfig::DEFAULT
+        });
+        let path = tmp_path("zero_batch_size");
+        let _g = scopeguard_remove(path.clone());
+        p.submit(
+            vec![BatchOp::Write {
+                path: path.clone(),
+                data: b"z".to_vec(),
+            }],
+            snapshot_default(),
+            false,
+        )
+        .expect("submit");
+        assert_eq!(std::fs::read(&path).unwrap(), b"z");
     }
 
     #[test]

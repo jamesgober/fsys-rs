@@ -1,5 +1,5 @@
 //! Group-lane dispatcher: bounded MPMC queue + per-handle thread that
-//! accumulates [`BatchJob`]s under a hybrid time-or-count window and
+//! takes the [`BatchJob`]s already queued (up to a count limit) and
 //! executes their ops in strict submission order.
 //!
 //! ## Op-execution model (decision D-4(c))
@@ -30,7 +30,6 @@
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 use crossbeam_channel::{select, Receiver, Sender};
 
@@ -173,80 +172,25 @@ pub(super) fn run_dispatcher(
             }
         };
 
-        // Step 2 — accumulate within the time/count window.
+        // Step 2 — scoop jobs that are already queued (non-blocking),
+        // up to `batch_size_max` ops, and execute them in order.
         //
-        // 0.8.0 I round-2: scoop any already-queued jobs via
-        // `try_recv` first. Two cases benefit:
-        //
-        //   (a) Multiple submitters racing — their jobs are already
-        //       queued by the time we wake up; we batch them
-        //       without waiting for the window.
-        //   (b) Single-submitter "big batch" — the first job alone
-        //       already has many ops; if no other jobs are queued,
-        //       skip the window entirely and flush.
-        //
-        // This eliminates the ~window/2 fixed latency penalty that
-        // the bench surfaced (batch-of-8 was 0.42–0.65× of solo×8
-        // on Windows because of the 1 ms accumulation wait).
+        // The dispatcher does not wait for more jobs to arrive. Every
+        // op carries its own fence (the temp file of each write must
+        // be durable before its own rename), so holding a job back to
+        // accumulate others shares no fsync; it only adds latency.
+        // 1.1.1 removed the former `batch_window_ms` wait for that
+        // reason.
         let mut total_ops: usize = first.ops.len();
         let mut accumulated: Vec<BatchJob> = Vec::with_capacity(8);
         accumulated.push(first);
-        // Drain any jobs already in the queue (non-blocking).
         while total_ops < config.batch_size_max {
             match job_rx.try_recv() {
                 Ok(job) => {
-                    total_ops += job.ops.len();
+                    total_ops = total_ops.saturating_add(job.ops.len());
                     accumulated.push(job);
                 }
                 Err(_) => break,
-            }
-        }
-        // Fast-flush rule: if we already have enough work or the
-        // queue is empty (no concurrent submitters trickling jobs
-        // in), don't wait for more.
-        let already_full = total_ops >= config.batch_size_max;
-        let already_busy = accumulated.len() >= 2;
-        if already_full || (config.batch_window_ms == 0) {
-            // No window — go straight to execute.
-            process_jobs(accumulated);
-            continue 'outer;
-        }
-        // Only enter the time-window if our first scoop found more
-        // jobs (indicating concurrent submitters worth waiting
-        // for). Otherwise flush eagerly — the bench's
-        // single-batch-and-wait pattern hits this branch.
-        if !already_busy {
-            process_jobs(accumulated);
-            continue 'outer;
-        }
-
-        let deadline = Instant::now() + Duration::from_millis(config.batch_window_ms);
-
-        while total_ops < config.batch_size_max {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            select! {
-                recv(job_rx) -> r => match r {
-                    Ok(job) => {
-                        total_ops += job.ops.len();
-                        accumulated.push(job);
-                    }
-                    // Senders gone — process what we have, then exit at
-                    // the top of the outer loop (which will see the
-                    // disconnect on the next first-job wait).
-                    Err(_) => break,
-                },
-                recv(shutdown_rx) -> _ => {
-                    while let Ok(j) = job_rx.try_recv() {
-                        accumulated.push(j);
-                    }
-                    process_jobs(accumulated);
-                    break 'outer;
-                },
-                default(remaining) => break, // window expired
             }
         }
 

@@ -95,8 +95,15 @@ Soak success criteria:
   per-handle pool. Default 64.
 - `buffer_pool_block_size(usize)` — size of each buffer (in bytes,
   rounded up to the probed sector size). Default 4096.
-- `batch_window_ms(u64)`, `batch_size_max(usize)`,
-  `batch_queue_max(usize)` — group-lane dispatcher knobs from 0.4.0.
+- `batch_size_max(usize)`, `batch_queue_max(usize)` — group-lane
+  dispatcher knobs from 0.4.0: ops taken from the queue per
+  dispatcher pass, and queue capacity before submitters block.
+  `batch_window_ms(u64)` is still accepted but unused since 1.1.1:
+  each op carries its own fence, so holding jobs back to group them
+  shared no fsync and only added latency.
+- With the default single dispatcher, every batch submitted to one
+  handle runs after the previous one finishes, whichever thread
+  submitted it.
 - `dispatcher_shards(usize)` (0.9.3) — number of dispatcher threads
   per handle. Default 1 (preserves pre-0.9.3 behavior exactly).
   Values > 1 spawn N independent dispatcher threads; batches are

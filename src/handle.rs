@@ -1399,6 +1399,11 @@ impl Handle {
     /// First call to any batch method on this handle spawns the dispatcher
     /// thread (~one-time ~50–200 µs cost).
     ///
+    /// With the default single dispatcher
+    /// ([`crate::Builder::dispatcher_shards`]), batches submitted to this
+    /// handle from any thread execute one after another, so a batch can
+    /// wait behind batches submitted earlier by other threads.
+    ///
     /// # Errors
     ///
     /// - [`BatchError`] wrapping [`Error::InvalidPath`] if any path
