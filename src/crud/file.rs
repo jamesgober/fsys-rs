@@ -1380,16 +1380,11 @@ mod tests {
         writer.join().expect("writer thread");
     }
 
-    // On Linux the io_uring ring caches fixed-file slots by raw fd
-    // number (`platform/linux_iouring.rs`, `FdRegistry`). Once a temp
-    // file's fd is closed and the number is reused by the next open,
-    // the ring keeps addressing the old file, so the second Direct
-    // write lands in the first file. The fix belongs to the io_uring
-    // track; this test documents the expected behaviour.
-    #[cfg_attr(
-        target_os = "linux",
-        ignore = "FS-C1: io_uring fixed-file slot reuse, fixed on fix/uring"
-    )]
+    // Regression for FS-C1: before 1.1.1 the Linux io_uring ring cached
+    // fixed-file slots by raw fd number. Once a temp file's fd closed and
+    // the number was reused by the next open, the ring kept addressing
+    // the old file, so the second Direct write landed in the first file.
+    // The slot cache is gone; every op on one Handle must hit its own file.
     #[test]
     fn test_direct_ops_on_one_handle_hit_the_right_files() {
         let h = direct_handle();
