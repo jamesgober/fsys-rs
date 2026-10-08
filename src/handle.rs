@@ -724,6 +724,10 @@ impl Handle {
     /// **Not free.** PLP detection is per-process probing, cached
     /// for the process lifetime. A hot-plugged drive that arrives
     /// after fsys's first probe is not re-detected.
+    ///
+    /// Describes the drive that holds the process's current working
+    /// directory at the first probe, not this handle's root; see
+    /// [`fsys::hardware::DriveInfo`](crate::hardware::DriveInfo).
     #[must_use]
     pub fn is_plp_protected(&self) -> bool {
         matches!(
@@ -759,11 +763,13 @@ impl Handle {
     ///   semantics — reads return zeros).
     /// - **Other**: returns `Error::Io` with `Unsupported` kind.
     ///
-    /// **Sector alignment.** Most filesystems will silently
-    /// round the range to filesystem-block boundaries (4 KiB
-    /// typical). Callers that need precise byte-level zeros
-    /// should follow with [`Self::write_zeros`] on the
-    /// trailing partial sectors.
+    /// **Alignment.** On macOS only whole file-system blocks inside
+    /// the range are deallocated; the unaligned head and tail are
+    /// overwritten with zeros and stay allocated. On Windows
+    /// `FSCTL_SET_ZERO_DATA` zero-fills the range and frees clusters
+    /// only on sparse files. Linux punches the exact range (partial
+    /// blocks are zeroed by the kernel). Every byte of the range
+    /// reads as zero afterwards on all three.
     ///
     /// # Errors
     ///
@@ -855,9 +861,13 @@ impl Handle {
     /// MUST treat `None` as "no atomic guarantee — protect every
     /// write".
     ///
-    /// **Probing happens once at handle creation** (via
-    /// [`crate::hardware::info`]) and the result is cached for
+    /// **Probing happens once per process** (via
+    /// [`crate::hardware::drive`]) and the result is cached for
     /// the lifetime of the process. Hot-plug is not re-probed.
+    ///
+    /// Describes the drive that holds the process's current working
+    /// directory at the first probe, not this handle's root; see
+    /// [`fsys::hardware::DriveInfo`](crate::hardware::DriveInfo).
     #[must_use]
     pub fn atomic_write_unit(&self) -> Option<u32> {
         let drive = crate::hardware::drive();
@@ -879,6 +889,10 @@ impl Handle {
     /// callers wants to log "drive PLP unknown, falling back to
     /// fdatasync" vs "drive confirmed no PLP, fdatasync mandatory".
     /// See [`Self::is_plp_protected`] for the most common case.
+    ///
+    /// Describes the drive that holds the process's current working
+    /// directory at the first probe, not this handle's root; see
+    /// [`fsys::hardware::DriveInfo`](crate::hardware::DriveInfo).
     #[must_use]
     pub fn plp_status(&self) -> crate::hardware::PlpStatus {
         crate::hardware::drive().plp
