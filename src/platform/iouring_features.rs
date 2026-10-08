@@ -94,15 +94,31 @@ pub(crate) struct IoUringFeatures {
 /// Returns [`IoUringFeatures::default`] (all-false) on hosts
 /// where every probed flag is rejected — the fallback behaviour
 /// is identical to pre-0.9.4 (vanilla `IoUring::new`).
+///
+/// Only a definitive answer is cached: a tier the kernel accepted,
+/// `EINVAL` on every tier (the flags are unknown to this kernel), or
+/// `ENOSYS` (no io_uring at all). Any other setup error (`ENOMEM`,
+/// `EMFILE`, `ENFILE`, `EAGAIN`, `EPERM`, ...) says nothing about the
+/// kernel's flag support, so that call returns the all-false default
+/// without caching it and the next call probes again.
 pub(crate) fn features() -> IoUringFeatures {
     static CACHE: OnceLock<IoUringFeatures> = OnceLock::new();
-    *CACHE.get_or_init(probe)
+    if let Some(cached) = CACHE.get() {
+        return *cached;
+    }
+    match probe() {
+        Some(definitive) => *CACHE.get_or_init(|| definitive),
+        None => IoUringFeatures::default(),
+    }
 }
 
 /// Synchronous probe. Tries the most aggressive flag combination
 /// first; strips on `EINVAL`. Always returns within microseconds
 /// (each `io_uring_setup` is a single syscall).
-fn probe() -> IoUringFeatures {
+///
+/// Returns `None` when a setup call failed for a reason other than
+/// flag support (see [`features`]); the result must not be cached.
+fn probe() -> Option<IoUringFeatures> {
     // 0.9.7 H-9 — test-hook env-var bypass.
     //
     // Audit H-9: the elite-flag fallback paths (kernel < 5.19 →
@@ -118,69 +134,105 @@ fn probe() -> IoUringFeatures {
     //
     // The env-var name is intentionally obscure to make
     // accidental triggering in production environments
-    // vanishingly unlikely. The check runs once per process
-    // (this function is called from a `OnceLock::get_or_init`),
-    // so production cost is one [`env::var_os`] call ever ≈ 1 µs
-    // on the first ring construction. After that, the cached
-    // value is returned with zero cost.
+    // vanishingly unlikely. The check runs until the first
+    // definitive probe result is cached, so production cost is
+    // one [`env::var_os`] call ≈ 1 µs on the first ring
+    // construction. After that, the cached value is returned
+    // with zero cost.
     if std::env::var_os("FSYS_TEST_FORCE_NO_IOURING_FEATURES").is_some() {
-        return IoUringFeatures::default();
+        return Some(IoUringFeatures::default());
     }
 
-    // Tier 1 — DEFER_TASKRUN (6.1+) requires SINGLE_ISSUER, and
-    // pairs naturally with COOP_TASKRUN. `let _ = ` consumes the
-    // chained `&mut Builder` return so the crate's `unused_results`
-    // lint is satisfied; the builder mutation is the side effect
-    // we want.
-    if try_build(|b| {
-        let _ = b
-            .setup_defer_taskrun()
-            .setup_single_issuer()
-            .setup_coop_taskrun();
-    }) {
-        return IoUringFeatures {
-            coop_taskrun: true,
-            single_issuer: true,
-            defer_taskrun: true,
-        };
-    }
+    let tiers: [(IoUringFeatures, ApplyFlags); 3] = [
+        // Tier 1 — DEFER_TASKRUN (6.1+) requires SINGLE_ISSUER, and
+        // pairs naturally with COOP_TASKRUN. `let _ = ` consumes the
+        // chained `&mut Builder` return so the crate's `unused_results`
+        // lint is satisfied; the builder mutation is the side effect
+        // we want.
+        (
+            IoUringFeatures {
+                coop_taskrun: true,
+                single_issuer: true,
+                defer_taskrun: true,
+            },
+            |b| {
+                let _ = b
+                    .setup_defer_taskrun()
+                    .setup_single_issuer()
+                    .setup_coop_taskrun();
+            },
+        ),
+        // Tier 2 — SINGLE_ISSUER (6.0+) + COOP_TASKRUN.
+        (
+            IoUringFeatures {
+                coop_taskrun: true,
+                single_issuer: true,
+                defer_taskrun: false,
+            },
+            |b| {
+                let _ = b.setup_single_issuer().setup_coop_taskrun();
+            },
+        ),
+        // Tier 3 — COOP_TASKRUN (5.19+) alone.
+        (
+            IoUringFeatures {
+                coop_taskrun: true,
+                single_issuer: false,
+                defer_taskrun: false,
+            },
+            |b| {
+                let _ = b.setup_coop_taskrun();
+            },
+        ),
+    ];
 
-    // Tier 2 — SINGLE_ISSUER (6.0+) + COOP_TASKRUN.
-    if try_build(|b| {
-        let _ = b.setup_single_issuer().setup_coop_taskrun();
-    }) {
-        return IoUringFeatures {
-            coop_taskrun: true,
-            single_issuer: true,
-            defer_taskrun: false,
-        };
-    }
-
-    // Tier 3 — COOP_TASKRUN (5.19+) alone.
-    if try_build(|b| {
-        let _ = b.setup_coop_taskrun();
-    }) {
-        return IoUringFeatures {
-            coop_taskrun: true,
-            single_issuer: false,
-            defer_taskrun: false,
-        };
+    for (features, cfg) in tiers {
+        match classify_setup(try_build(cfg)) {
+            SetupOutcome::Accepted => return Some(features),
+            SetupOutcome::FlagsRejected => continue,
+            SetupOutcome::Unsupported => return Some(IoUringFeatures::default()),
+            SetupOutcome::Transient => return None,
+        }
     }
 
     // Tier 4 — no elite flags. This is the pre-0.9.4 baseline.
-    IoUringFeatures::default()
+    Some(IoUringFeatures::default())
+}
+
+/// Sets one tier's setup flags on a ring builder.
+type ApplyFlags = fn(&mut io_uring::Builder);
+
+/// How one probe `io_uring_setup(2)` attempt ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupOutcome {
+    /// The ring was built with these flags.
+    Accepted,
+    /// `EINVAL`: the kernel does not know one of the flags.
+    FlagsRejected,
+    /// `ENOSYS`: no io_uring support at all.
+    Unsupported,
+    /// Anything else (resource limits, permission policy): no
+    /// conclusion about flag support.
+    Transient,
+}
+
+fn classify_setup(result: std::io::Result<()>) -> SetupOutcome {
+    match result {
+        Ok(()) => SetupOutcome::Accepted,
+        Err(e) => match e.raw_os_error() {
+            Some(libc::EINVAL) => SetupOutcome::FlagsRejected,
+            Some(libc::ENOSYS) => SetupOutcome::Unsupported,
+            _ => SetupOutcome::Transient,
+        },
+    }
 }
 
 /// Tries building a tiny (queue-depth 4) ring with the flags
-/// applied by `cfg`. Returns `true` if construction succeeded,
-/// `false` otherwise. The ring is dropped immediately.
-fn try_build<F>(cfg: F) -> bool
-where
-    F: FnOnce(&mut io_uring::Builder),
-{
+/// applied by `cfg`. The ring is dropped immediately.
+fn try_build(cfg: ApplyFlags) -> std::io::Result<()> {
     let mut builder = io_uring::IoUring::builder();
     cfg(&mut builder);
-    builder.build(4).is_ok()
+    builder.build(4).map(drop)
 }
 
 /// Ring usage mode — selects which elite flags are safe to apply.
@@ -302,6 +354,37 @@ mod tests {
                  the kernel will reject a ring built this way"
             );
         }
+    }
+
+    #[test]
+    fn test_classify_setup_only_einval_strips_flags() {
+        use std::io::Error;
+        assert_eq!(classify_setup(Ok(())), SetupOutcome::Accepted);
+        assert_eq!(
+            classify_setup(Err(Error::from_raw_os_error(libc::EINVAL))),
+            SetupOutcome::FlagsRejected
+        );
+        assert_eq!(
+            classify_setup(Err(Error::from_raw_os_error(libc::ENOSYS))),
+            SetupOutcome::Unsupported
+        );
+        for transient in [
+            libc::ENOMEM,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::EPERM,
+            libc::EAGAIN,
+        ] {
+            assert_eq!(
+                classify_setup(Err(Error::from_raw_os_error(transient))),
+                SetupOutcome::Transient,
+                "errno {transient}"
+            );
+        }
+        assert_eq!(
+            classify_setup(Err(Error::other("no errno"))),
+            SetupOutcome::Transient
+        );
     }
 
     /// `features()` must be a pure cache after the first call —
