@@ -161,19 +161,21 @@ pub fn io_uring_features() -> Vec<IoUringFeature> {
     }
 }
 
-/// Returns the running kernel version (Linux/macOS) or build label
-/// (Windows / other) for cache invalidation.
+/// Returns the running OS version used as the capability cache's
+/// invalidation key.
 ///
 /// **Linux:** reads `/proc/sys/kernel/osrelease` — the standard
 /// kernel-version string. Falls back to `"unknown"` if the file
 /// is unreadable.
 ///
-/// **macOS:** the `sysctl` `kern.osrelease` would be the analogue;
-/// 1.1.0 returns `"macos"` as a coarse cache key (the SPDK probe
-/// always reports `NotLinux` on macOS, so the kernel version doesn't
-/// actually matter for invalidation here).
+/// **macOS / Windows:** the version from [`crate::os::info`]: the
+/// product version (`kern.osproductversion`, e.g. `"14.4.1"`) on macOS,
+/// `"<major>.<minor>.<build>"` from `RtlGetVersion` on Windows. An OS
+/// update therefore invalidates the cache. (Before 1.1.1 this returned
+/// the constant `"macos"` / `"windows"`.)
 ///
-/// **Windows:** returns `"windows"` for the same reason.
+/// **Other targets:** [`std::env::consts::OS`], because no version
+/// probe exists there.
 #[must_use]
 pub fn kernel_version_string() -> String {
     #[cfg(target_os = "linux")]
@@ -183,7 +185,11 @@ pub fn kernel_version_string() -> String {
             Err(_) => "unknown".to_string(),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        crate::os::info().version.clone()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         std::env::consts::OS.to_string()
     }

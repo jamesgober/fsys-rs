@@ -27,11 +27,14 @@
 //!
 //! 1. The fsys version embedded in the file does not match this
 //!    crate's `CARGO_PKG_VERSION`.
-//! 2. The kernel version (Linux/macOS) or build number (Windows) in
-//!    the file does not match the live value.
+//! 2. The OS version in the file does not match the live value: the
+//!    kernel release on Linux, the product version on macOS, the
+//!    `major.minor.build` number on Windows (the last two come from
+//!    [`crate::os::info`]).
 //! 3. The schema version in the file does not match
-//!    [`Capabilities::SCHEMA_VERSION`].
-//! 4. The cache file's modification time is older than 30 days.
+//!    [`CAPABILITY_CACHE_SCHEMA_VERSION`].
+//! 4. The `probed_at_unix_secs` timestamp stored in the file is 30 or
+//!    more days old (the file's modification time is not consulted).
 //! 5. The `FSYS_REPROBE` environment variable is set to `1`.
 //! 6. The cache file is missing, unreadable, or fails to parse.
 //!
@@ -39,7 +42,7 @@
 //!
 //! - [`capabilities()`] — returns the cached snapshot (or runs the
 //!   probe + writes the cache on first call). Sub-millisecond on
-//!   cache hit.
+//!   cache hit, and a hit does not rewrite the file.
 //! - [`probe_capabilities_fresh()`] — forces a re-probe, ignoring the
 //!   cache. Writes the new result to the cache file.
 //! - [`invalidate_capability_cache()`] — deletes the cache file so
@@ -115,21 +118,33 @@ static CAPABILITIES: OnceLock<Capabilities> = OnceLock::new();
 #[must_use]
 pub fn capabilities() -> &'static Capabilities {
     CAPABILITIES.get_or_init(|| {
-        let snapshot = if std::env::var("FSYS_REPROBE").as_deref() == Ok("1") {
-            probe_fresh()
-        } else {
-            match cache::load() {
-                Ok(Some(c)) => c,
-                Ok(None) | Err(_) => probe_fresh(),
-            }
-        };
-        // Best-effort write. Failure to persist the cache is not fatal;
-        // it just means the next process will re-probe. Errors are
-        // ignored deliberately — REPS forbids silent error swallow,
-        // but this is the documented "best-effort persistence" path.
-        let _ = cache::store(&snapshot);
-        snapshot
+        let reprobe = std::env::var("FSYS_REPROBE").as_deref() == Ok("1");
+        load_or_probe(reprobe, cache::load, probe_fresh, cache::store)
     })
+}
+
+/// Returns the cached snapshot when `reprobe` is false and `load` yields
+/// a valid one; otherwise runs `probe` and persists the result with
+/// `store`. A cache hit is returned as-is and never rewritten.
+fn load_or_probe(
+    reprobe: bool,
+    load: impl FnOnce() -> std::io::Result<Option<Capabilities>>,
+    probe: impl FnOnce() -> Capabilities,
+    store: impl FnOnce(&Capabilities) -> std::io::Result<()>,
+) -> Capabilities {
+    if !reprobe {
+        // A read error is treated like a miss: re-probe and overwrite.
+        if let Ok(Some(cached)) = load() {
+            return cached;
+        }
+    }
+    let fresh = probe();
+    // Best-effort write. Failure to persist the cache is not fatal;
+    // it just means the next process will re-probe. Errors are
+    // ignored deliberately — REPS forbids silent error swallow,
+    // but this is the documented "best-effort persistence" path.
+    let _ = store(&fresh);
+    fresh
 }
 
 /// Runs a fresh probe, ignoring any cached data on disk.
@@ -260,6 +275,55 @@ mod tests {
         assert_eq!(a.schema_version, b.schema_version);
         assert_eq!(a.fsys_version, b.fsys_version);
         assert_eq!(a.os_target, b.os_target);
+    }
+
+    #[test]
+    fn test_load_or_probe_hit_does_not_probe_or_store() {
+        use std::cell::Cell;
+        let probes = Cell::new(0);
+        let stores = Cell::new(0);
+        let cached = probe_fresh();
+        let expected_at = cached.probed_at_unix_secs;
+        let got = load_or_probe(
+            false,
+            || Ok(Some(cached)),
+            || {
+                probes.set(probes.get() + 1);
+                probe_fresh()
+            },
+            |_| {
+                stores.set(stores.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(got.probed_at_unix_secs, expected_at);
+        assert_eq!((probes.get(), stores.get()), (0, 0));
+    }
+
+    #[test]
+    fn test_load_or_probe_miss_probes_and_stores_once() {
+        use std::cell::Cell;
+        for (reprobe, loaded) in [
+            (false, Ok(None)),
+            (false, Err(std::io::Error::other("read failed"))),
+            (true, Ok(Some(probe_fresh()))),
+        ] {
+            let probes = Cell::new(0);
+            let stores = Cell::new(0);
+            let _ = load_or_probe(
+                reprobe,
+                || loaded,
+                || {
+                    probes.set(probes.get() + 1);
+                    probe_fresh()
+                },
+                |_| {
+                    stores.set(stores.get() + 1);
+                    Ok(())
+                },
+            );
+            assert_eq!((probes.get(), stores.get()), (1, 1));
+        }
     }
 
     #[test]
