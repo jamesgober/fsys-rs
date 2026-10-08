@@ -77,6 +77,9 @@ prohibited. Diagram reflects the architecture as of **0.9.7**.
 - **`crate::hardware`** — drive type, PLP, sector sizes, queue
   depth, capacity, IO primitive availability. Live functions for
   drive/memory/cpu; cached `info()` snapshot for everything-at-once.
+  The drive values describe the drive holding the process's
+  current working directory, not a handle's root (see
+  [`PLATFORM-NOTES.md`](PLATFORM-NOTES.md#hardware-probe-scope)).
 - **`crate::path`** — OS-aware default paths, normalization,
   segment sanitisation, dev/prod mode.
 - **`crate::Handle`** — the primary entry point. Owns the resolved
@@ -150,8 +153,10 @@ prohibited. Diagram reflects the architecture as of **0.9.7**.
    NVMe passthrough flush if capable), falling back to the
    platform's `write_all_direct` (`pwrite` + `fdatasync`).
 4. `platform::atomic_rename` performs the temp→target swap.
-5. `platform::sync_parent_dir` finalises directory durability
-   on Linux/macOS.
+5. `platform::sync_parent_dir` finalises directory durability:
+   `fsync` of the directory on Linux, `F_FULLFSYNC` (or `fsync`
+   where unsupported) on macOS, `FlushFileBuffers` on a directory
+   handle on Windows.
 
 ## Data flow — async batch
 

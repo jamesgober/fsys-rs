@@ -73,8 +73,7 @@ use unknown as imp;
 // address.
 //
 // Allocation cost: one `alloc + dealloc` per Direct IO operation on
-// unaligned input. The 64 KiB stack-buffer optimisation is deferred to
-// 0.5.0; all Direct IO alignment uses heap allocation in 0.3.0.
+// unaligned input; there is no stack-buffer fast path.
 // ──────────────────────────────────────────────────────────────────────────────
 
 use std::alloc::{self, Layout};
@@ -241,11 +240,13 @@ pub(crate) fn write_all(file: &std::fs::File, data: &[u8]) -> crate::Result<()> 
 ///
 /// # Platform-specific behavior
 ///
-/// - Linux: `pwrite(2)` with an aligned buffer; offset 0.
-/// - macOS: standard `write(2)` on an `F_NOCACHE` fd; alignment handled by
-///   zero-padding to sector boundary.
-/// - Windows: `WriteFile` through a `FILE_FLAG_NO_BUFFERING` handle with an
-///   aligned buffer.
+/// - Linux: `pwrite(2)` loop with an aligned buffer, starting at offset 0.
+/// - macOS: the same `pwrite(2)` loop from offset 0 on an `F_NOCACHE` fd.
+///   `F_NOCACHE` does not flush the drive cache; durability needs a
+///   following [`sync_data`] (`F_FULLFSYNC`).
+/// - Windows: `WriteFile` at the handle's cursor through a
+///   `FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH` handle with an
+///   aligned buffer, in chunks of at most 2 GiB (a sector multiple).
 /// - Unknown: delegates to [`write_all`] (no Direct IO on unknown platforms).
 #[inline]
 pub(crate) fn write_all_direct(
@@ -258,10 +259,12 @@ pub(crate) fn write_all_direct(
 
 /// Writes `data` to `file` at `offset` bytes using standard IO.
 ///
-/// Uses `pwrite(2)` on Unix and `SetFilePointerEx` + `WriteFile` on
-/// Windows. This is **not** crash-atomic — a power failure mid-write
-/// may leave the file in a partially updated state. Callers that need
-/// crash safety should use [`crate::Handle::write`] instead.
+/// Uses `pwrite(2)` on Unix and `WriteFile` with the offset in an
+/// `OVERLAPPED` struct on Windows, so concurrent callers on one handle
+/// never race on a shared cursor. This is **not** crash-atomic: a power
+/// failure mid-write may leave the file in a partially updated state.
+/// Callers that need crash safety should use [`crate::Handle::write`]
+/// instead.
 #[inline]
 pub(crate) fn write_at(file: &std::fs::File, offset: u64, data: &[u8]) -> crate::Result<()> {
     imp::write_at(file, offset, data)
@@ -301,10 +304,91 @@ pub(crate) fn read_all_direct(
     imp::read_all_direct(file, file_size, sector_size)
 }
 
-/// Reads `len` bytes from `file` starting at `offset`.
+/// Reads up to `len` bytes from `file` starting at `offset`.
+///
+/// Returns fewer bytes when the file ends first, and an empty buffer when
+/// `offset` is at or past the end. The read position comes from the call
+/// (`pread(2)` on Unix, `OVERLAPPED` offsets on Windows), so concurrent
+/// callers on the same handle do not race on a shared cursor.
+///
+/// The buffer never grows past what the file can supply (rounded up to
+/// 64 KiB): see [`read_range_with`].
+///
+/// On `O_DIRECT` / `FILE_FLAG_NO_BUFFERING` handles the request length
+/// and offset reach the kernel unchanged (for any `len` up to 64 KiB, or
+/// any sector-multiple `len` within the file), but the returned `Vec` is
+/// not sector-aligned, so such reads only succeed when the allocator
+/// happens to return a suitably aligned buffer.
 #[inline]
 pub(crate) fn read_range(file: &std::fs::File, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
     imp::read_range(file, offset, len)
+}
+
+/// Allocation granule for range reads: the up-front buffer for a
+/// regular file is `size - offset` rounded up to this, and buffers for
+/// files of unknown size (pipes, character devices, procfs) grow in
+/// steps of at least this much.
+const RANGE_READ_GROW_STEP: usize = 64 * 1024;
+
+/// Shared body of every platform's `read_range`.
+///
+/// `read_at(buf, pos)` is the platform's positioned read: it fills a
+/// prefix of `buf` from file offset `pos` and returns the byte count
+/// (`0` at end of file). `ErrorKind::Interrupted` is retried.
+///
+/// Allocation is bounded by what the file can supply, never by `len`
+/// alone. For a regular file the buffer is `min(len, size - offset
+/// rounded up to 64 KiB)` from one `fstat`; an `offset` at or past the
+/// end returns an empty buffer without reading. The rounding keeps the
+/// first request at the caller's full length in the common cases, which
+/// matters on `O_DIRECT` handles where a request shorter than a sector
+/// is rejected; the kernel's short read at end of file then trims the
+/// result. For other file types the buffer grows in 64 KiB (or
+/// doubling) steps as data arrives, up to `len`.
+pub(crate) fn read_range_with(
+    file: &std::fs::File,
+    offset: u64,
+    len: usize,
+    mut read_at: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> crate::Result<Vec<u8>> {
+    let meta = file.metadata().map_err(crate::Error::Io)?;
+    let (initial, can_grow) = if meta.is_file() {
+        let available = meta.len().saturating_sub(offset);
+        let step = RANGE_READ_GROW_STEP as u64;
+        let rounded = available
+            .checked_add(step - 1)
+            .map_or(u64::MAX, |v| v / step * step);
+        let cap = usize::try_from(rounded).unwrap_or(usize::MAX);
+        (len.min(cap), false)
+    } else {
+        (len.min(RANGE_READ_GROW_STEP), true)
+    };
+
+    let mut buf = vec![0u8; initial];
+    let mut total = 0usize;
+    loop {
+        if total == buf.len() {
+            if !can_grow || total >= len {
+                break;
+            }
+            let grow = (len - total).min(RANGE_READ_GROW_STEP.max(buf.len()));
+            buf.resize(total + grow, 0);
+        }
+        let pos = offset.checked_add(total as u64).ok_or_else(|| {
+            crate::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "read_range: offset overflow",
+            ))
+        })?;
+        match read_at(&mut buf[total..], pos) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(crate::Error::Io(e)),
+        }
+    }
+    buf.truncate(total);
+    Ok(buf)
 }
 
 /// Flushes data-only (equivalent of `fdatasync`).
@@ -312,12 +396,25 @@ pub(crate) fn read_range(file: &std::fs::File, offset: u64, len: usize) -> crate
 /// On platforms without `fdatasync` (macOS, Windows), falls back to a
 /// full flush. The caller is responsible for updating `active_method()`
 /// when this fallback occurs.
+///
+/// # Platform-specific behavior
+///
+/// - Linux: `fdatasync(2)`.
+/// - macOS: `fcntl(F_FULLFSYNC)`, which also flushes the drive's write
+///   cache. File systems that reject `F_FULLFSYNC` (`ENOTSUP`,
+///   `EOPNOTSUPP`, `EINVAL`) get `fsync(2)` instead. This is the call
+///   that makes a `Method::Direct` (`F_NOCACHE`) write durable on macOS.
+/// - Windows: `FlushFileBuffers`.
+/// - Unknown: `File::sync_all`.
 #[inline]
 pub(crate) fn sync_data(file: &std::fs::File) -> crate::Result<()> {
     imp::sync_data(file)
 }
 
 /// Full file flush (equivalent of `fsync` / `F_FULLFSYNC`).
+///
+/// Same per-platform primitives as [`sync_data`] except on Linux, where
+/// this is `fsync(2)`.
 #[inline]
 pub(crate) fn sync_full(file: &std::fs::File) -> crate::Result<()> {
     imp::sync_full(file)
@@ -364,10 +461,14 @@ pub(crate) fn set_write_lifetime_hint(file: &std::fs::File, hint_ordinal: u8) ->
 ///
 /// **Per-platform implementation:**
 /// - **Linux**: `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`.
-/// - **macOS**: `fcntl(F_PUNCHHOLE)` with `fpunchhole_t` payload.
-/// - **Windows**: `DeviceIoControl(FSCTL_SET_ZERO_DATA)` —
-///   the closest semantic match (Windows zeros the range, which
-///   most NTFS configurations release to free space).
+/// - **macOS**: `fcntl(F_PUNCHHOLE)` with `fpunchhole_t` payload on the
+///   whole file-system blocks inside the range (clipped to EOF); the
+///   unaligned head and tail are overwritten with zeros, so those
+///   partial blocks stay allocated.
+/// - **Windows**: `DeviceIoControl(FSCTL_SET_ZERO_DATA)`. The range
+///   always reads back as zeros, but NTFS only releases the clusters
+///   for files marked sparse, and fsys never sets the sparse flag: on
+///   files fsys created, the call zero-fills without freeing space.
 /// - **Other**: returns `Err(Error::Io)` with `Unsupported` kind.
 ///
 /// Returns `Err` on filesystems that don't support hole-punching
@@ -390,15 +491,19 @@ pub(crate) fn punch_hole(file: &std::fs::File, offset: u64, len: u64) -> crate::
 /// this into an NVMe `WRITE ZEROES` command — the drive marks
 /// the range as zeros without host→device data transfer. On
 /// other platforms / configurations the implementation falls
-/// back to a write of an aligned zero buffer.
+/// back to positioned writes of a zero buffer
+/// ([`zero_fill_by_writes`]).
 ///
 /// **Per-platform implementation:**
-/// - **Linux**: `fallocate(FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE)`.
-/// - **macOS**: pwrite of an in-memory zero buffer.
-/// - **Windows**: `DeviceIoControl(FSCTL_SET_ZERO_DATA)` (same
-///   IOCTL as `punch_hole`; semantics match for the zero-fill
-///   case).
-/// - **Other**: pwrite of an in-memory zero buffer.
+/// - **Linux**: `fallocate(FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE)`;
+///   on file systems that reject it with `EOPNOTSUPP` (tmpfs, many
+///   FUSE mounts), the zero-buffer writes.
+/// - **macOS / Windows / other**: the zero-buffer writes. (On Windows
+///   this is not `FSCTL_SET_ZERO_DATA`; that IOCTL is only used by
+///   [`punch_hole`].)
+///
+/// `fallocate` with `KEEP_SIZE` never changes the file size; the
+/// zero-buffer writes extend the file when the range runs past EOF.
 #[inline]
 pub(crate) fn zero_range(file: &std::fs::File, offset: u64, len: u64) -> crate::Result<()> {
     #[cfg(target_os = "linux")]
@@ -407,23 +512,37 @@ pub(crate) fn zero_range(file: &std::fs::File, offset: u64, len: u64) -> crate::
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // Universal fallback: write zeros via pwrite.
-        // Uses an 8 KiB stack buffer to avoid a large heap
-        // allocation for typical hole sizes; longer ranges loop.
-        if len == 0 {
-            return Ok(());
-        }
-        let zeros: [u8; 8192] = [0u8; 8192];
-        let mut written = 0u64;
-        while written < len {
-            let chunk = (len - written).min(zeros.len() as u64) as usize;
-            // pwrite-style positioned write. Use the platform's
-            // write_at primitive which handles offset internally.
-            write_at(file, offset + written, &zeros[..chunk])?;
-            written += chunk as u64;
-        }
-        Ok(())
+        zero_fill_by_writes(file, offset, len)
     }
+}
+
+/// Writes zeros over `[offset, offset + len)` with the platform's
+/// positioned [`write_at`], 8 KiB at a time from a stack buffer.
+///
+/// `offset + len` overflowing `u64` is an `InvalidInput` error rather
+/// than a wrapped offset.
+pub(crate) fn zero_fill_by_writes(
+    file: &std::fs::File,
+    offset: u64,
+    len: u64,
+) -> crate::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    if offset.checked_add(len).is_none() {
+        return Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "zero-fill range overflows u64",
+        )));
+    }
+    let zeros = [0u8; 8192];
+    let mut written = 0u64;
+    while written < len {
+        let chunk = (len - written).min(zeros.len() as u64) as usize;
+        write_at(file, offset + written, &zeros[..chunk])?;
+        written += chunk as u64;
+    }
+    Ok(())
 }
 
 /// 0.9.4 — Barrier-grade sync. Cheaper than [`sync_full`]
@@ -438,9 +557,12 @@ pub(crate) fn zero_range(file: &std::fs::File, offset: u64, len: u64) -> crate::
 ///   Apple Silicon NVMe.
 /// - **Linux:** `fdatasync(2)` — already barrier-grade by
 ///   default; same as `sync_data`.
-/// - **Windows:** no-op. `FILE_FLAG_WRITE_THROUGH` already
-///   provides durable-on-return semantics for every write;
-///   there is no separate barrier primitive to call.
+/// - **Windows:** returns immediately when the handle was opened
+///   with `FILE_FLAG_WRITE_THROUGH` (every write on it was already
+///   durable when `WriteFile` returned); otherwise calls
+///   `FlushFileBuffers`, the same as [`sync_full`]. The default
+///   buffered journal handle is not write-through, so on Windows
+///   `SyncMode::Barrier` costs the same as `SyncMode::Full` there.
 /// - **Unknown:** falls back to `sync_data`.
 ///
 /// **Used internally** by [`crate::JournalHandle::sync_through`]
@@ -461,10 +583,7 @@ pub(crate) fn sync_barrier(file: &std::fs::File) -> crate::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        // WRITE_THROUGH already made every write durable on
-        // return; the per-handle file has nothing pending.
-        let _ = file;
-        Ok(())
+        imp::sync_barrier(file)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -487,11 +606,39 @@ pub(crate) fn atomic_rename(from: &std::path::Path, to: &std::path::Path) -> cra
 /// Opens the parent directory and calls `fsync` on it.
 ///
 /// Required on Linux and macOS after an atomic rename to guarantee that the
-/// directory entry update is durable. No-op on Windows (directory durability
-/// is implicit with `WRITE_THROUGH`) and on unknown platforms.
+/// directory entry update is durable. A bare file name (`"file"`, whose
+/// `parent()` is the empty path) syncs the current directory.
+///
+/// # Platform-specific behavior
+///
+/// - Linux: `fsync(2)` on the directory.
+/// - macOS: `fcntl(F_FULLFSYNC)` on the directory, `fsync(2)` where the
+///   file system rejects `F_FULLFSYNC`.
+/// - Windows: opens the directory with `FILE_FLAG_BACKUP_SEMANTICS` and
+///   `FILE_WRITE_DATA` access (no administrator rights needed) and calls
+///   `FlushFileBuffers`, which commits the rename's directory-entry
+///   change. File systems that cannot flush a directory handle
+///   (`ERROR_INVALID_FUNCTION`, `ERROR_NOT_SUPPORTED`,
+///   `ERROR_INVALID_PARAMETER`) are treated as success, which is what this
+///   function did unconditionally before 1.1.1.
+/// - Other Unix (the BSDs): `fsync(2)` on the directory.
+/// - Other targets: no-op.
 #[inline]
 pub(crate) fn sync_parent_dir(path: &std::path::Path) -> crate::Result<()> {
     imp::sync_parent_dir(path)
+}
+
+/// Directory that holds `path`: its parent, or `"."` when `path` is a
+/// bare file name (whose `parent()` is the empty path, which no OS can
+/// open) or has no parent at all.
+// Unused only on non-Unix, non-Windows fallback targets, whose
+// `sync_parent_dir` is a no-op.
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+pub(crate) fn parent_or_current_dir(path: &std::path::Path) -> &std::path::Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    }
 }
 
 /// Copies `src` to `dst` using the best available platform primitive.
@@ -501,7 +648,11 @@ pub(crate) fn sync_parent_dir(path: &std::path::Path) -> crate::Result<()> {
 /// - Linux: `copy_file_range(2)` for same-filesystem copies; `std::fs::copy`
 ///   fallback.
 /// - macOS: `clonefile(2)` when available; `std::fs::copy` fallback.
-/// - Windows/Unknown: `std::fs::copy`.
+/// - Windows: ReFS block clone (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`) when
+///   the source volume supports it; `std::fs::copy` otherwise or on any
+///   clone failure (a destination the clone attempt created is removed
+///   first).
+/// - Unknown: `std::fs::copy`.
 #[inline]
 pub(crate) fn copy_file(src: &std::path::Path, dst: &std::path::Path) -> crate::Result<u64> {
     imp::copy_file(src, dst)
@@ -520,6 +671,8 @@ pub(crate) fn probe_sector_size(path: &std::path::Path) -> u32 {
 ///
 /// A `true` result means the kernel-level API exists; actual availability
 /// depends on the filesystem and is confirmed at file-open time.
+// Only the per-platform unit tests call this today; it stays as the one
+// place that states each platform's Direct IO answer.
 #[allow(dead_code)]
 #[inline]
 pub(crate) fn probe_direct_io_available() -> bool {
@@ -547,18 +700,20 @@ pub(crate) fn probe_direct_io_available() -> bool {
 /// - **macOS:** `fcntl(fd, F_PREALLOCATE, ...)` with
 ///   `F_ALLOCATECONTIG | F_ALLOCATEALL` flags. Falls back to
 ///   `F_ALLOCATEALL` alone if contiguous allocation fails.
-/// - **Windows:** `SetEndOfFile` to extend the logical size. True
-///   physical preallocation requires `SetFileValidData` which
-///   needs the `SE_MANAGE_VOLUME_NAME` privilege; we use it only
-///   when the privilege is detected (caller running as
-///   administrator). Without the privilege the kernel allocates
-///   on the first write — same as not calling preallocate.
+///   `F_PREALLOCATE` allocates relative to the file's current
+///   allocation, so only the shortfall between `offset + len` and the
+///   bytes already allocated (`st_blocks * 512`) is requested; a range
+///   that is already covered is a no-op.
+/// - **Windows:** `SetFileInformationByHandle(FileAllocationInfo)`
+///   reserves clusters up to `offset + len` without moving EOF. The
+///   reservation only grows: a request already covered by the current
+///   `AllocationSize` is a no-op. `SetFileValidData` is not used, so
+///   NTFS still zero-fills lazily on first write.
 /// - **Unknown:** no-op (succeeds; the OS allocates on write).
 ///
 /// # Errors
 ///
 /// - [`Error::Io`](crate::Error::Io) on the underlying syscall failure.
-#[allow(dead_code)]
 #[inline]
 pub(crate) fn preallocate(file: &std::fs::File, offset: u64, len: u64) -> crate::Result<()> {
     imp::preallocate(file, offset, len)
@@ -570,8 +725,7 @@ pub(crate) fn preallocate(file: &std::fs::File, offset: u64, len: u64) -> crate:
 ///
 /// `len = 0` means "the rest of the file from `offset` onward."
 ///
-/// See [`Advice`] for the available hint variants.
-#[allow(dead_code)]
+/// See [`crate::Advice`] for the available hint variants.
 #[inline]
 pub(crate) fn advise(
     file: &std::fs::File,
@@ -627,6 +781,164 @@ mod tests {
             "sector size must be at least 512, got {}",
             size
         );
+    }
+
+    fn range_tmp(tag: &str, contents: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "fsys_platform_range_{}_{}",
+            std::process::id(),
+            tag
+        ));
+        std::fs::write(&path, contents).expect("seed");
+        path
+    }
+
+    #[test]
+    fn test_read_range_returns_requested_bytes() {
+        let path = range_tmp("mid", b"0123456789");
+        let f = std::fs::File::open(&path).expect("open");
+        assert_eq!(read_range(&f, 2, 4).expect("read"), b"2345");
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_range_short_at_eof_and_empty_past_eof() {
+        let path = range_tmp("eof", b"hello");
+        let f = std::fs::File::open(&path).expect("open");
+        assert_eq!(read_range(&f, 3, 100).expect("tail"), b"lo");
+        assert!(read_range(&f, 5, 10).expect("at eof").is_empty());
+        assert!(read_range(&f, u64::MAX, 10)
+            .expect("far past eof")
+            .is_empty());
+        assert!(read_range(&f, 0, 0).expect("zero len").is_empty());
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_range_huge_len_does_not_allocate_len() {
+        // usize::MAX would abort the process if it were allocated.
+        let path = range_tmp("huge", b"abc");
+        let f = std::fs::File::open(&path).expect("open");
+        assert_eq!(read_range(&f, 0, usize::MAX).expect("read"), b"abc");
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_range_with_keeps_full_request_length_for_short_tail() {
+        // A 1000-byte file read at 0 for 4096 bytes: the first request
+        // must still ask for 4096 bytes (an O_DIRECT read of a partial
+        // final sector needs the full sector length), then stop at EOF.
+        let path = range_tmp("fullreq", &[7u8; 1000]);
+        let f = std::fs::File::open(&path).expect("open");
+        let mut requests = Vec::new();
+        let got = read_range_with(&f, 0, 4096, |buf, pos| {
+            requests.push((pos, buf.len()));
+            let start = usize::try_from(pos).expect("pos");
+            let n = buf.len().min(1000usize.saturating_sub(start));
+            buf[..n].fill(7);
+            Ok(n)
+        })
+        .expect("read");
+        assert_eq!(got.len(), 1000);
+        assert_eq!(requests, vec![(0, 4096), (1000, 3096)]);
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_range_with_retries_interrupted_and_stops_at_zero() {
+        let path = range_tmp("interrupt", b"abcdef");
+        let f = std::fs::File::open(&path).expect("open");
+        let mut calls = 0;
+        let got = read_range_with(&f, 0, 6, |buf, pos| {
+            calls += 1;
+            if calls == 1 {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            // Two bytes per call.
+            let src = b"abcdef";
+            let start = pos as usize;
+            let n = buf.len().min(2).min(src.len() - start);
+            buf[..n].copy_from_slice(&src[start..start + n]);
+            Ok(n)
+        })
+        .expect("read");
+        assert_eq!(got, b"abcdef");
+        assert_eq!(calls, 4);
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_range_with_propagates_errors() {
+        let path = range_tmp("err", b"abc");
+        let f = std::fs::File::open(&path).expect("open");
+        let err = read_range_with(&f, 0, 3, |_, _| Err(std::io::Error::other("boom")))
+            .expect_err("must fail");
+        assert!(matches!(err, crate::Error::Io(_)));
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_parent_or_current_dir_maps_bare_name_to_dot() {
+        use std::path::Path;
+        assert_eq!(parent_or_current_dir(Path::new("file")), Path::new("."));
+        assert_eq!(parent_or_current_dir(Path::new("")), Path::new("."));
+        assert_eq!(parent_or_current_dir(Path::new("a/b")), Path::new("a"));
+    }
+
+    #[test]
+    fn test_sync_parent_dir_accepts_bare_file_name() {
+        // `Path::new("x").parent()` is `Some("")`; opening "" fails with
+        // ENOENT, so this used to error on Linux and macOS.
+        sync_parent_dir(std::path::Path::new("fsys-bare-name-that-need-not-exist"))
+            .expect("bare file name syncs the current directory");
+    }
+
+    #[test]
+    fn test_sync_parent_dir_errors_for_missing_directory() {
+        let missing = std::env::temp_dir()
+            .join(format!("fsys_no_such_dir_{}", std::process::id()))
+            .join("file");
+        assert!(sync_parent_dir(&missing).is_err());
+    }
+
+    #[test]
+    fn test_zero_range_zeroes_exactly_the_range() {
+        let path = range_tmp("zero", &[0xEEu8; 20_000]);
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open");
+        zero_range(&f, 100, 9_000).expect("zero");
+        zero_fill_by_writes(&f, 15_000, 1).expect("zero one");
+        drop(f);
+        let data = std::fs::read(&path).expect("read");
+        assert_eq!(data.len(), 20_000);
+        assert!(data[..100].iter().all(|&b| b == 0xEE));
+        assert!(data[100..9_100].iter().all(|&b| b == 0));
+        assert!(data[9_100..15_000].iter().all(|&b| b == 0xEE));
+        assert_eq!(data[15_000], 0);
+        assert!(data[15_001..].iter().all(|&b| b == 0xEE));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_zero_fill_by_writes_rejects_overflow() {
+        let path = range_tmp("zero_ovf", b"x");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        assert!(zero_fill_by_writes(&f, u64::MAX, 2).is_err());
+        assert!(zero_fill_by_writes(&f, 5, 0).is_ok());
+        drop(f);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

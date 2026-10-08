@@ -291,11 +291,10 @@ fn parse_value(s: &str) -> Option<Value> {
     if let Some(stripped) = s.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
         return parse_string_array(stripped);
     }
-    // Integer.
-    if let Some(rest) = s.strip_prefix('-') {
-        let n: i64 = rest.parse().ok()?;
-        return Some(Value::Integer(-n));
-    }
+    // Integer. `i64::from_str` handles the sign itself, so `i64::MIN`
+    // parses and a doubled sign (`--5`) is rejected; stripping `-` and
+    // negating afterwards overflowed on `--9223372036854775808` and
+    // accepted `--5` as 5.
     let n: i64 = s.parse().ok()?;
     Some(Value::Integer(n))
 }
@@ -386,6 +385,20 @@ fn unescape(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_value_integer_sign_handling() {
+        assert_eq!(parse_value("5"), Some(Value::Integer(5)));
+        assert_eq!(parse_value("-5"), Some(Value::Integer(-5)));
+        assert_eq!(
+            parse_value("-9223372036854775808"),
+            Some(Value::Integer(i64::MIN))
+        );
+        assert_eq!(parse_value("--5"), None);
+        assert_eq!(parse_value("--9223372036854775808"), None);
+        assert_eq!(parse_value("-"), None);
+        assert_eq!(parse_value("9223372036854775808"), None);
+    }
 
     #[test]
     fn test_round_trip_simple_pairs() {

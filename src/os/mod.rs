@@ -154,18 +154,21 @@ pub struct OsInfo {
     /// Linux distribution identifier (parsed from `/etc/os-release`),
     /// or `None` on non-Linux platforms or when probing fails.
     pub distro: Option<String>,
-    /// Platform version string. Kernel release on Linux, OS version
-    /// elsewhere. `"unknown"` if the platform-specific probe is
-    /// deferred (see TODO markers in the per-OS modules).
+    /// Platform version string: the kernel release on Linux
+    /// (`/proc/sys/kernel/osrelease`), the product version on macOS
+    /// (`kern.osproductversion`, e.g. `"14.4.1"`), and
+    /// `"<major>.<minor>.<build>"` on Windows (`RtlGetVersion`).
+    /// `"unknown"` when the probe fails or on other targets, which have
+    /// no version probe.
     pub version: String,
     /// Compile-time CPU architecture.
     pub arch: Arch,
     /// Compile-time byte order.
     pub endianness: Endianness,
-    /// Memory page size in bytes. Defaulted from the target triple
-    /// (4 KiB everywhere except 64-bit Apple Silicon, which is 16 KiB).
-    /// Real `sysconf` / `GetSystemInfo` probing is deferred to
-    /// `0.0.5`.
+    /// Memory page size in bytes, probed at run time:
+    /// `sysconf(_SC_PAGESIZE)` on Unix, `GetSystemInfo` on Windows. If
+    /// the probe fails (or on other targets) it falls back to 16 KiB on
+    /// 64-bit Apple Silicon and 4 KiB everywhere else.
     pub page_size: usize,
 }
 

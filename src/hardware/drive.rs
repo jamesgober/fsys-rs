@@ -10,8 +10,9 @@
 /// Coarse classification of the storage device.
 ///
 /// Used by [`crate::hardware::DriveInfo::kind`] to drive method
-/// selection ladders. `Unknown` is the only value the foundation
-/// layer ever produces; real probing in `0.0.5` widens this.
+/// selection ladders. Linux classifies the device from sysfs (NVMe by
+/// name, otherwise SSD / HDD by the `rotational` flag); the Windows and
+/// macOS probes do not classify and report `Unknown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum DriveKind {
@@ -41,12 +42,21 @@ impl DriveKind {
 
 /// Snapshot of the storage device fsys currently sees.
 ///
-/// 0.5.0 populates these fields from real per-platform probes
-/// (the crate-internal `probe` module) rather than the 0.2.0 stub
-/// defaults. The probe
-/// runs once per process (cached via [`super::info`]) and never fails
-/// the handle — fields the probe couldn't determine fall back to the
-/// values returned by [`DriveInfo::default`].
+/// Populated from per-platform probes (the crate-internal `probe`
+/// module). The probe runs once per process (cached via
+/// [`super::info`] / [`super::drive()`]) and never fails the handle;
+/// fields the probe couldn't determine fall back to the values returned
+/// by [`DriveInfo::default`].
+///
+/// # Which drive
+///
+/// The probe describes the device that holds the process's **current
+/// working directory at the time of the first probe**, not the device
+/// of any particular [`crate::Handle`] root or file. If your data lives
+/// on another drive (or the process changes directory later), every
+/// field here, including [`DriveInfo::plp`] and the NAWUN / NAWUPF
+/// values, may describe the wrong device. Start the process with its
+/// working directory on the data volume when these values matter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriveInfo {
     /// Coarse drive classification.

@@ -2,52 +2,59 @@
 //!
 //! Mirrors the Linux NVMe passthrough surface from `linux_iouring.rs`:
 //! [`nvme_flush_capable`] probes whether the volume's underlying device
-//! is an NVMe drive accessible to this process for raw protocol
-//! commands; [`nvme_flush`] issues an NVMe FLUSH (opcode `0x00`) via
-//! `DeviceIoControl`.
+//! accepts an NVMe FLUSH (opcode `0x00`) sent through
+//! `DeviceIoControl`, and [`nvme_flush`] issues one.
 //!
 //! ## Capability requirements
 //!
-//! - The volume must back an NVMe drive (consumer NVMe + Windows
-//!   storport driver — typical for `C:` on most systems shipped
-//!   2018+).
-//! - The process must have a handle to the volume opened with
-//!   `GENERIC_READ | GENERIC_WRITE` and admin privileges. Most
-//!   non-elevated processes will hit `ERROR_ACCESS_DENIED`; the
-//!   capability detection records that case and the caller falls
-//!   back to `FILE_FLAG_WRITE_THROUGH`.
+//! - The volume must back an NVMe drive.
+//! - The process must be able to open the volume (`\\.\C:`) with
+//!   `GENERIC_READ | GENERIC_WRITE`, which the IOCTL's access mask
+//!   requires. Non-elevated processes get `ERROR_ACCESS_DENIED`; the
+//!   probe then reports "not capable" and the caller keeps using
+//!   `FILE_FLAG_WRITE_THROUGH`.
+//! - The storage driver must pass the command through. Microsoft
+//!   documents `IOCTL_STORAGE_PROTOCOL_COMMAND` for vendor-specific NVMe
+//!   commands, and the inbox `StorNVMe` driver is expected to reject a
+//!   standard FLUSH (and the volume stack may not forward the IOCTL at
+//!   all). On such systems the probe fails cleanly; only a driver that
+//!   actually executes the FLUSH makes the probe succeed.
+//!
+//! ## Verification
+//!
+//! The probe sends a real FLUSH and requires both a successful
+//! `DeviceIoControl` and `ReturnStatus == STORAGE_PROTOCOL_STATUS_SUCCESS`
+//! in the returned header. A flush has no effect on stored data, so it is
+//! a safe probe, and it is the only way to know the path works: an IOCTL
+//! that "succeeds" while the device reports an error is treated as a
+//! failure, here and in [`nvme_flush`].
+//!
+//! ## Command buffer layout
+//!
+//! `STORAGE_PROTOCOL_COMMAND` is 80 bytes of `u32` fields followed by a
+//! variable-length `Command` array; `size_of` reports 84 because of the
+//! one-byte placeholder plus padding. The 64-byte NVMe command starts at
+//! the `Command` field offset (80), which is computed from the type
+//! rather than assumed. The buffer is a `Vec<u64>` so the header is
+//! naturally aligned.
+//!
+//! The FLUSH targets namespace ID `0xFFFF_FFFF` (all namespaces). The
+//! volume handle does not reveal which namespace backs it; a controller
+//! that does not support the broadcast namespace for FLUSH rejects the
+//! command, which the status check turns into a probe failure.
 //!
 //! ## Privilege boundary
 //!
-//! `IOCTL_STORAGE_PROTOCOL_COMMAND` is a privileged IOCTL — it
-//! sends raw NVMe commands directly to the controller. Bugs here
-//! can corrupt filesystems. The submission path is therefore
-//! deliberately conservative:
-//!
-//! 1. Capability detection issues a no-op probe (Identify
-//!    Controller — admin command 0x06) and verifies the IOCTL is
-//!    accepted. We do NOT issue actual FLUSH during capability
-//!    probing.
-//! 2. The probe handle is closed immediately after capability is
-//!    confirmed. Subsequent flushes reopen the volume per-op.
-//!    (This matches the Linux pattern of holding only the
-//!    character-device fd, not the data-fd.)
-//! 3. The env override `FSYS_DISABLE_NVME_PASSTHROUGH=1` (locked
-//!    decision D-11) forces the fallback path on every probe.
-//!
-//! ## Per-handle state
-//!
-//! On Windows, [`crate::Handle`] caches the volume's NVMe-passthrough
-//! capability the same way it caches the Linux capability — three-
-//! state lazy slot. The volume handle itself is reopened per-op
-//! because long-lived shared volume handles can interfere with
-//! Windows's volume-shadow / lock semantics; the capability bit
-//! and the resolved volume root path are what we cache.
+//! The probe and every flush reopen the volume and close it again; no
+//! long-lived volume handle is kept, because those interfere with
+//! Windows volume-shadow and lock semantics. The env override
+//! `FSYS_DISABLE_NVME_PASSTHROUGH=1` (locked decision D-11) forces the
+//! fallback path.
 
 #![cfg(target_os = "windows")]
-#![allow(dead_code)] // wired into Handle in checkpoint D continuation
 
 use crate::{Error, Result};
+use std::mem::MaybeUninit;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -59,9 +66,19 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Ioctl::{
     ProtocolTypeNvme, IOCTL_STORAGE_PROTOCOL_COMMAND, STORAGE_PROTOCOL_COMMAND,
-    STORAGE_PROTOCOL_STRUCTURE_VERSION,
+    STORAGE_PROTOCOL_COMMAND_LENGTH_NVME, STORAGE_PROTOCOL_SPECIFIC_NVME_NVM_COMMAND,
+    STORAGE_PROTOCOL_STATUS_SUCCESS, STORAGE_PROTOCOL_STRUCTURE_VERSION,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
+
+/// NVMe FLUSH opcode (NVM command set).
+const NVME_OPCODE_FLUSH: u8 = 0x00;
+/// Namespace ID meaning "all namespaces attached to the controller".
+const NVME_NSID_ALL: u32 = 0xFFFF_FFFF;
+/// Length of an NVMe submission-queue entry.
+const NVME_COMMAND_BYTES: usize = STORAGE_PROTOCOL_COMMAND_LENGTH_NVME as usize;
+/// Seconds the driver may spend on one command.
+const COMMAND_TIMEOUT_SECS: u32 = 30;
 
 /// Result of probing NVMe-passthrough capability for a given volume.
 ///
@@ -75,21 +92,19 @@ pub(crate) struct NvmeAccess {
     pub(crate) volume_root: PathBuf,
 }
 
-/// Probes whether NVMe passthrough flush is available for the
-/// volume containing `path`.
+/// Probes whether NVMe passthrough flush works for the volume containing
+/// `path`.
 ///
-/// Returns `Some(NvmeAccess)` when:
-/// 1. `FSYS_DISABLE_NVME_PASSTHROUGH` env override is **not** set
-///    (locked decision D-11).
-/// 2. The volume's underlying device accepts
-///    `IOCTL_STORAGE_PROTOCOL_COMMAND` with `ProtocolTypeNvme` for
-///    a no-op admin command (Identify Controller).
-/// 3. The calling process has admin privileges (otherwise the IOCTL
-///    returns `ERROR_ACCESS_DENIED`).
+/// Returns `Some(NvmeAccess)` only when:
+/// 1. `FSYS_DISABLE_NVME_PASSTHROUGH` is **not** set (locked decision
+///    D-11).
+/// 2. The volume can be opened for read and write (administrator rights
+///    in practice).
+/// 3. A real NVMe FLUSH sent through `IOCTL_STORAGE_PROTOCOL_COMMAND`
+///    completes with `STORAGE_PROTOCOL_STATUS_SUCCESS`.
 ///
-/// Returns `None` on any failure. The caller's [`Method::Direct`]
-/// path falls back to `FILE_FLAG_WRITE_THROUGH` per locked
-/// decision D-2.
+/// Returns `None` on any failure. The caller's `Method::Direct` path then
+/// relies on `FILE_FLAG_WRITE_THROUGH` per locked decision D-2.
 pub(crate) fn nvme_flush_capable(path: &Path) -> Option<NvmeAccess> {
     if std::env::var_os("FSYS_DISABLE_NVME_PASSTHROUGH").is_some() {
         return None;
@@ -97,28 +112,17 @@ pub(crate) fn nvme_flush_capable(path: &Path) -> Option<NvmeAccess> {
 
     let volume_root = volume_root_for(path)?;
     let handle = open_volume(&volume_root)?;
+    let flushed = issue_flush_command(handle).is_ok();
+    close_volume(handle);
 
-    // Probe with NVMe Identify Controller (admin opcode 0x06).
-    // The IOCTL accepts the command on capable hardware and
-    // returns either success or a structured NVMe error; both
-    // outcomes confirm capability. Only `ERROR_ACCESS_DENIED` /
-    // `ERROR_INVALID_FUNCTION` from `DeviceIoControl` itself mean
-    // the volume / privilege combination is incapable.
-    let probe_ok = issue_identify_controller(handle).is_ok();
-
-    // SAFETY: `handle` was opened by `CreateFileW` above and not
-    // shared elsewhere. `CloseHandle` is the matching teardown.
-    let _ = unsafe { CloseHandle(handle) };
-
-    if probe_ok {
+    if flushed {
         Some(NvmeAccess { volume_root })
     } else {
         None
     }
 }
 
-/// Issues an NVMe FLUSH (opcode 0x00) on the volume rooted at
-/// `access.volume_root`.
+/// Issues an NVMe FLUSH on the volume rooted at `access.volume_root`.
 ///
 /// Reopens the volume handle for each call — long-lived shared
 /// volume handles are problematic on Windows. The cost is one
@@ -127,21 +131,17 @@ pub(crate) fn nvme_flush_capable(path: &Path) -> Option<NvmeAccess> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`] wrapping the underlying Win32 error code
-/// on failure.
+/// Returns [`Error::Io`] when the volume cannot be reopened, when
+/// `DeviceIoControl` fails, or when the driver reports a protocol status
+/// other than success. `Ok(())` means the device acknowledged the flush.
 pub(crate) fn nvme_flush(access: &NvmeAccess) -> Result<()> {
     let handle = open_volume(&access.volume_root).ok_or_else(|| {
         Error::Io(std::io::Error::other(
             "failed to reopen volume for NVMe flush",
         ))
     })?;
-
     let result = issue_flush_command(handle);
-
-    // SAFETY: same as in `nvme_flush_capable` — `handle` is owned
-    // by this stack frame and CloseHandle is the matching teardown.
-    let _ = unsafe { CloseHandle(handle) };
-
+    close_volume(handle);
     result
 }
 
@@ -201,105 +201,129 @@ fn open_volume(volume_root: &Path) -> Option<WinHandle> {
     }
 }
 
-/// Capability probe: NVMe Identify Controller (admin opcode 0x06).
-/// Allocates a 4096-byte response buffer (the standard Identify
-/// Controller data size) and submits the IOCTL. Returns `Ok(())` on
-/// success, `Err` on `DeviceIoControl` failure.
-fn issue_identify_controller(handle: WinHandle) -> Result<()> {
-    // Buffer layout: STORAGE_PROTOCOL_COMMAND header followed by
-    // CommandLength bytes of NVMe command, then 4096 bytes of
-    // response. Total size matches what `DataFromDeviceTransferLength`
-    // declares.
-    const NVME_COMMAND_LENGTH: u32 = 64;
-    const IDENTIFY_DATA_LEN: u32 = 4096;
-    let total_len = (std::mem::size_of::<STORAGE_PROTOCOL_COMMAND>() as u32)
-        + NVME_COMMAND_LENGTH
-        + IDENTIFY_DATA_LEN;
-
-    let mut buf: Vec<u8> = vec![0u8; total_len as usize];
-
-    // Fill the STORAGE_PROTOCOL_COMMAND header at the start of buf.
-    // SAFETY: the buffer is at least `size_of::<STORAGE_PROTOCOL_COMMAND>()`
-    // bytes long; we wrote zero bytes into it on allocation. The
-    // pointer cast yields a properly aligned `*mut STORAGE_PROTOCOL_COMMAND`
-    // because `Vec<u8>::as_mut_ptr` returns a byte-aligned pointer
-    // and STORAGE_PROTOCOL_COMMAND is a `#[repr(C)]` struct whose
-    // alignment is satisfied by 8-byte alignment (which the system
-    // allocator provides for Vec<u8>).
-    unsafe {
-        let header = buf.as_mut_ptr() as *mut STORAGE_PROTOCOL_COMMAND;
-        (*header).Version = STORAGE_PROTOCOL_STRUCTURE_VERSION;
-        (*header).Length = std::mem::size_of::<STORAGE_PROTOCOL_COMMAND>() as u32;
-        (*header).ProtocolType = ProtocolTypeNvme;
-        (*header).Flags = 0;
-        (*header).CommandLength = NVME_COMMAND_LENGTH;
-        (*header).ErrorInfoLength = 0;
-        (*header).DataToDeviceTransferLength = 0;
-        (*header).DataFromDeviceTransferLength = IDENTIFY_DATA_LEN;
-        (*header).TimeOutValue = 30;
-        (*header).ErrorInfoOffset = 0;
-        (*header).DataToDeviceBufferOffset = 0;
-        (*header).DataFromDeviceBufferOffset =
-            (std::mem::size_of::<STORAGE_PROTOCOL_COMMAND>() as u32) + NVME_COMMAND_LENGTH;
-        // CommandSpecific[0..] holds the NVMe command bytes. For
-        // Identify Controller: opcode 0x06, CDW10 = CNS = 0x01.
-        let cmd_offset = std::mem::size_of::<STORAGE_PROTOCOL_COMMAND>();
-        let cmd_ptr = buf.as_mut_ptr().add(cmd_offset);
-        // Opcode at byte 0:
-        *cmd_ptr = 0x06;
-        // CDW10 at byte 40 (per NVMe Common Command Format): CNS=1
-        // means "Identify Controller".
-        *(cmd_ptr.add(40) as *mut u32) = 1;
-    }
-
-    issue_protocol_command(handle, &mut buf)
+/// Closes a handle returned by [`open_volume`].
+fn close_volume(handle: WinHandle) {
+    // SAFETY: `handle` came from `open_volume`, is owned by the caller's
+    // stack frame, and is not used after this call.
+    let closed = unsafe { CloseHandle(handle) };
+    // Nothing useful can be done if closing a volume handle fails; the
+    // flush result has already been decided.
+    let _ = closed;
 }
 
-/// Submission helper: NVMe FLUSH (opcode 0x00).
+/// Byte offsets of the `STORAGE_PROTOCOL_COMMAND` fields this module
+/// reads after the call, plus the `Command` array.
+struct HeaderOffsets {
+    return_status: usize,
+    error_code: usize,
+    command: usize,
+}
+
+/// Computes field offsets from the type itself (no `offset_of!`, which
+/// needs Rust 1.77; the crate's MSRV is 1.75).
+fn header_offsets() -> HeaderOffsets {
+    let slot = MaybeUninit::<STORAGE_PROTOCOL_COMMAND>::uninit();
+    let base = slot.as_ptr();
+    // SAFETY: `addr_of!` on a field of `*base` only computes an address
+    // inside the `slot` allocation; it creates no reference and reads no
+    // (uninitialised) memory.
+    let (return_status, error_code, command) = unsafe {
+        (
+            std::ptr::addr_of!((*base).ReturnStatus),
+            std::ptr::addr_of!((*base).ErrorCode),
+            std::ptr::addr_of!((*base).Command),
+        )
+    };
+    HeaderOffsets {
+        return_status: return_status as usize - base as usize,
+        error_code: error_code as usize - base as usize,
+        command: command as usize - base as usize,
+    }
+}
+
+/// Byte view of the `u64`-backed command buffer.
+fn as_bytes_mut(buf: &mut [u64]) -> &mut [u8] {
+    let len = std::mem::size_of_val(buf);
+    // SAFETY: `buf` is a live, exclusively borrowed slice of `len` bytes;
+    // `u8` has alignment 1 and every bit pattern is a valid `u8`, and the
+    // returned slice keeps the exclusive borrow of `buf`.
+    unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), len) }
+}
+
+/// Reads a native-endian `u32` at `offset` of `bytes`, if in bounds.
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let raw: [u8; 4] = bytes.get(offset..end)?.try_into().ok()?;
+    Some(u32::from_ne_bytes(raw))
+}
+
+/// Builds the `IOCTL_STORAGE_PROTOCOL_COMMAND` input buffer for an NVMe
+/// FLUSH of all namespaces: header, then the 64-byte command at the
+/// `Command` field offset. No data transfer.
+fn build_flush_buffer() -> Vec<u64> {
+    let offsets = header_offsets();
+    let total = offsets.command + NVME_COMMAND_BYTES;
+    let mut buf = vec![0u64; total.div_ceil(8)];
+
+    // SAFETY: STORAGE_PROTOCOL_COMMAND is a repr(C) struct of integers
+    // (plus a one-byte array); the all-zero bit pattern is valid.
+    let mut header: STORAGE_PROTOCOL_COMMAND = unsafe { std::mem::zeroed() };
+    header.Version = STORAGE_PROTOCOL_STRUCTURE_VERSION;
+    header.Length = std::mem::size_of::<STORAGE_PROTOCOL_COMMAND>() as u32;
+    header.ProtocolType = ProtocolTypeNvme;
+    // FLUSH is an NVM (I/O) command, so no ADAPTER_REQUEST flag; that flag
+    // is only for admin commands addressed to the controller.
+    header.Flags = 0;
+    header.CommandLength = STORAGE_PROTOCOL_COMMAND_LENGTH_NVME;
+    header.TimeOutValue = COMMAND_TIMEOUT_SECS;
+    header.CommandSpecific = STORAGE_PROTOCOL_SPECIFIC_NVME_NVM_COMMAND;
+
+    let bytes = as_bytes_mut(&mut buf);
+    // SAFETY: `header` is a live, fully initialised plain-old-data value;
+    // viewing its first `offsets.command` bytes (all `u32` fields, no
+    // padding before `Command`) as `u8` is valid for reads.
+    let header_bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&header as *const STORAGE_PROTOCOL_COMMAND).cast::<u8>(),
+            offsets.command,
+        )
+    };
+    bytes[..offsets.command].copy_from_slice(header_bytes);
+
+    // NVMe submission-queue entry: CDW0 byte 0 = opcode, bytes 4..8 = NSID.
+    let cmd = &mut bytes[offsets.command..offsets.command + NVME_COMMAND_BYTES];
+    cmd[0] = NVME_OPCODE_FLUSH;
+    cmd[4..8].copy_from_slice(&NVME_NSID_ALL.to_le_bytes());
+    buf
+}
+
+/// Maps the header's `ReturnStatus` / `ErrorCode` to a result.
+fn protocol_status(return_status: u32, error_code: u32) -> Result<()> {
+    if return_status == STORAGE_PROTOCOL_STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::other(format!(
+            "NVMe passthrough command failed: protocol status {return_status:#x}, \
+             error code {error_code:#x}"
+        ))))
+    }
+}
+
+/// Sends an NVMe FLUSH through `IOCTL_STORAGE_PROTOCOL_COMMAND` and
+/// checks both the IOCTL result and the device-reported status.
 fn issue_flush_command(handle: WinHandle) -> Result<()> {
-    const NVME_COMMAND_LENGTH: u32 = 64;
-    let total_len = (std::mem::size_of::<STORAGE_PROTOCOL_COMMAND>() as u32) + NVME_COMMAND_LENGTH;
-    let mut buf: Vec<u8> = vec![0u8; total_len as usize];
-
-    // SAFETY: same alignment + capacity reasoning as
-    // `issue_identify_controller`.
-    unsafe {
-        let header = buf.as_mut_ptr() as *mut STORAGE_PROTOCOL_COMMAND;
-        (*header).Version = STORAGE_PROTOCOL_STRUCTURE_VERSION;
-        (*header).Length = std::mem::size_of::<STORAGE_PROTOCOL_COMMAND>() as u32;
-        (*header).ProtocolType = ProtocolTypeNvme;
-        (*header).Flags = 0;
-        (*header).CommandLength = NVME_COMMAND_LENGTH;
-        (*header).ErrorInfoLength = 0;
-        (*header).DataToDeviceTransferLength = 0;
-        (*header).DataFromDeviceTransferLength = 0;
-        (*header).TimeOutValue = 30;
-        (*header).ErrorInfoOffset = 0;
-        (*header).DataToDeviceBufferOffset = 0;
-        (*header).DataFromDeviceBufferOffset = 0;
-        // FLUSH is opcode 0x00; remaining 63 bytes of command are
-        // zero (already zeroed by `vec![0u8; …]`).
-        let cmd_offset = std::mem::size_of::<STORAGE_PROTOCOL_COMMAND>();
-        *buf.as_mut_ptr().add(cmd_offset) = 0x00;
-    }
-
-    issue_protocol_command(handle, &mut buf)
-}
-
-/// Common IOCTL submission: invokes
-/// `DeviceIoControl(IOCTL_STORAGE_PROTOCOL_COMMAND, ...)` with the
-/// caller-prepared buffer. Returns `Ok(())` on success.
-fn issue_protocol_command(handle: WinHandle, buf: &mut [u8]) -> Result<()> {
+    let mut buf = build_flush_buffer();
+    let len = u32::try_from(std::mem::size_of_val(buf.as_slice()))
+        .map_err(|_| Error::Io(std::io::Error::other("NVMe command buffer too large")))?;
     let mut bytes_returned: u32 = 0;
-    let len = buf.len() as u32;
 
-    // SAFETY: `handle` is owned by the caller and is valid for the
-    // duration of this synchronous call. `buf` is exclusively
-    // borrowed via `&mut [u8]`, of length `len`; we pass it as
-    // both input and output buffer (the IOCTL writes the response
-    // back into the same buffer at `DataFromDeviceBufferOffset`).
-    // `DeviceIoControl` returns 0 on failure rather than panicking;
-    // we surface `last_os_error` in that case.
+    // SAFETY: `handle` is a valid volume handle owned by the caller for
+    // the duration of this synchronous call. `buf` is an exclusively
+    // owned, 8-byte-aligned allocation of `len` bytes holding a complete
+    // STORAGE_PROTOCOL_COMMAND plus command; it is passed as both input
+    // and output buffer (the driver writes ReturnStatus / ErrorCode back
+    // into the header). `bytes_returned` is a valid out-pointer and the
+    // null OVERLAPPED selects synchronous completion.
     let ok = unsafe {
         DeviceIoControl(
             handle,
@@ -312,11 +336,15 @@ fn issue_protocol_command(handle: WinHandle, buf: &mut [u8]) -> Result<()> {
             std::ptr::null_mut(),
         )
     };
-    if ok != 0 {
-        Ok(())
-    } else {
-        Err(Error::Io(std::io::Error::last_os_error()))
+    if ok == 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
     }
+
+    let offsets = header_offsets();
+    let bytes = as_bytes_mut(&mut buf);
+    let return_status = read_u32(bytes, offsets.return_status).unwrap_or(0);
+    let error_code = read_u32(bytes, offsets.error_code).unwrap_or(0);
+    protocol_status(return_status, error_code)
 }
 
 #[cfg(test)]
@@ -336,6 +364,59 @@ mod tests {
         // If `volume_root_for` returns None (rare on Windows but
         // possible for non-canonical paths), the test passes silently
         // — the resolution is best-effort.
+    }
+
+    #[test]
+    fn test_header_offsets_match_ntddstor_layout() {
+        let o = header_offsets();
+        // Twenty u32 fields precede `Command`; ReturnStatus is the 5th,
+        // ErrorCode the 6th (ntddstor.h).
+        assert_eq!(o.return_status, 16);
+        assert_eq!(o.error_code, 20);
+        assert_eq!(o.command, 80);
+        // size_of includes the one-byte Command placeholder plus padding,
+        // which is why the old code (command at size_of) was 4 bytes off.
+        assert_eq!(std::mem::size_of::<STORAGE_PROTOCOL_COMMAND>(), 84);
+    }
+
+    #[test]
+    fn test_build_flush_buffer_layout() {
+        let mut buf = build_flush_buffer();
+        let bytes = as_bytes_mut(&mut buf).to_vec();
+        assert!(bytes.len() >= 80 + 64);
+        assert_eq!(
+            read_u32(&bytes, 0),
+            Some(STORAGE_PROTOCOL_STRUCTURE_VERSION)
+        );
+        assert_eq!(read_u32(&bytes, 4), Some(84));
+        assert_eq!(read_u32(&bytes, 8), Some(ProtocolTypeNvme as u32));
+        // Flags: NVM command, so no ADAPTER_REQUEST.
+        assert_eq!(read_u32(&bytes, 12), Some(0));
+        assert_eq!(read_u32(&bytes, 24), Some(64)); // CommandLength
+        assert_eq!(read_u32(&bytes, 36), Some(0)); // DataFromDeviceTransferLength
+        assert_eq!(
+            read_u32(&bytes, 56),
+            Some(STORAGE_PROTOCOL_SPECIFIC_NVME_NVM_COMMAND)
+        );
+        // NVMe command: opcode at +0, NSID at +4.
+        assert_eq!(bytes[80], NVME_OPCODE_FLUSH);
+        assert_eq!(read_u32(&bytes, 84), Some(NVME_NSID_ALL));
+        assert!(bytes[88..80 + 64].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_protocol_status_requires_success() {
+        assert!(protocol_status(STORAGE_PROTOCOL_STATUS_SUCCESS, 0).is_ok());
+        assert!(protocol_status(0, 0).is_err());
+        assert!(protocol_status(0x2, 0x5).is_err());
+    }
+
+    #[test]
+    fn test_read_u32_bounds() {
+        let b = [1u8, 0, 0, 0, 2];
+        assert_eq!(read_u32(&b, 0), Some(1));
+        assert_eq!(read_u32(&b, 2), None);
+        assert_eq!(read_u32(&b, usize::MAX), None);
     }
 
     #[test]

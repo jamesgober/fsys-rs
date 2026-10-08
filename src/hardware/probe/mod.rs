@@ -8,10 +8,10 @@
 //!
 //! Every probe function in this module **never panics** and **never
 //! errors out the handle**. When a probe cannot reach its data source
-//! — a sandboxed container has no `/sys/` mount, a Windows process
-//! lacks the privileges for `IOCTL_STORAGE_QUERY_PROPERTY`, an macOS
-//! sysctl name has gone away — the function logs via the metrics
-//! placeholder and returns the documented default
+//! (a sandboxed container has no `/sys/` mount, a Windows process
+//! cannot open the volume for `IOCTL_STORAGE_QUERY_PROPERTY`, a macOS
+//! sysctl name has gone away), the function returns the documented
+//! default
 //! ([`crate::hardware::DriveInfo::default`], `MemoryInfo::default`,
 //! etc.).
 //!
@@ -57,12 +57,12 @@ pub(super) use self::windows as platform;
 /// guess. When the probe cannot conclusively determine PLP status, the
 /// answer is [`PlpStatus::Unknown`].
 ///
-/// **0.5.0 reliability** — the probes return [`PlpStatus::Unknown`]
-/// across the board. Definitive PLP detection (via NVMe Identify
-/// Controller vendor-specific log pages on Linux, refined IOCTL paths
-/// on Windows, IOKit property mining on macOS) lands alongside NVMe
-/// passthrough in `0.6.0`. See follow-up F-9 in
-/// `.dev/DECISIONS-0.5.0.md`.
+/// **Current reliability:** the Linux and Windows probes report
+/// [`PlpStatus::Yes`] when the drive's vendor / model matches a table of
+/// known PLP-equipped enterprise drives and [`PlpStatus::Unknown`]
+/// otherwise; they never report [`PlpStatus::No`]. macOS always reports
+/// `Unknown`. The answer describes the drive holding the process's
+/// current working directory (see [`crate::hardware::DriveInfo`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum PlpStatus {

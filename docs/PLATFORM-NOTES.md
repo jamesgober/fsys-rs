@@ -83,16 +83,21 @@ the drive's guaranteed torn-write-free write size, when known.
 Databases on guaranteeing drives can safely skip torn-write
 detection on writes ≤ that size.
 
-The probe runs once at first Direct op via the io_uring
-passthrough path; result is cached for the handle's lifetime.
-Drives that don't expose NAWUN return `None`; non-NVMe storage
-returns `None`.
+The probe is part of the process-wide hardware drive probe: it
+runs once, against the NVMe controller (`/dev/nvmeX`, which needs
+`CAP_SYS_ADMIN` or the `disk` group) behind the drive that holds
+the process's current working directory (see
+[Hardware probe scope](#hardware-probe-scope)). Drives that don't
+expose NAWUN, non-NVMe storage, and unprivileged processes get
+`None`. Before 1.1.1 the controller name was derived incorrectly
+and the probe always returned `None`.
 
 ### OS-version + page-size probes (0.9.6)
 
-- Real OS-version probe via `sysctlbyname` (macOS) /
-  `RtlGetVersion` (Windows) / `uname -r` (Linux). Before 0.9.6
-  these returned `"unknown"` stubs on macOS / Windows.
+- Real OS-version probe via `sysctlbyname("kern.osproductversion")`
+  (macOS) / `RtlGetVersion` (Windows) /
+  `/proc/sys/kernel/osrelease` (Linux). Before 0.9.6 these
+  returned `"unknown"` stubs on macOS / Windows.
 - Real page-size probe via `sysconf(_SC_PAGESIZE)` (Unix) /
   `GetSystemInfo` (Windows). Before 0.9.6 the value was a
   build-time constant.
@@ -107,11 +112,21 @@ Probe results live in `fsys::os::info()` /
 1. `open` (no O_DIRECT — macOS doesn't have it).
 2. `fcntl(F_NOCACHE)` to disable page cache for the fd.
 3. Write via `pwrite(2)`.
-4. Durability via `fcntl(F_FULLFSYNC)` — regular `fsync(2)` on
-   macOS does NOT actually flush to media (it returns when the
-   page cache is flushed to the device's volatile cache).
-   `F_FULLFSYNC` is the macOS primitive that actually waits for
-   media.
+4. Durability via `fcntl(F_FULLFSYNC)` after the write: regular
+   `fsync(2)` on macOS does NOT actually flush to media (it
+   returns when the page cache is flushed to the device's volatile
+   cache). `F_FULLFSYNC` is the macOS primitive that actually waits
+   for media. `F_NOCACHE` alone only bypasses the buffer cache; it
+   does not flush the drive.
+
+### `F_FULLFSYNC` fallback
+
+Some file systems (certain SMB / NFS / FUSE mounts) do not
+implement `F_FULLFSYNC` and reject it with `ENOTSUP`,
+`EOPNOTSUPP` or `EINVAL`. Since 1.1.1 fsys then falls back to
+`fsync(2)`, the strongest flush such a mount offers, instead of
+failing the write. The same applies to the directory sync after
+an atomic replace. Any other error is returned.
 
 ### NVMe passthrough
 
@@ -171,6 +186,9 @@ file size).
    FILE_FLAG_WRITE_THROUGH`. `WRITE_THROUGH` makes every write
    durable on return — no separate flush call needed.
 2. Aligned `WriteFile` calls (alignment matches sector size).
+   Transfers of 4 GiB or more are split into 2 GiB chunks (a
+   multiple of every sector size), since `WriteFile` / `ReadFile`
+   take a 32-bit length.
 
 ### NVMe passthrough requirements
 
@@ -180,7 +198,47 @@ file size).
   processes hit `ERROR_ACCESS_DENIED`; fsys falls back to
   `WRITE_THROUGH` and surfaces the fallback via
   `active_durability_primitive()`.
+- The storage driver must execute a standard NVMe FLUSH sent
+  through that IOCTL. Microsoft documents the IOCTL for
+  vendor-specific commands, and the inbox StorNVMe driver is
+  expected to reject FLUSH; on such systems the probe fails and
+  fsys stays on `WRITE_THROUGH`. The capability probe sends a
+  real FLUSH (all namespaces) and requires both a successful
+  `DeviceIoControl` and `STORAGE_PROTOCOL_STATUS_SUCCESS`, so a
+  reported NVMe-flush primitive means a flush was acknowledged.
 - `FSYS_DISABLE_NVME_PASSTHROUGH=1` env override forces fallback.
+
+### `SyncMode::Barrier` for journals
+
+Windows has no barrier-only flush. `platform::sync_barrier` checks
+whether the journal's handle was opened with
+`FILE_FLAG_WRITE_THROUGH` (`NtQueryInformationFile`,
+`FileModeInformation`):
+
+- write-through handle (Direct journal on a volume that accepted
+  `FILE_FLAG_NO_BUFFERING`): every write was already durable when
+  `WriteFile` returned, so the barrier returns immediately;
+- any other handle (the default buffered journal, and the Direct
+  journal's buffered fallback after `ERROR_INVALID_PARAMETER`):
+  `FlushFileBuffers`, the same cost as `SyncMode::Full`.
+
+Before 1.1.1 the barrier was a no-op on every Windows handle, so a
+buffered journal could report records as committed while they
+were still in the OS cache.
+
+### Rename and directory durability
+
+`MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`
+performs the atomic replace, but `MOVEFILE_WRITE_THROUGH` only
+waits for the flush when the move is carried out as copy + delete
+(across volumes). For a same-volume rename, fsys then opens the
+parent directory with `FILE_FLAG_BACKUP_SEMANTICS` and
+`FILE_WRITE_DATA` access (no administrator rights needed) and
+calls `FlushFileBuffers` on it (`platform::sync_parent_dir`).
+File systems that cannot flush a directory handle
+(`ERROR_INVALID_FUNCTION`, `ERROR_NOT_SUPPORTED`,
+`ERROR_INVALID_PARAMETER`) are treated as success; before 1.1.1
+this step was skipped on every volume.
 
 ### Path-length notes
 
@@ -202,14 +260,21 @@ flush, no metadata-skip optimisation.
 destination live on the same ReFS volume. Same instant-clone
 behavior as APFS `clonefile` on macOS. Falls back to
 `std::fs::copy` cleanly on:
-- NTFS (no reflink support)
+- NTFS and other volumes without block cloning (checked through
+  `FILE_SUPPORTS_BLOCK_REFCOUNTING` before anything is created)
 - Cross-volume copies
+- An existing destination
 - Permission denials
 - Pre-Windows-Server-2016 systems
 
-The implementation uses raw `DeviceIoControl` against a
-fresh-destination handle with `FILE_SHARE_DELETE`. Verified
-against the FSCTL contract.
+The destination is created fresh (`CREATE_NEW`, `FILE_SHARE_DELETE`),
+sized to the source, marked sparse when the source is, and cloned
+in cluster-aligned ranges below 4 GiB (the final range is rounded
+up past EOF, which ReFS accepts at end of file). If any step fails
+after the destination was created, it is deleted before the
+`std::fs::copy` fallback runs. The ReFS path has unit tests for the
+range arithmetic but has not been exercised on a ReFS volume in
+fsys's own test runs.
 
 ## Cross-platform sparse-file primitives (0.9.5)
 
@@ -217,15 +282,53 @@ against the FSCTL contract.
 `Handle::write_zeros(path, offset, len)` expose cross-platform
 sparse-file APIs:
 
-| Platform | Primitive |
-|---|---|
-| Linux | `fallocate(FALLOC_FL_PUNCH_HOLE | FL_KEEP_SIZE)` for `punch_hole`; `fallocate(FL_ZERO_RANGE)` for `write_zeros` |
-| macOS | `fcntl(F_PUNCHHOLE)` for both |
-| Windows | `FSCTL_SET_ZERO_DATA` for both |
+| Platform | `punch_hole` | `write_zeros` |
+|---|---|---|
+| Linux | `fallocate(FALLOC_FL_PUNCH_HOLE \| FL_KEEP_SIZE)` | `fallocate(FL_ZERO_RANGE \| FL_KEEP_SIZE)`; positioned zero writes where the file system returns `EOPNOTSUPP` (tmpfs, most FUSE) |
+| macOS | `fcntl(F_PUNCHHOLE)` on the whole file-system blocks in the range (clipped to EOF); unaligned head / tail overwritten with zeros | positioned zero writes |
+| Windows | `FSCTL_SET_ZERO_DATA` | positioned zero writes |
 
 Used as the WAL-trim primitive in databases that give back
-consumed log segments without touching the page cache. All
-three primitives are kernel-atomic.
+consumed log segments without touching the page cache. After
+either call every byte of the range reads as zero. Storage is only
+returned where the primitive actually deallocates: NTFS releases
+clusters for `FSCTL_SET_ZERO_DATA` only on sparse files (fsys does
+not mark files sparse), and the macOS edge blocks stay allocated.
+The positioned-write paths are not atomic and, unlike
+`FL_KEEP_SIZE`, extend the file when the range runs past EOF.
+
+## Preallocation
+
+`JournalHandle::preallocate(offset, len)` reserves space for
+`[0, offset + len)` without changing the logical file size:
+
+| Platform | Primitive |
+|---|---|
+| Linux | `fallocate(FALLOC_FL_KEEP_SIZE)`; `posix_fallocate` where unsupported |
+| macOS | `fcntl(F_PREALLOCATE, F_PEOFPOSMODE)` for only the shortfall between `offset + len` and the bytes already allocated (`st_blocks * 512`) |
+| Windows | `SetFileInformationByHandle(FileAllocationInfo)`, only when `offset + len` exceeds the current `AllocationSize` |
+
+On macOS and Windows a request that is already covered does
+nothing, so repeated or smaller calls never grow (macOS) or shrink
+(Windows) an earlier reservation; both did before 1.1.1.
+
+## Hardware probe scope
+
+`fsys::hardware::drive()` / `info()`, `Handle::plp_status()`,
+`Handle::is_plp_protected()` and `Handle::atomic_write_unit()`
+describe the drive that holds the **process's current working
+directory** at the time of the first probe. They do not look at a
+handle's root or at any particular file, and the answer is cached
+for the life of the process. If your data lives on a different
+drive, start the process with its working directory on the data
+volume, or treat these values as unknown.
+
+PLP detection itself is a vendor / model lookup table of known
+power-loss-protected enterprise drives (Linux sysfs, Windows
+`IOCTL_STORAGE_QUERY_PROPERTY`, which works without administrator
+rights since 1.1.1). It reports `Yes` on a hit and `Unknown`
+otherwise, never `No`; macOS always reports `Unknown`. Drive kind
+is classified on Linux only.
 
 ## Cross-platform fallback ladder
 

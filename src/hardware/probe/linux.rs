@@ -2,8 +2,12 @@
 //!
 //! Probes against `/proc/meminfo`, `/sys/block/<dev>/queue/*`,
 //! `std::thread::available_parallelism`, and runtime checks on the
-//! io_uring crate. PLP detection returns [`super::PlpStatus::Unknown`]
-//! pending the `0.6.0` NVMe passthrough work.
+//! io_uring crate. PLP detection checks the sysfs vendor / model
+//! against the lookup table in `hardware::plp` (`Yes` on a hit,
+//! otherwise [`super::PlpStatus::Unknown`]).
+//!
+//! Every drive value describes the block device holding the process's
+//! current working directory, not that of any particular fsys handle.
 //!
 //! All probes are non-fatal — when a `/sys/` or `/proc/` file is not
 //! reachable (sandboxed container, restricted mount), the probe
@@ -145,10 +149,7 @@ fn probe_nawun_nawupf_linux(block_dir: &std::path::Path) -> Option<(Option<u32>,
     // Resolve `/dev/nvmeX` (character device) from the block
     // device name. For `nvme0n1` the char device is `/dev/nvme0`.
     let dev_name = block_dir.file_name().and_then(|n| n.to_str())?;
-    let char_name = dev_name
-        .split('n')
-        .next()
-        .map(|prefix| format!("/dev/{prefix}"))?;
+    let char_name = format!("/dev/{}", nvme_controller_name(dev_name)?);
     let nvme = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -156,6 +157,21 @@ fn probe_nawun_nawupf_linux(block_dir: &std::path::Path) -> Option<(Option<u32>,
         .ok()?;
     let id_buf = linux_iouring::nvme_identify_namespace(nvme.as_raw_fd(), nsid).ok()?;
     Some(linux_iouring::parse_nawun_nawupf(&id_buf))
+}
+
+/// Maps an NVMe block-device name to its controller character device
+/// name: `nvme0n1` and the multipath form `nvme0c0n1` both map to
+/// `nvme0`. Returns `None` for anything that is not `nvme<digits>...`.
+///
+/// (`"nvme0n1".split('n').next()` is `""` because the name starts with
+/// `n`, which is why the probe previously never found a device.)
+fn nvme_controller_name(dev_name: &str) -> Option<String> {
+    let rest = dev_name.strip_prefix("nvme")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    Some(format!("nvme{}", &rest[..digits]))
 }
 
 /// Reads `vendor` and `model` from sysfs and consults the
@@ -306,10 +322,8 @@ fn parse_kib(s: &str) -> u64 {
 ///
 /// Logical core count via [`std::thread::available_parallelism`];
 /// physical core count via `/proc/cpuinfo` (counts unique
-/// `core id`+`physical id` pairs). Compile-time CPU features via
-/// `cfg!(target_feature = "...")` (matches 0.2.0's accuracy; runtime
-/// `is_x86_feature_detected!` is deferred to a future enhancement
-/// because it requires `target_arch`-gated code paths).
+/// `core id`+`physical id` pairs). CPU features are detected at run
+/// time by `cpu::runtime_features()`.
 ///
 /// Cache sizes are read from `/sys/devices/system/cpu/cpu0/cache/*`;
 /// fallback to `0` on failure.
@@ -423,7 +437,7 @@ pub(crate) fn probe_io_primitives() -> IoPrimitives {
         io_uring: probe_io_uring_available(),
         iocp: false,
         kqueue: false,
-        nvme_passthrough: false, // 0.6.0
+        nvme_passthrough: false, // probed per handle, not here
         direct_io: true,
         mmap: true,
     }
@@ -474,6 +488,17 @@ mod tests {
         assert_eq!(classify_drive_kind("sda", 0), DriveKind::SataSsd);
         assert_eq!(classify_drive_kind("sda", 1), DriveKind::Hdd);
         assert_eq!(classify_drive_kind("xvdb", 2), DriveKind::Unknown);
+    }
+
+    #[test]
+    fn test_nvme_controller_name() {
+        assert_eq!(nvme_controller_name("nvme0n1").as_deref(), Some("nvme0"));
+        assert_eq!(nvme_controller_name("nvme12n3").as_deref(), Some("nvme12"));
+        assert_eq!(nvme_controller_name("nvme0c0n1").as_deref(), Some("nvme0"));
+        assert_eq!(nvme_controller_name("nvme1c2n1").as_deref(), Some("nvme1"));
+        assert_eq!(nvme_controller_name("nvmen1"), None);
+        assert_eq!(nvme_controller_name("sda"), None);
+        assert_eq!(nvme_controller_name(""), None);
     }
 
     #[test]

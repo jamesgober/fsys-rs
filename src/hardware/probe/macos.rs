@@ -7,10 +7,16 @@
 //!   `hw.pagesize` is a serviceable approximation that requires no
 //!   Mach-port bindings. We use the simpler approximation in 0.5.0.
 //! - Drive capacity / free space: `statvfs(2)`.
-//! - Drive sector sizes: `fcntl(F_GETPATH)` + `statfs64`'s `f_bsize`.
+//! - Drive block sizes: `statvfs(2)`'s `f_frsize` (optimal block, and
+//!   physical sector capped at 4 KiB); the logical sector stays at the
+//!   512-byte default.
 //! - CPU: `sysctlbyname("hw.physicalcpu", "hw.logicalcpu",
 //!   "hw.l1icachesize", "hw.l2cachesize", "hw.l3cachesize")`.
-//! - PLP: deferred to 0.6.0 alongside IOKit refinement.
+//! - PLP and drive kind: not probed (no IOKit queries); always
+//!   `Unknown`.
+//!
+//! Every drive value describes the file system holding the process's
+//! current working directory, not that of any particular fsys handle.
 
 #![cfg(target_os = "macos")]
 
@@ -190,13 +196,13 @@ pub(crate) fn probe_cpu() -> CpuInfo {
 /// `kqueue` is universal on macOS / BSDs. `mmap` is universal.
 /// `F_NOCACHE` for direct-IO is universal at the API level (some
 /// filesystems still reject it). No `io_uring`. No NVMe passthrough
-/// in 0.5.0.
+/// on macOS.
 pub(crate) fn probe_io_primitives() -> IoPrimitives {
     IoPrimitives {
         io_uring: false,
         iocp: false,
         kqueue: true,
-        nvme_passthrough: false, // 0.6.0
+        nvme_passthrough: false, // no NVMe passthrough on macOS
         direct_io: true,
         mmap: true,
     }

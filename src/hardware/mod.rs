@@ -9,18 +9,26 @@
 //!
 //! ## Status
 //!
-//! Every load-bearing probe is now real:
-//! - **Drive identity** (NVMe model / firmware / serial / sector
-//!   sizes) — real probe via `NVME_IOCTL_ADMIN_CMD` since 0.6.0.
-//! - **Sector size** — real probe (`statfs`/`GetDiskFreeSpaceW`)
-//!   since 0.5.0.
-//! - **PLP detection** — real probe via SCSI Inquiry + NVMe
-//!   feature flags since 0.9.2.
-//! - **NAWUN / NAWUPF** (atomic-write unit) — real probe via NVMe
-//!   Identify Namespace since 0.9.4.
+//! What each probe actually reads:
+//! - **Drive kind / sectors / capacity**: Linux: sysfs
+//!   `/sys/block/<dev>/queue/*` and `statvfs`; Windows:
+//!   `GetDiskFreeSpace(Ex)W`; macOS: `statvfs`. Drive kind is only
+//!   classified on Linux.
+//! - **PLP detection**: vendor / model lookup table (Linux sysfs,
+//!   Windows `IOCTL_STORAGE_QUERY_PROPERTY`); `Yes` or `Unknown`, never
+//!   `No`. Not probed on macOS.
+//! - **NAWUN / NAWUPF** (atomic-write unit): NVMe Identify Namespace,
+//!   Linux only, and only with access to `/dev/nvmeX`.
 //! - **CPU features** — true runtime detection (CPUID on x86,
 //!   HWCAP on aarch64) since 0.9.2.
-//! - **Memory** — `sysinfo`/`GetGlobalMemoryStatusEx` since 0.5.0.
+//! - **Memory**: `/proc/meminfo`, `sysctl`, `GlobalMemoryStatusEx`.
+//!
+//! ## Which drive is probed
+//!
+//! The drive probe describes the device holding the process's
+//! **current working directory** at the time of the first call, not
+//! the drive under any [`crate::Handle`] root. There is no per-path
+//! probe in 1.x. See [`DriveInfo`] for the consequences.
 
 use std::sync::OnceLock;
 
@@ -83,6 +91,10 @@ pub fn info() -> &'static HardwareInfo {
 }
 
 /// Returns the cached [`DriveInfo`], probing on first call.
+///
+/// Describes the drive holding the process's current working directory
+/// at the time of the first call, not the drive of any particular path
+/// (see [`DriveInfo`]).
 #[must_use]
 pub fn drive() -> &'static DriveInfo {
     DRIVE_INFO.get_or_init(drive::probe)

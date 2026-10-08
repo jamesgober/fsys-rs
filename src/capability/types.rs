@@ -168,6 +168,14 @@ impl HardwareSummary {
 /// Format: `DDDD:BB:DD.F` — a 16-bit domain, 8-bit bus, 5-bit device,
 /// 3-bit function. Domain 0000 is implicit on systems without multi-
 /// domain support; we always emit and parse the full four-segment form.
+///
+/// # Limitation: 16-bit domains
+///
+/// Linux allows PCI domains wider than 16 bits (for example VMD-managed
+/// NVMe drives show up as `10000:e1:00.0`). [`PciAddress::domain`] is a
+/// `u16`, so [`PciAddress::parse`] returns `None` for those addresses and
+/// the SPDK device scan skips them. Widening the field would be a
+/// breaking change and is deferred to the next major version.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PciAddress {
     /// PCI segment / domain (typically `0`).
