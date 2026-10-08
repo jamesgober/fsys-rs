@@ -303,7 +303,9 @@ impl Handle {
     /// Reads `len` bytes from `path` starting at byte `offset`.
     ///
     /// If fewer than `len` bytes are available (EOF), the returned `Vec`
-    /// will be shorter than `len`.
+    /// will be shorter than `len`. `len` is clamped to the bytes the
+    /// file holds past `offset` when it is opened, so a large `len`
+    /// (up to `usize::MAX`) never allocates more than the file size.
     ///
     /// Symmetric with [`Handle::write_at`] — both target a positioned
     /// IO operation. Renamed from `read_range` in `0.7.0` per the
@@ -317,6 +319,14 @@ impl Handle {
     pub fn read_at(&self, path: impl AsRef<Path>, offset: u64, len: usize) -> Result<Vec<u8>> {
         let path = self.resolve_path(path.as_ref())?;
         let (file, _) = platform::open_read(&path, false)?;
+        // Clamp to what the opened file actually holds past `offset`
+        // so the read buffer is sized by the file, not by the caller.
+        let size = file.metadata().map_err(Error::Io)?.len();
+        let available = size.saturating_sub(offset);
+        let len = usize::try_from(available).map_or(len, |avail| len.min(avail));
+        if len == 0 {
+            return Ok(Vec::new());
+        }
         platform::read_range(&file, offset, len)
     }
 
@@ -1374,6 +1384,27 @@ mod tests {
         assert_eq!(counter.reads.load(Ordering::Relaxed), 2);
         assert_eq!(counter.read_bytes.load(Ordering::Relaxed), 5);
         assert_eq!(counter.read_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_read_at_huge_len_is_clamped_to_file_size() {
+        // Before 1.1.1 the platform layer allocated `len` bytes up
+        // front, so `usize::MAX` aborted the process on allocation.
+        let path = tmp_path("read_at_huge");
+        let _g = TmpFile(path.clone());
+        let h = handle();
+        h.write(&path, b"0123456789").expect("write");
+        assert_eq!(
+            h.read_at(&path, 0, usize::MAX).expect("read_at"),
+            b"0123456789"
+        );
+        assert_eq!(h.read_at(&path, 7, usize::MAX).expect("read_at"), b"789");
+        assert!(h.read_at(&path, 10, usize::MAX).expect("at EOF").is_empty());
+        assert!(h
+            .read_at(&path, u64::MAX, usize::MAX)
+            .expect("past EOF")
+            .is_empty());
+        assert!(h.read_at(&path, 3, 0).expect("zero len").is_empty());
     }
 
     #[test]
