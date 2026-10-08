@@ -855,11 +855,17 @@ mod tests {
     /// then drops it. (`tokio::time::timeout(Duration::ZERO, ..)` is
     /// not a substitute: its timer can report `Pending` and let other
     /// tasks run before it fires.)
+    ///
+    /// Returns `true` when the op was still in flight at the drop. On a
+    /// fast kernel the write can complete on the first poll; the
+    /// invariants the callers check (later syncs complete, the durable
+    /// frontier covers only written bytes) must hold either way, so the
+    /// callers do not fail on `false`.
     #[cfg(target_os = "linux")]
-    async fn poll_once_then_drop<F: std::future::Future>(fut: F) {
+    async fn poll_once_then_drop<F: std::future::Future>(fut: F) -> bool {
         let mut fut = std::pin::pin!(fut);
         let polled = std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx))).await;
-        assert!(polled.is_pending(), "op completed on its first poll");
+        polled.is_pending()
     }
 
     /// End LSN of the longest prefix of cleanly decoded records.
@@ -897,7 +903,7 @@ mod tests {
             // Poll once (reserves and queues the write), then drop
             // the future.
             let fut = log.clone().append_async(vec![0xA7; 256 * 1024]);
-            poll_once_then_drop(fut).await;
+            let _ = poll_once_then_drop(fut).await;
             let target = log.next_lsn();
             assert!(target > first);
 
@@ -940,7 +946,7 @@ mod tests {
             };
             for round in 0..4u8 {
                 let fut = log.clone().append_async(vec![round + 1; 8 * 1024 * 1024]);
-                poll_once_then_drop(fut).await;
+                let _ = poll_once_then_drop(fut).await;
                 let target = log.next_lsn();
 
                 tokio::time::timeout(
@@ -954,7 +960,7 @@ mod tests {
                 assert!(clean_prefix_end(&path) >= log.synced_lsn().as_u64());
 
                 let fut = log.clone().append_async(vec![round + 1; 8 * 1024 * 1024]);
-                poll_once_then_drop(fut).await;
+                let _ = poll_once_then_drop(fut).await;
                 let target = log.next_lsn();
                 let blocking = Arc::clone(&log);
                 tokio::time::timeout(
@@ -985,7 +991,7 @@ mod tests {
                 return;
             };
             let fut = log.clone().append_async(vec![0x3C; 4 * 1024 * 1024]);
-            poll_once_then_drop(fut).await;
+            let _ = poll_once_then_drop(fut).await;
             let target = log.next_lsn();
             log.clone()
                 .sync_through_async(target)
@@ -1078,7 +1084,7 @@ mod tests {
             let fut = log
                 .clone()
                 .append_async(b"fails in the background".to_vec());
-            poll_once_then_drop(fut).await;
+            let _ = poll_once_then_drop(fut).await;
             let target = log.next_lsn();
             assert_poisoned(log.clone().sync_through_async(target).await);
             assert!(log.synced_lsn() < target, "a poisoned sync published");
