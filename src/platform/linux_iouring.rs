@@ -1,28 +1,5 @@
 //! Linux `io_uring` submission wrapper (owner-thread design).
 //!
-//! ## rustc 1.95 ICE workaround
-//!
-//! rustc 1.95.0 panics during the `dead_code` analysis pass on this
-//! module:
-//!
-//! ```text
-//! thread 'rustc' panicked at library/core/src/slice/index.rs:1031:55:
-//!   slice index starts at 23 but ends at 21
-//! query stack during panic:
-//! #0 [check_mod_deathness] checking deathness of variables in
-//!     module `platform::linux_iouring`
-//! ```
-//!
-//! Empirically the trigger is a combination of `io_uring::IoUring`
-//! references plus our specific module structure — bisection ruled
-//! out individual factors (channel + spawn alone is fine; a single
-//! `&mut io_uring::IoUring` parameter alone reproduces; etc.).
-//! Module-level `#![allow(dead_code)]` skips the buggy lint path
-//! entirely without affecting correctness — every public item in
-//! this module is reachable from `Handle::io_uring_ring`, so there
-//! is no real dead code to suppress. See the historical record in
-//! `.dev/DECISIONS-0.5.0.md`'s "io_uring blocker" section.
-//!
 //! ## Design: owner thread instead of `Mutex<IoUring>`
 //!
 //! `io_uring::IoUring` is `!Sync` (the SQ/CQ rings are SPSC). The
@@ -75,7 +52,6 @@
 //! the durability contract is identical.
 
 #![cfg(target_os = "linux")]
-#![allow(dead_code)]
 
 use crate::{Error, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};

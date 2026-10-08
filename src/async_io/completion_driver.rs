@@ -63,13 +63,6 @@
 //!   buffers.
 
 #![cfg(all(target_os = "linux", feature = "async"))]
-#![allow(dead_code)] // Same ICE-class workaround as `linux_iouring.rs` —
-                     // any item referencing `io_uring::IoUring` plus a
-                     // dead-code lint pass triggers rustc 1.95's
-                     // `check_mod_deathness` panic; module-level allow
-                     // sidesteps the buggy lint without affecting
-                     // correctness (everything here is reachable from
-                     // `Handle::async_io_uring`).
 
 use crate::platform::linux_iouring::MAX_SQE_LEN;
 use crate::platform::AlignedBuf;

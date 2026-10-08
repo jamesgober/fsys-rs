@@ -258,12 +258,13 @@ libc = { version = "0.2", default-features = false }
 # quinn, monoio, glommio internally and the Linux kernel test
 # infrastructure. Pure Rust over `libc`, ~zero transitive deps.
 [target.'cfg(target_os = "linux")'.dependencies]
-# Pinned to 0.6.x. The 0.7.x line triggers a known rustc 1.95 ICE
-# (`check_mod_deathness` panic) when the `IoUring` type is wrapped
-# in `std::sync::Mutex` or `RwLock`. 0.6.x is the latest line not
-# affected by this interaction. Re-evaluate when 0.7.y bumps to a
-# fixed rustc.
-io-uring = "0.6"
+# 0.7.x: uses bitflags 2 (the 0.6 line pulled a second, 1.x copy of
+# bitflags into the tree) and supports the crate MSRV (io-uring's own
+# MSRV is 1.63). An earlier comment here blamed 0.7 for a rustc 1.95
+# `check_mod_deathness` ICE; 1.1.1 rebuilt the io_uring modules with
+# rustc 1.95.0, current stable and 1.75 on x86_64 Linux, with and
+# without `#![allow(dead_code)]`, and saw no ICE on either line.
+io-uring = "0.7"
 
 # Win32 API bindings for Windows IO primitives:
 # CreateFileW (FILE_FLAG_NO_BUFFERING / WRITE_THROUGH), FlushFileBuffers,

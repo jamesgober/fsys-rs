@@ -6,7 +6,6 @@
 //! layer the journal and CRUD async paths call.
 
 #![cfg(all(target_os = "linux", feature = "async"))]
-#![allow(dead_code)] // ICE-class workaround — same as completion_driver.rs.
 
 use crate::async_io::completion_driver::{AsyncIoUring, FileRef, IoBuf, Op};
 use crate::Result;
