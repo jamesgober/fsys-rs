@@ -23,6 +23,18 @@
 //!
 //! Tests both `JournalOptions::default()` (buffered/lock-free) and
 //! `JournalOptions::direct(true)` (sector-aligned log buffer).
+//!
+//! 1.1.1 adds two victims per mode:
+//!
+//! - **Concurrent appenders.** Four threads append and
+//!   `sync_through` at once; the parent kills the victim and checks
+//!   that every acknowledged sync survived, no record is torn or
+//!   duplicated, and the journal reopens and accepts appends.
+//! - **Injected write failure (Linux).** The victim caps its file
+//!   size with `RLIMIT_FSIZE` so a write fails with `EFBIG` mid-
+//!   stream. The journal must poison itself (later appends and
+//!   syncs fail), keep every record synced before the failure, and
+//!   reopen cleanly once the limit is gone.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -265,4 +277,296 @@ fn crash_journal_buffered_mid_unsynced_burst() {
 #[test]
 fn crash_journal_direct_mid_unsynced_burst() {
     run_crash_test("crash_journal_direct_mid_unsynced_burst", true);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 1.1.1: concurrent-appender kill and injected write failure
+// ─────────────────────────────────────────────────────────────────
+
+const ENV_CONCURRENT_VICTIM: &str = "FSYS_CRASH_JOURNAL_CONCURRENT_VICTIM";
+#[cfg(target_os = "linux")]
+const ENV_FSIZE_VICTIM: &str = "FSYS_CRASH_JOURNAL_FSIZE_VICTIM";
+const CONCURRENT_THREADS: u32 = 4;
+
+fn concurrent_payload(thread: u32, seq: u32) -> Vec<u8> {
+    // Variable sizes so frames cross Direct-IO sector and slot
+    // boundaries; the first 8 bytes identify the record.
+    let len = 16 + ((seq as usize * 37 + thread as usize * 11) % 700);
+    let mut p = vec![(thread as u8).wrapping_add(0x41); len];
+    p[..4].copy_from_slice(&thread.to_le_bytes());
+    p[4..8].copy_from_slice(&seq.to_le_bytes());
+    p
+}
+
+fn open_victim_journal(target: &Path, direct: bool) -> Arc<JournalHandle> {
+    let fs = match builder().build() {
+        Ok(h) => h,
+        Err(_) => std::process::exit(102),
+    };
+    let opts = JournalOptions::new().direct(direct).log_buffer_kib(4);
+    match fs.journal_with(target, opts) {
+        Ok(j) => Arc::new(j),
+        Err(_) => std::process::exit(103),
+    }
+}
+
+/// Victim: four threads append and `sync_through` concurrently and
+/// print `S <thread> <seq>` after each sync returns. The parent
+/// kills it mid-run.
+fn maybe_run_concurrent_victim() {
+    if std::env::var(ENV_CONCURRENT_VICTIM).is_err() {
+        return;
+    }
+    let target = match std::env::var(ENV_TARGET).ok() {
+        Some(s) => PathBuf::from(s),
+        None => std::process::exit(101),
+    };
+    let direct = std::env::var(ENV_DIRECT).ok().as_deref() == Some("1");
+    let log = open_victim_journal(&target, direct);
+    let mut threads = Vec::new();
+    for t in 0..CONCURRENT_THREADS {
+        let log = Arc::clone(&log);
+        threads.push(std::thread::spawn(move || {
+            for seq in 0.. {
+                let lsn = match log.append(&concurrent_payload(t, seq)) {
+                    Ok(l) => l,
+                    Err(_) => std::process::exit(110),
+                };
+                if seq % 3 == 0 {
+                    if log.sync_through(lsn).is_err() {
+                        std::process::exit(111);
+                    }
+                    let mut out = std::io::stdout().lock();
+                    let _ = writeln!(out, "S {t} {seq}");
+                    let _ = out.flush();
+                }
+            }
+        }));
+    }
+    for t in threads {
+        let _ = t.join();
+    }
+    std::process::exit(0);
+}
+
+/// Every record a `sync_through` acknowledged before the kill must
+/// be present and intact after it; the tail must be recoverable and
+/// the journal must reopen and accept appends.
+fn run_concurrent_crash_test(test_fn: &str, direct: bool) {
+    maybe_run_concurrent_victim();
+    let target = tmp(test_fn);
+    let _g = Cleanup(target.clone());
+
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut child = Command::new(&exe)
+        .args(["--exact", test_fn, "--nocapture"])
+        .env(ENV_CONCURRENT_VICTIM, "1")
+        .env(ENV_TARGET, &target)
+        .env(ENV_DIRECT, if direct { "1" } else { "0" })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn victim");
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let mut synced: Vec<(u32, u32)> = Vec::new();
+    while synced.len() < 300 {
+        match lines.next() {
+            Some(Ok(l)) => {
+                if let Some(rest) = l.strip_prefix("S ") {
+                    let mut it = rest.split(' ').map(|n| n.parse::<u32>().expect("number"));
+                    synced.push((it.next().expect("thread"), it.next().expect("seq")));
+                }
+            }
+            _ => break,
+        }
+    }
+    let _ = child.kill();
+    // Lines printed before the kill landed are still valid acks.
+    for l in lines.map_while(|l| l.ok()) {
+        if let Some(rest) = l.strip_prefix("S ") {
+            let mut it = rest.split(' ').map(|n| n.parse::<u32>().expect("number"));
+            synced.push((it.next().expect("thread"), it.next().expect("seq")));
+        }
+    }
+    let _ = child.wait();
+    assert!(!synced.is_empty(), "victim never acknowledged a sync");
+
+    let mut reader = JournalReader::open(&target).expect("open journal for recovery");
+    let mut present = std::collections::HashSet::new();
+    let mut last_lsn = None;
+    for rec in reader.iter() {
+        let r = rec.expect("record");
+        assert!(last_lsn < Some(r.lsn), "LSNs must increase");
+        last_lsn = Some(r.lsn);
+        let t = u32::from_le_bytes(r.payload[..4].try_into().expect("thread id"));
+        let s = u32::from_le_bytes(r.payload[4..8].try_into().expect("seq"));
+        assert_eq!(
+            r.payload,
+            concurrent_payload(t, s),
+            "torn record surfaced as valid"
+        );
+        assert!(present.insert((t, s)), "record ({t}, {s}) appears twice");
+    }
+    let tail = reader.tail_state();
+    assert!(
+        matches!(
+            tail,
+            JournalTailState::CleanEnd
+                | JournalTailState::TruncatedHeader
+                | JournalTailState::TruncatedPayload
+                | JournalTailState::ChecksumMismatch
+        ),
+        "non-recoverable tail {tail:?} after a concurrent crash"
+    );
+    for key in &synced {
+        assert!(
+            present.contains(key),
+            "synced record {key:?} lost (direct={direct})"
+        );
+    }
+
+    // Reopen in the same mode and keep going.
+    let fs = builder().build().expect("handle");
+    let log = fs
+        .journal_with(&target, JournalOptions::new().direct(direct))
+        .expect("reopen after crash");
+    let lsn = log.append(b"after-crash").expect("append after reopen");
+    log.sync_through(lsn).expect("sync after reopen");
+    drop(log);
+    let mut reader = JournalReader::open(&target).expect("reader");
+    let last = reader.iter().map(|r| r.expect("record").payload).last();
+    assert_eq!(last.as_deref(), Some(&b"after-crash"[..]));
+    assert_eq!(reader.tail_state(), JournalTailState::CleanEnd);
+}
+
+#[test]
+fn crash_journal_buffered_concurrent_appenders() {
+    run_concurrent_crash_test("crash_journal_buffered_concurrent_appenders", false);
+}
+
+#[test]
+fn crash_journal_direct_concurrent_appenders() {
+    run_concurrent_crash_test("crash_journal_direct_concurrent_appenders", true);
+}
+
+/// Victim: caps its file size with `RLIMIT_FSIZE` (writes past the
+/// cap fail with `EFBIG`), appends and syncs until a write fails,
+/// then checks that the journal stays poisoned.
+#[cfg(target_os = "linux")]
+fn maybe_run_fsize_victim() {
+    if std::env::var(ENV_FSIZE_VICTIM).is_err() {
+        return;
+    }
+    let target = match std::env::var(ENV_TARGET).ok() {
+        Some(s) => PathBuf::from(s),
+        None => std::process::exit(101),
+    };
+    let direct = std::env::var(ENV_DIRECT).ok().as_deref() == Some("1");
+    let log = open_victim_journal(&target, direct);
+    // SAFETY: plain libc calls with valid arguments. Ignoring
+    // SIGXFSZ turns the over-limit write into an `EFBIG` error
+    // instead of killing the process; the limit applies to this
+    // victim process only.
+    unsafe {
+        let _ = libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        let lim = libc::rlimit {
+            rlim_cur: 64 * 1024,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        if libc::setrlimit(libc::RLIMIT_FSIZE, &lim) != 0 {
+            std::process::exit(104);
+        }
+    }
+    let mut out = std::io::stdout().lock();
+    for seq in 0..100_000u32 {
+        let ok = log
+            .append(&concurrent_payload(0, seq))
+            .and_then(|lsn| log.sync_through(lsn));
+        if ok.is_err() {
+            let _ = writeln!(out, "FAILED {seq}");
+            break;
+        }
+        let _ = writeln!(out, "S 0 {seq}");
+    }
+    // A sync whose target was durable before the failure still
+    // succeeds; any target past the durable frontier must fail.
+    let still_poisoned =
+        log.append(b"after-failure").is_err() && log.sync_through(Lsn::new(u64::MAX)).is_err();
+    let _ = writeln!(
+        out,
+        "{}",
+        if still_poisoned {
+            "POISONED"
+        } else {
+            "RECOVERED"
+        }
+    );
+    let _ = out.flush();
+    std::process::exit(0);
+}
+
+/// A write that fails with `EFBIG` mid-stream must poison the
+/// journal, keep every record synced before the failure readable,
+/// and leave a journal that reopens cleanly.
+#[cfg(target_os = "linux")]
+fn run_fsize_test(test_fn: &str, direct: bool) {
+    maybe_run_fsize_victim();
+    let target = tmp(test_fn);
+    let _g = Cleanup(target.clone());
+    let exe = std::env::current_exe().expect("current_exe");
+    let output = Command::new(&exe)
+        .args(["--exact", test_fn, "--nocapture"])
+        .env(ENV_FSIZE_VICTIM, "1")
+        .env(ENV_TARGET, &target)
+        .env(ENV_DIRECT, if direct { "1" } else { "0" })
+        .stderr(Stdio::null())
+        .output()
+        .expect("run victim");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let synced: Vec<u32> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("S 0 "))
+        .map(|n| n.parse().expect("seq"))
+        .collect();
+    assert!(
+        text.contains("FAILED"),
+        "the size limit never failed a write:\n{text}"
+    );
+    assert!(
+        text.contains("POISONED"),
+        "journal accepted work after a failed write:\n{text}"
+    );
+    assert!(!synced.is_empty());
+
+    let mut reader = JournalReader::open(&target).expect("reader");
+    let records: Vec<Vec<u8>> = reader.iter().map(|r| r.expect("record").payload).collect();
+    assert!(records.len() >= synced.len(), "synced records lost");
+    for (seq, payload) in records.iter().enumerate() {
+        assert_eq!(payload, &concurrent_payload(0, seq as u32));
+    }
+    let fs = builder().build().expect("handle");
+    let log = fs
+        .journal_with(&target, JournalOptions::new().direct(direct))
+        .expect("reopen after failure");
+    let lsn = log.append(b"after-reopen").expect("append");
+    log.sync_through(lsn).expect("sync");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn crash_journal_buffered_write_failure_poisons_and_recovers() {
+    run_fsize_test(
+        "crash_journal_buffered_write_failure_poisons_and_recovers",
+        false,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn crash_journal_direct_write_failure_poisons_and_recovers() {
+    run_fsize_test(
+        "crash_journal_direct_write_failure_poisons_and_recovers",
+        true,
+    );
 }
