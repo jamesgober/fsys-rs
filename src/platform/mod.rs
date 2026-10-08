@@ -469,15 +469,19 @@ pub(crate) fn punch_hole(file: &std::fs::File, offset: u64, len: u64) -> crate::
 /// this into an NVMe `WRITE ZEROES` command — the drive marks
 /// the range as zeros without host→device data transfer. On
 /// other platforms / configurations the implementation falls
-/// back to a write of an aligned zero buffer.
+/// back to positioned writes of a zero buffer
+/// ([`zero_fill_by_writes`]).
 ///
 /// **Per-platform implementation:**
-/// - **Linux**: `fallocate(FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE)`.
-/// - **macOS**: pwrite of an in-memory zero buffer.
-/// - **Windows**: `DeviceIoControl(FSCTL_SET_ZERO_DATA)` (same
-///   IOCTL as `punch_hole`; semantics match for the zero-fill
-///   case).
-/// - **Other**: pwrite of an in-memory zero buffer.
+/// - **Linux**: `fallocate(FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE)`;
+///   on file systems that reject it with `EOPNOTSUPP` (tmpfs, many
+///   FUSE mounts), the zero-buffer writes.
+/// - **macOS / Windows / other**: the zero-buffer writes. (On Windows
+///   this is not `FSCTL_SET_ZERO_DATA`; that IOCTL is only used by
+///   [`punch_hole`].)
+///
+/// `fallocate` with `KEEP_SIZE` never changes the file size; the
+/// zero-buffer writes extend the file when the range runs past EOF.
 #[inline]
 pub(crate) fn zero_range(file: &std::fs::File, offset: u64, len: u64) -> crate::Result<()> {
     #[cfg(target_os = "linux")]
@@ -486,23 +490,37 @@ pub(crate) fn zero_range(file: &std::fs::File, offset: u64, len: u64) -> crate::
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // Universal fallback: write zeros via pwrite.
-        // Uses an 8 KiB stack buffer to avoid a large heap
-        // allocation for typical hole sizes; longer ranges loop.
-        if len == 0 {
-            return Ok(());
-        }
-        let zeros: [u8; 8192] = [0u8; 8192];
-        let mut written = 0u64;
-        while written < len {
-            let chunk = (len - written).min(zeros.len() as u64) as usize;
-            // pwrite-style positioned write. Use the platform's
-            // write_at primitive which handles offset internally.
-            write_at(file, offset + written, &zeros[..chunk])?;
-            written += chunk as u64;
-        }
-        Ok(())
+        zero_fill_by_writes(file, offset, len)
     }
+}
+
+/// Writes zeros over `[offset, offset + len)` with the platform's
+/// positioned [`write_at`], 8 KiB at a time from a stack buffer.
+///
+/// `offset + len` overflowing `u64` is an `InvalidInput` error rather
+/// than a wrapped offset.
+pub(crate) fn zero_fill_by_writes(
+    file: &std::fs::File,
+    offset: u64,
+    len: u64,
+) -> crate::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    if offset.checked_add(len).is_none() {
+        return Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "zero-fill range overflows u64",
+        )));
+    }
+    let zeros = [0u8; 8192];
+    let mut written = 0u64;
+    while written < len {
+        let chunk = (len - written).min(zeros.len() as u64) as usize;
+        write_at(file, offset + written, &zeros[..chunk])?;
+        written += chunk as u64;
+    }
+    Ok(())
 }
 
 /// 0.9.4 — Barrier-grade sync. Cheaper than [`sync_full`]
@@ -843,6 +861,40 @@ mod tests {
             .join(format!("fsys_no_such_dir_{}", std::process::id()))
             .join("file");
         assert!(sync_parent_dir(&missing).is_err());
+    }
+
+    #[test]
+    fn test_zero_range_zeroes_exactly_the_range() {
+        let path = range_tmp("zero", &[0xEEu8; 20_000]);
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open");
+        zero_range(&f, 100, 9_000).expect("zero");
+        zero_fill_by_writes(&f, 15_000, 1).expect("zero one");
+        drop(f);
+        let data = std::fs::read(&path).expect("read");
+        assert_eq!(data.len(), 20_000);
+        assert!(data[..100].iter().all(|&b| b == 0xEE));
+        assert!(data[100..9_100].iter().all(|&b| b == 0));
+        assert!(data[9_100..15_000].iter().all(|&b| b == 0xEE));
+        assert_eq!(data[15_000], 0);
+        assert!(data[15_001..].iter().all(|&b| b == 0xEE));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_zero_fill_by_writes_rejects_overflow() {
+        let path = range_tmp("zero_ovf", b"x");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        assert!(zero_fill_by_writes(&f, u64::MAX, 2).is_err());
+        assert!(zero_fill_by_writes(&f, 5, 0).is_ok());
+        drop(f);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

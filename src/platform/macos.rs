@@ -448,7 +448,7 @@ pub(crate) fn punch_hole(file: &File, offset: u64, len: u64) -> Result<()> {
         punch_aligned(file, start, stop - start)?;
     }
     for (start, stop) in plan.zero.into_iter().flatten() {
-        zero_fill(file, start, stop - start)?;
+        super::zero_fill_by_writes(file, start, stop - start)?;
     }
     Ok(())
 }
@@ -540,19 +540,6 @@ fn punch_aligned(file: &File, offset: u64, len: u64) -> Result<()> {
     } else {
         Err(Error::Io(std::io::Error::last_os_error()))
     }
-}
-
-/// Overwrites `[offset, offset + len)` with zeros using positioned
-/// writes.
-fn zero_fill(file: &File, offset: u64, len: u64) -> Result<()> {
-    let zeros = [0u8; 8192];
-    let mut done = 0u64;
-    while done < len {
-        let chunk = (len - done).min(zeros.len() as u64) as usize;
-        write_at(file, offset + done, &zeros[..chunk])?;
-        done += chunk as u64;
-    }
-    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

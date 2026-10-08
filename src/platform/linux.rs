@@ -1049,23 +1049,35 @@ pub(crate) fn punch_hole(file: &File, offset: u64, len: u64) -> Result<()> {
 /// On capable filesystems + NVMe drives the kernel translates
 /// this to an NVMe `WRITE ZEROES` command — the drive controller
 /// marks the range as zeros without any host→device data
-/// transfer. Falls back to a regular write-of-zeros on
-/// filesystems that don't implement `FALLOC_FL_ZERO_RANGE`.
+/// transfer.
 ///
-/// Returns `Ok(())` on success. Returns an `Err` wrapping
-/// `EOPNOTSUPP` on filesystems that don't support
-/// `FALLOC_FL_ZERO_RANGE`.
+/// File systems that do not implement `FALLOC_FL_ZERO_RANGE` (tmpfs,
+/// many FUSE mounts) return `EOPNOTSUPP`; the range is then zeroed with
+/// positioned writes ([`super::zero_fill_by_writes`]), which, unlike
+/// `KEEP_SIZE`, extend the file if the range runs past EOF. Any other
+/// `fallocate` error is returned.
 pub(crate) fn zero_range(file: &File, offset: u64, len: u64) -> Result<()> {
     if len == 0 {
         return Ok(());
     }
+    let invalid = || {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "zero_range: range exceeds off_t",
+        ))
+    };
+    let off = libc::off_t::try_from(offset).map_err(|_| invalid())?;
+    let length = libc::off_t::try_from(len).map_err(|_| invalid())?;
     let fd = file.as_raw_fd();
     let mode = libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE;
     // SAFETY: fd is a valid open file descriptor.
-    let rc = unsafe { libc::fallocate(fd, mode, offset as i64, len as i64) };
+    let rc = unsafe { libc::fallocate(fd, mode, off, length) };
     if rc == 0 {
-        Ok(())
-    } else {
-        Err(Error::Io(std::io::Error::last_os_error()))
+        return Ok(());
     }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EOPNOTSUPP) {
+        return super::zero_fill_by_writes(file, offset, len);
+    }
+    Err(Error::Io(err))
 }
