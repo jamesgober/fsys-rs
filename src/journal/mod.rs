@@ -59,10 +59,10 @@
 
 pub mod backend;
 pub(crate) mod format;
-mod gate;
+pub(crate) mod gate;
 pub(crate) mod log_buffer;
 pub mod options;
-mod poison;
+pub(crate) mod poison;
 pub mod reader;
 
 pub use backend::{JournalBackend, JournalBackendHealth, JournalBackendInfo, JournalBackendKind};
@@ -290,13 +290,17 @@ pub struct JournalHandle {
     /// write, flush or fsync; every later append and every
     /// `sync_through` whose target is not already durable then
     /// returns an error. See the `poison` module docs.
-    poison: Poison,
+    ///
+    /// `pub(crate)` so the native async paths in
+    /// `src/async_io/journal.rs` can check and set it.
+    pub(crate) poison: Poison,
     /// 1.1.1: tracks buffered-mode writes between their LSN
     /// reservation and the end of their positioned write, so a
     /// group-commit leader only publishes a durable frontier whose
     /// bytes have all been written. Unused in Direct-IO mode. See
-    /// the `gate` module docs.
-    write_gate: WriteGate,
+    /// the `gate` module docs. `pub(crate)` so the native async
+    /// append path can register its writes the same way.
+    pub(crate) write_gate: WriteGate,
     /// 1.1.1: set by [`Self::close`] after its final sync so `Drop`
     /// does not flush and fsync a second time.
     closed: bool,
