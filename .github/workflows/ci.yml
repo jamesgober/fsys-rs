@@ -125,8 +125,10 @@ jobs:
       - name: Cache cargo registry & build
         uses: Swatinem/rust-cache@v2
 
+      # The soak tests are `#[ignore]` so plain `cargo test` skips
+      # them; without `--ignored` this step ran zero tests.
       - name: Run soak test (default 60s budget)
-        run: cargo test --test stress --release
+        run: cargo test --test stress --release -- --ignored
 
   # 0.9.6 audit H-13 — feature-matrix coverage.
   # The default + all-features paths are exercised by the `test` /
