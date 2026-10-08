@@ -240,10 +240,14 @@ impl JournalHandle {
     /// syscall-cost on the submitter side.
     ///
     /// 1.1.1: the state lock is taken only inside the synchronous
-    /// [`Self::try_lead_group_commit`] / [`Self::finish_group_commit`]
-    /// helpers, so no `parking_lot` guard is ever alive across an
-    /// `.await` and the future stays `Send` (it was `!Send` on Linux
-    /// in 1.1.0 because the guard binding spanned the yields).
+    /// [`Self::try_lead_group_commit`] helper and in the `Drop` of
+    /// [`LeaderLease`], so no `parking_lot` guard is ever alive across
+    /// an `.await` and the future stays `Send` (it was `!Send` on
+    /// Linux in 1.1.0 because the guard binding spanned the yields).
+    /// The leader role is held by a [`LeaderLease`], so dropping this
+    /// future mid-fsync still clears `in_flight`; in 1.1.0 a cancelled
+    /// leader left it set and every later sync on the journal waited
+    /// forever.
     async fn sync_through_native(self: &Arc<Self>, ring: &AsyncIoUring, lsn: Lsn) -> Result<()> {
         use std::os::fd::AsRawFd;
 
@@ -264,21 +268,27 @@ impl JournalHandle {
                     tokio::task::yield_now().await;
                     continue;
                 }
-                LeaderAttempt::Leader => {}
+                LeaderAttempt::Leader(mut lease) => {
+                    let frontier = self.next_lsn.load(Ordering::Acquire);
+                    let file = FileRef::new(Arc::clone(self), |j| j.file.as_raw_fd());
+                    let result =
+                        crate::async_io::iouring_substrate::fdatasync_native(ring, file).await;
+                    if result.is_ok() {
+                        lease.durable_frontier = Some(frontier);
+                    }
+                    // Publishes the frontier, clears `in_flight` and
+                    // wakes followers.
+                    drop(lease);
+                    return result;
+                }
             }
-
-            let frontier = self.next_lsn.load(Ordering::Acquire);
-            let file = FileRef::new(Arc::clone(self), |j| j.file.as_raw_fd());
-            let result = crate::async_io::iouring_substrate::fdatasync_native(ring, file).await;
-            self.finish_group_commit(result.is_ok().then_some(frontier));
-            return result;
         }
     }
 
     /// Tries to become the group-commit leader for `lsn_off` without
     /// blocking. On [`LeaderAttempt::Leader`] this caller has set
-    /// `in_flight` and must call [`Self::finish_group_commit`].
-    fn try_lead_group_commit(&self, lsn_off: u64) -> LeaderAttempt {
+    /// `in_flight`; the returned lease clears it when dropped.
+    fn try_lead_group_commit(&self, lsn_off: u64) -> LeaderAttempt<'_> {
         // Non-blocking try_lock so the tokio worker isn't parked on a
         // contended mutex.
         let Some(mut state) = self.group_commit.state.try_lock() else {
@@ -294,34 +304,52 @@ impl JournalHandle {
         // SQE is submitted, so concurrent followers observe the
         // in-flight state.
         state.in_flight = true;
-        LeaderAttempt::Leader
-    }
-
-    /// Ends a leader's turn: publishes `durable_frontier` (the LSN the
-    /// fsync covered, `None` if it failed), clears `in_flight` and
-    /// wakes parked sync-path followers.
-    fn finish_group_commit(&self, durable_frontier: Option<u64>) {
-        let mut state = self.group_commit.state.lock();
-        if let Some(frontier) = durable_frontier {
-            if frontier > state.committed_lsn {
-                state.committed_lsn = frontier;
-                self.synced_lsn.store(frontier, Ordering::Release);
-            }
-        }
-        state.in_flight = false;
-        let _woken = self.group_commit.cv_followers.notify_all();
+        LeaderAttempt::Leader(LeaderLease {
+            journal: self,
+            durable_frontier: None,
+        })
     }
 }
 
 /// Outcome of [`JournalHandle::try_lead_group_commit`].
 #[cfg(all(target_os = "linux", feature = "async"))]
-enum LeaderAttempt {
+enum LeaderAttempt<'a> {
     /// A completed fsync already covers the target LSN.
     Covered,
     /// The state lock is contended or another fsync is in flight.
     Busy,
     /// This caller set `in_flight` and runs the fsync.
-    Leader,
+    Leader(LeaderLease<'a>),
+}
+
+/// The group-commit leader role, held across the async fsync.
+///
+/// Dropping the lease publishes `durable_frontier` (when set),
+/// clears `in_flight` and wakes parked sync-path followers. Because
+/// that happens in `Drop`, it also runs when the leader's future is
+/// cancelled mid-fsync; the next caller then becomes leader and
+/// issues its own fsync.
+#[cfg(all(target_os = "linux", feature = "async"))]
+struct LeaderLease<'a> {
+    journal: &'a JournalHandle,
+    /// LSN covered by a successful fsync. `None` (failed or
+    /// cancelled) publishes nothing.
+    durable_frontier: Option<u64>,
+}
+
+#[cfg(all(target_os = "linux", feature = "async"))]
+impl Drop for LeaderLease<'_> {
+    fn drop(&mut self) {
+        let mut state = self.journal.group_commit.state.lock();
+        if let Some(frontier) = self.durable_frontier {
+            if frontier > state.committed_lsn {
+                state.committed_lsn = frontier;
+                self.journal.synced_lsn.store(frontier, Ordering::Release);
+            }
+        }
+        state.in_flight = false;
+        let _woken = self.journal.group_commit.cv_followers.notify_all();
+    }
 }
 
 fn join_error_to_io(e: tokio::task::JoinError) -> Error {
@@ -503,6 +531,63 @@ mod tests {
             assert_send(&sync);
             tokio::spawn(sync).await.expect("join").expect("sync");
             assert!(log.synced_lsn() >= lsn);
+        })
+        .await;
+    }
+
+    /// FS-H1: dropping a `sync_through_async` leader after its first
+    /// poll (fsync submitted, `in_flight` set) must not wedge the
+    /// journal. In 1.1.0 `in_flight` stayed `true` and every later
+    /// sync, async or blocking, waited forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelled_sync_leader_does_not_block_later_syncs() {
+        with_timeout(async {
+            let path = tmp_path("cancel_leader");
+            let _g = Cleanup(path.clone());
+            let fs = builder().build().expect("handle");
+            let log = Arc::new(fs.journal(&path).expect("journal"));
+
+            for round in 0..8u8 {
+                let lsn = log
+                    .clone()
+                    .append_async(vec![round; 128])
+                    .await
+                    .expect("append");
+                {
+                    let fut = log.clone().sync_through_async(lsn);
+                    tokio::pin!(fut);
+                    // Poll the leader exactly once, then drop it.
+                    tokio::select! {
+                        biased;
+                        r = &mut fut => r.expect("leader finished on first poll"),
+                        () = std::future::ready(()) => {}
+                    }
+                }
+
+                let next = log
+                    .clone()
+                    .append_async(vec![round; 64])
+                    .await
+                    .expect("append after cancel");
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    log.clone().sync_through_async(next),
+                )
+                .await
+                .expect("sync_through_async hung after a cancelled leader")
+                .expect("sync_through_async");
+
+                let blocking = log.clone();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    tokio::task::spawn_blocking(move || blocking.sync_through(next)),
+                )
+                .await
+                .expect("sync_through hung after a cancelled leader")
+                .expect("join")
+                .expect("sync_through");
+                assert!(log.synced_lsn() >= next);
+            }
         })
         .await;
     }
