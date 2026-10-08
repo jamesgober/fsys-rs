@@ -10,8 +10,11 @@
 //! Runtime verification is now in place for the load-bearing fields:
 //! - `io_uring` is a real runtime probe (`io_uring_setup(2)`) on Linux
 //!   since 0.5.0.
-//! - `nvme_passthrough` is a real probe (NVMe character device + ioctl
-//!   capability) since 0.6.0.
+//! - `nvme_passthrough` is **not** probed here and is always `false` in
+//!   this snapshot. NVMe passthrough needs a specific device and
+//!   privileges, so it is probed lazily per handle on the first Direct
+//!   write; observe the result through
+//!   `Handle::active_durability_primitive()`.
 //! - `direct_io` / `iocp` / `kqueue` / `mmap` are target-driven (their
 //!   *syscall* availability is determined at compile time by the build
 //!   target; per-fd open-time rejection is signalled separately via
@@ -37,8 +40,10 @@ pub struct IoPrimitives {
     /// NVMe passthrough flush via `NVME_IOCTL_IO_CMD` (Linux) or
     /// `IOCTL_STORAGE_PROTOCOL_COMMAND` (Windows).
     ///
-    /// Real device-class + privilege probe since 0.6.0; lazily
-    /// computed on first hot-path query.
+    /// Always `false` in this process-wide snapshot: passthrough is
+    /// probed per handle on its first Direct write (device + privilege
+    /// check), and the outcome is reported by
+    /// `Handle::active_durability_primitive()`, not here.
     pub nvme_passthrough: bool,
     /// Direct (page-cache-bypassing) IO. Available on Linux
     /// (`O_DIRECT`), macOS (`F_NOCACHE`), and Windows
@@ -54,8 +59,8 @@ pub struct IoPrimitives {
 /// `probe::platform::probe_io_primitives`. On Linux the `io_uring`
 /// field is now a real runtime check (attempts to construct a 1-entry
 /// submission ring; success means the kernel supports
-/// `io_uring_setup(2)` for this process). NVMe passthrough remains
-/// `false` until 0.6.0.
+/// `io_uring_setup(2)` for this process). `nvme_passthrough` is always
+/// `false` here (see the field docs).
 #[must_use]
 pub(super) fn probe() -> IoPrimitives {
     super::probe::platform::probe_io_primitives()

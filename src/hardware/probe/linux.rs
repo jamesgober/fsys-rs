@@ -2,8 +2,12 @@
 //!
 //! Probes against `/proc/meminfo`, `/sys/block/<dev>/queue/*`,
 //! `std::thread::available_parallelism`, and runtime checks on the
-//! io_uring crate. PLP detection returns [`super::PlpStatus::Unknown`]
-//! pending the `0.6.0` NVMe passthrough work.
+//! io_uring crate. PLP detection checks the sysfs vendor / model
+//! against the lookup table in `hardware::plp` (`Yes` on a hit,
+//! otherwise [`super::PlpStatus::Unknown`]).
+//!
+//! Every drive value describes the block device holding the process's
+//! current working directory, not that of any particular fsys handle.
 //!
 //! All probes are non-fatal — when a `/sys/` or `/proc/` file is not
 //! reachable (sandboxed container, restricted mount), the probe
@@ -318,10 +322,8 @@ fn parse_kib(s: &str) -> u64 {
 ///
 /// Logical core count via [`std::thread::available_parallelism`];
 /// physical core count via `/proc/cpuinfo` (counts unique
-/// `core id`+`physical id` pairs). Compile-time CPU features via
-/// `cfg!(target_feature = "...")` (matches 0.2.0's accuracy; runtime
-/// `is_x86_feature_detected!` is deferred to a future enhancement
-/// because it requires `target_arch`-gated code paths).
+/// `core id`+`physical id` pairs). CPU features are detected at run
+/// time by `cpu::runtime_features()`.
 ///
 /// Cache sizes are read from `/sys/devices/system/cpu/cpu0/cache/*`;
 /// fallback to `0` on failure.
@@ -435,7 +437,7 @@ pub(crate) fn probe_io_primitives() -> IoPrimitives {
         io_uring: probe_io_uring_available(),
         iocp: false,
         kqueue: false,
-        nvme_passthrough: false, // 0.6.0
+        nvme_passthrough: false, // probed per handle, not here
         direct_io: true,
         mmap: true,
     }

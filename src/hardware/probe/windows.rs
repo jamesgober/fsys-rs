@@ -3,11 +3,17 @@
 //! Probes use Win32 APIs:
 //! - Memory: `GlobalMemoryStatusEx`.
 //! - Drive capacity / free space: `GetDiskFreeSpaceExW`.
-//! - Drive sector sizes: `GetDiskFreeSpaceW` + `IOCTL_STORAGE_QUERY_PROPERTY`
-//!   with `StorageAccessAlignmentProperty` for finer detail when reachable.
-//! - CPU: `GetSystemInfo` (logical cores) + `GetLogicalProcessorInformationEx`
-//!   (physical cores + cache sizes).
-//! - PLP: deferred to 0.6.0 alongside NVMe IOCTL passthrough.
+//! - Drive sector sizes: `GetDiskFreeSpaceW` (logical sector, used for
+//!   both logical and physical; cluster size as the optimal block).
+//! - CPU: `std::thread::available_parallelism` (logical cores) +
+//!   `GetLogicalProcessorInformationEx` (physical cores + cache sizes).
+//! - PLP: vendor / product strings from `IOCTL_STORAGE_QUERY_PROPERTY`
+//!   (`StorageDeviceProperty`) checked against the lookup table in
+//!   `hardware::plp`; works without administrator rights.
+//! - Drive kind is not probed and is always `Unknown`.
+//!
+//! Every drive value describes the volume holding the process's current
+//! working directory, not the volume of any particular fsys handle.
 //!
 //! All probes are non-fatal — failures degrade to documented defaults
 //! and do not error handle creation.
@@ -39,14 +45,12 @@ use crate::hardware::memory::MemoryInfo;
 /// 1. Find the volume containing the cwd via `GetVolumePathNameW`.
 /// 2. Read total/free bytes via `GetDiskFreeSpaceExW`.
 /// 3. Read sector sizes via `GetDiskFreeSpaceW`.
+/// 4. Read vendor / product via `IOCTL_STORAGE_QUERY_PROPERTY` for the
+///    PLP lookup.
 ///
-/// Drive kind classification is conservative on Windows: refining it
-/// would require `IOCTL_STORAGE_QUERY_PROPERTY` with
-/// `StorageDeviceSeekPenaltyProperty` (rotational vs non-rotational)
-/// and bus-type inspection. That landed in 0.6.0 alongside NVMe IOCTL
-/// support; for 0.5.0 we report `Unknown` for kind unless the volume
-/// path makes the drive type unambiguous (which it rarely does on
-/// Windows).
+/// Drive kind is always `Unknown` on Windows: classifying it would need
+/// `StorageDeviceSeekPenaltyProperty` and bus-type queries, which are
+/// not implemented.
 pub(crate) fn probe_drive() -> DriveInfo {
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
@@ -480,13 +484,15 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
 /// IOCP is always available since NT 3.5. mmap-equivalent
 /// (`MapViewOfFile`) is universal. `FILE_FLAG_NO_BUFFERING` for direct
 /// IO is universal at the API level (filesystem may still reject at
-/// open). No io_uring on Windows; no NVMe passthrough in 0.5.0.
+/// open). No io_uring on Windows. `nvme_passthrough` is always `false`
+/// here; NVMe passthrough capability is probed per handle (see
+/// [`IoPrimitives::nvme_passthrough`]).
 pub(crate) fn probe_io_primitives() -> IoPrimitives {
     IoPrimitives {
         io_uring: false,
         iocp: true,
         kqueue: false,
-        nvme_passthrough: false, // 0.6.0
+        nvme_passthrough: false, // probed per handle, not here
         direct_io: true,
         mmap: true,
     }
