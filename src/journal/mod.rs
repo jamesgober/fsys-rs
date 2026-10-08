@@ -295,6 +295,9 @@ pub struct JournalHandle {
     /// bytes have all been written. Unused in Direct-IO mode. See
     /// the `gate` module docs.
     write_gate: WriteGate,
+    /// 1.1.1: set by [`Self::close`] after its final sync so `Drop`
+    /// does not flush and fsync a second time.
+    closed: bool,
 }
 
 impl JournalHandle {
@@ -402,6 +405,7 @@ impl JournalHandle {
             sync_mode: options.sync_mode,
             poison: Poison::new(),
             write_gate: WriteGate::new(),
+            closed: false,
         })
     }
 
@@ -523,6 +527,7 @@ impl JournalHandle {
             sync_mode: options.sync_mode,
             poison: Poison::new(),
             write_gate: WriteGate::new(),
+            closed: false,
         })
     }
 
@@ -1463,7 +1468,7 @@ impl JournalHandle {
     /// # Errors
     ///
     /// - [`Error::Io`] on fsync or close failure.
-    pub fn close(self) -> Result<()> {
+    pub fn close(mut self) -> Result<()> {
         // Direct-IO: the log buffer's own end LSN is exact; the
         // public `next_lsn` mirror is published after the buffer
         // copy. Buffered: every append has returned (we own
@@ -1473,6 +1478,10 @@ impl JournalHandle {
             None => self.next_lsn.load(Ordering::SeqCst),
         };
         self.sync_through(Lsn(frontier))?;
+        // Everything is durable; `Drop` only has to close the file.
+        // Pre-1.1.1 `Drop` flushed and fsynced again after a
+        // successful close.
+        self.closed = true;
         // File closes when `self` drops; explicit drop here for
         // documentation.
         drop(self);
@@ -1505,7 +1514,7 @@ impl Drop for JournalHandle {
         // A poisoned journal must not write again: the flush could
         // land bytes after a hole, and a retried fsync can report
         // success for pages a failed one dropped.
-        if self.poison.is_set() {
+        if self.poison.is_set() || self.closed {
             return;
         }
         if let Some(log_buffer) = &self.log_buffer {

@@ -392,9 +392,9 @@ impl LogBuffer {
         records: &[&[u8]],
         total_encoded_size: usize,
     ) -> Result<Option<(u64, u64)>> {
-        if records.is_empty() {
-            return Ok(Some((0, 0)));
-        }
+        // `JournalHandle::append_batch` returns before reaching here
+        // for an empty batch; an empty slice would still be handled
+        // correctly (an empty range at the current end).
         let mut state = self.state.lock();
         let remaining = self.capacity.saturating_sub(state.active_len);
         if total_encoded_size > remaining {
