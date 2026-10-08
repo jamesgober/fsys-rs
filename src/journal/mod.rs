@@ -1085,7 +1085,7 @@ impl JournalHandle {
         // partial flush, so this call is consistent with the
         // group-commit captured-frontier invariant.
         if let Some(log_buffer) = &self.log_buffer {
-            log_buffer.flush_partial(&self.file)?;
+            let _ = log_buffer.flush_partial(&self.file)?;
         }
 
         // Capture the append frontier. We commit only up

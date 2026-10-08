@@ -214,12 +214,34 @@ pub(crate) fn encode_frame_into(payload: &[u8], buf: &mut [u8]) -> Result<usize>
     Ok(total)
 }
 
+/// Returns the encoded size of a frame carrying `payload_len`
+/// payload bytes.
+///
+/// # Errors
+///
+/// [`Error::Io`] with `InvalidInput` when `payload_len` exceeds
+/// [`FRAME_MAX_PAYLOAD`]. Callers use this to reject a record
+/// before allocating for it or reserving an LSN range.
+#[inline]
+pub(crate) fn frame_len(payload_len: usize) -> Result<usize> {
+    if (payload_len as u64) > (FRAME_MAX_PAYLOAD as u64) {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "journal record exceeds FRAME_MAX_PAYLOAD (256 MiB)",
+        )));
+    }
+    // `payload_len <= FRAME_MAX_PAYLOAD` (2^28 - 1): the sum fits in
+    // `usize` on every supported target, 32-bit included.
+    Ok(payload_len + FRAME_OVERHEAD)
+}
+
 /// Allocates a fresh `Vec<u8>` containing the encoded frame for
 /// `payload`. Convenience wrapper over [`encode_frame_into`] when
-/// the caller doesn't already own a buffer.
+/// the caller doesn't already own a buffer. The payload size is
+/// validated before the allocation.
 #[inline]
 pub(crate) fn encode_frame_owned(payload: &[u8]) -> Result<Vec<u8>> {
-    let total = payload.len().saturating_add(FRAME_OVERHEAD);
+    let total = frame_len(payload.len())?;
     let mut buf = vec![0u8; total];
     let _ = encode_frame_into(payload, &mut buf)?;
     Ok(buf)
