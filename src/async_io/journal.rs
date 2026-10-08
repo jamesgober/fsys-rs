@@ -608,17 +608,21 @@ mod tests {
                 .await
                 .expect("append");
 
-            // On a Linux runner with io_uring available, native should
-            // engage. On a Linux runner WITHOUT io_uring (sandboxed CI,
-            // containers without the syscall), it stays inactive.
-            // Both are valid outcomes — the test pins that the field
-            // *transitions* to a defined state (Some(_), not None).
-            // We don't assert specifically true/false because the
-            // runtime environment varies.
+            // The first append settles the substrate choice: the
+            // OnceLock is populated either way, and the native path
+            // is active exactly when this kernel lets us build an
+            // async ring (sandboxed CI without io_uring falls back).
+            assert!(
+                log.native_ring.get().is_some(),
+                "first append_async must settle the substrate choice"
+            );
+            let ring_available = AsyncIoUring::new(8).is_ok();
             let active = log.native_iouring_active();
-            // Just confirm the value is well-defined (either true or
-            // false). The OnceLock should have been populated.
-            assert!(active || !active);
+            assert_eq!(active, ring_available);
+            assert_eq!(
+                log.backend_kind() == crate::JournalBackendKind::KernelIoUring,
+                active
+            );
         })
         .await;
     }
