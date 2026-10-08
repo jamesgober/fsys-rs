@@ -3,8 +3,9 @@
 //! Provides `O_DIRECT`, `pwrite`/`pread`, `fdatasync`, `fsync`,
 //! `copy_file_range`, and `rename` for Linux targets.
 //!
-//! `io_uring` integration is deferred to `0.5.0`. All IO here is
-//! synchronous via `pwrite(2)` / `pread(2)` after the file is opened.
+//! All IO here is synchronous via `pwrite(2)` / `pread(2)`. The
+//! `io_uring` paths live in `linux_iouring.rs` (sync owner-thread ring)
+//! and `async_io` (async substrate); this module is their fallback.
 
 #![cfg(target_os = "linux")]
 

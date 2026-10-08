@@ -692,8 +692,10 @@ fn allocated_bytes(file: &File) -> Result<u64> {
 }
 
 /// macOS advise — limited surface vs Linux. Sequential / WillNeed
-/// map to `F_RDADVISE`; DontNeed maps to a temporary `F_NOCACHE`
-/// flip; Random and Normal are best-effort no-ops.
+/// map to `F_RDADVISE` (a failure is ignored, the hint is advisory).
+/// DontNeed, Random and Normal are no-ops: macOS has no per-range
+/// eviction hint, and toggling `F_NOCACHE` would change the whole
+/// handle's caching rather than one range.
 pub(crate) fn advise(file: &File, offset: u64, len: u64, advice: crate::Advice) -> Result<()> {
     let fd = file.as_raw_fd();
     match advice {

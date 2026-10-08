@@ -13,6 +13,8 @@
 //!   need for a separate `FlushFileBuffers` call on the Direct IO path.
 //! - **Alignment:** `GetDiskFreeSpaceW` returns `BytesPerSector` at handle
 //!   creation; the same sector size is used to size aligned scratch buffers.
+//! - **Large transfers:** `ReadFile` / `WriteFile` take a `u32` length, so
+//!   every loop splits at 2 GiB, a multiple of any sector size.
 //! - **Positioned writes (`write_at`):** uses `WriteFile` with an
 //!   `OVERLAPPED` struct carrying the offset (Windows' equivalent of
 //!   POSIX `pwrite`). Concurrent-safe at the same fd because the
@@ -1140,7 +1142,6 @@ pub(crate) fn probe_sector_size(path: &Path) -> u32 {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn probe_direct_io_available() -> bool {
     // FILE_FLAG_NO_BUFFERING is available on all supported Windows versions.
     // Whether it works depends on the filesystem (checked at open time).

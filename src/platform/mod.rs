@@ -73,8 +73,7 @@ use unknown as imp;
 // address.
 //
 // Allocation cost: one `alloc + dealloc` per Direct IO operation on
-// unaligned input. The 64 KiB stack-buffer optimisation is deferred to
-// 0.5.0; all Direct IO alignment uses heap allocation in 0.3.0.
+// unaligned input; there is no stack-buffer fast path.
 // ──────────────────────────────────────────────────────────────────────────────
 
 use std::alloc::{self, Layout};
@@ -241,11 +240,13 @@ pub(crate) fn write_all(file: &std::fs::File, data: &[u8]) -> crate::Result<()> 
 ///
 /// # Platform-specific behavior
 ///
-/// - Linux: `pwrite(2)` with an aligned buffer; offset 0.
-/// - macOS: standard `write(2)` on an `F_NOCACHE` fd; alignment handled by
-///   zero-padding to sector boundary.
-/// - Windows: `WriteFile` through a `FILE_FLAG_NO_BUFFERING` handle with an
-///   aligned buffer.
+/// - Linux: `pwrite(2)` loop with an aligned buffer, starting at offset 0.
+/// - macOS: the same `pwrite(2)` loop from offset 0 on an `F_NOCACHE` fd.
+///   `F_NOCACHE` does not flush the drive cache; durability needs a
+///   following [`sync_data`] (`F_FULLFSYNC`).
+/// - Windows: `WriteFile` at the handle's cursor through a
+///   `FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH` handle with an
+///   aligned buffer, in chunks of at most 2 GiB (a sector multiple).
 /// - Unknown: delegates to [`write_all`] (no Direct IO on unknown platforms).
 #[inline]
 pub(crate) fn write_all_direct(
@@ -258,10 +259,12 @@ pub(crate) fn write_all_direct(
 
 /// Writes `data` to `file` at `offset` bytes using standard IO.
 ///
-/// Uses `pwrite(2)` on Unix and `SetFilePointerEx` + `WriteFile` on
-/// Windows. This is **not** crash-atomic — a power failure mid-write
-/// may leave the file in a partially updated state. Callers that need
-/// crash safety should use [`crate::Handle::write`] instead.
+/// Uses `pwrite(2)` on Unix and `WriteFile` with the offset in an
+/// `OVERLAPPED` struct on Windows, so concurrent callers on one handle
+/// never race on a shared cursor. This is **not** crash-atomic — a power
+/// failure mid-write may leave the file in a partially updated state.
+/// Callers that need crash safety should use [`crate::Handle::write`]
+/// instead.
 #[inline]
 pub(crate) fn write_at(file: &std::fs::File, offset: u64, data: &[u8]) -> crate::Result<()> {
     imp::write_at(file, offset, data)
@@ -443,10 +446,14 @@ pub(crate) fn set_write_lifetime_hint(file: &std::fs::File, hint_ordinal: u8) ->
 ///
 /// **Per-platform implementation:**
 /// - **Linux**: `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`.
-/// - **macOS**: `fcntl(F_PUNCHHOLE)` with `fpunchhole_t` payload.
-/// - **Windows**: `DeviceIoControl(FSCTL_SET_ZERO_DATA)` —
-///   the closest semantic match (Windows zeros the range, which
-///   most NTFS configurations release to free space).
+/// - **macOS**: `fcntl(F_PUNCHHOLE)` with `fpunchhole_t` payload on the
+///   whole file-system blocks inside the range (clipped to EOF); the
+///   unaligned head and tail are overwritten with zeros, so those
+///   partial blocks stay allocated.
+/// - **Windows**: `DeviceIoControl(FSCTL_SET_ZERO_DATA)`. The range
+///   always reads back as zeros, but NTFS only releases the clusters
+///   for files marked sparse, and fsys never sets the sparse flag: on
+///   files fsys created, the call zero-fills without freeing space.
 /// - **Other**: returns `Err(Error::Io)` with `Unsupported` kind.
 ///
 /// Returns `Err` on filesystems that don't support hole-punching
@@ -649,6 +656,8 @@ pub(crate) fn probe_sector_size(path: &std::path::Path) -> u32 {
 ///
 /// A `true` result means the kernel-level API exists; actual availability
 /// depends on the filesystem and is confirmed at file-open time.
+// Only the per-platform unit tests call this today; it stays as the one
+// place that states each platform's Direct IO answer.
 #[allow(dead_code)]
 #[inline]
 pub(crate) fn probe_direct_io_available() -> bool {
@@ -690,7 +699,6 @@ pub(crate) fn probe_direct_io_available() -> bool {
 /// # Errors
 ///
 /// - [`Error::Io`](crate::Error::Io) on the underlying syscall failure.
-#[allow(dead_code)]
 #[inline]
 pub(crate) fn preallocate(file: &std::fs::File, offset: u64, len: u64) -> crate::Result<()> {
     imp::preallocate(file, offset, len)
@@ -702,8 +710,7 @@ pub(crate) fn preallocate(file: &std::fs::File, offset: u64, len: u64) -> crate:
 ///
 /// `len = 0` means "the rest of the file from `offset` onward."
 ///
-/// See [`Advice`] for the available hint variants.
-#[allow(dead_code)]
+/// See [`crate::Advice`] for the available hint variants.
 #[inline]
 pub(crate) fn advise(
     file: &std::fs::File,
