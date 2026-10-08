@@ -138,6 +138,52 @@ fn test_direct_write_concurrent_fd_churn_each_keep_own_bytes() {
     }
 }
 
+/// Reads every record of the journal at `path`, requiring a clean
+/// tail.
+fn journal_records(path: &std::path::Path) -> Vec<Vec<u8>> {
+    let mut reader = fsys::JournalReader::open(path).expect("open reader");
+    let records: Vec<Vec<u8>> = reader
+        .iter()
+        .map(|r| r.expect("record decodes").payload)
+        .collect();
+    assert_eq!(reader.tail_state(), fsys::JournalTailState::CleanEnd);
+    records
+}
+
+#[test]
+fn test_direct_journals_reopened_on_one_handle_keep_appending() {
+    // Finding 10: each Direct journal's log buffer registers its two
+    // slots as fixed buffers on an io_uring ring. If that ring were
+    // the Handle-wide one, the registration would outlive the
+    // journal and the next Direct journal on the same Handle would
+    // fail to register (EBUSY) or write through stale slots. Open,
+    // close and reopen several Direct journals on one Handle, two of
+    // them at once, and check every record.
+    let dir = test_dir("journal_reopen");
+    let fs = builder().root(&dir.0).build().expect("handle");
+    let opts = || fsys::JournalOptions::new().direct(true);
+    let a = dir.0.join("a.wal");
+    let b = dir.0.join("b.wal");
+    let mut want_a = Vec::new();
+    let mut want_b = Vec::new();
+    for round in 0..3u8 {
+        let log_a = fs.journal_with(&a, opts()).expect("open a");
+        let log_b = fs.journal_with(&b, opts()).expect("open b");
+        for k in 0..20u8 {
+            let rec_a = vec![round.wrapping_mul(40).wrapping_add(k); 100 + k as usize];
+            let rec_b = vec![0xB0 ^ k; 3000 + k as usize];
+            let _ = log_a.append(&rec_a).expect("append a");
+            let _ = log_b.append(&rec_b).expect("append b");
+            want_a.push(rec_a);
+            want_b.push(rec_b);
+        }
+        log_a.close().expect("close a");
+        log_b.close().expect("close b");
+    }
+    assert_eq!(journal_records(&a), want_a);
+    assert_eq!(journal_records(&b), want_b);
+}
+
 #[cfg(feature = "async")]
 mod async_tests {
     use super::*;
