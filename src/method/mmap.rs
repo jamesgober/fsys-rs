@@ -27,6 +27,23 @@
 //!   exceeds benefit).
 //! - The target/source is not a regular file.
 //! - The kernel rejects the `mmap` syscall.
+//!
+//! ## Reads and concurrent modification
+//!
+//! The read path maps the file with `memmap2::Mmap::map`, which is a
+//! **shared** (`MAP_SHARED`, `PROT_READ`) mapping on Unix and a
+//! read-only file view on Windows, then copies it into a `Vec`. It is
+//! not a snapshot: bytes changed in place by another writer while the
+//! copy runs can show up in the result, and if the file is truncated
+//! below the mapped length during the copy, touching the vanished pages
+//! raises `SIGBUS` (Unix) or an in-page exception (Windows), which
+//! terminates the process. fsys's own atomic-replace writes never
+//! modify a published file in place (they rename a new file over it),
+//! so they are safe to run concurrently with mmap reads. In-place
+//! modifiers are not: `Handle::write_at`, `Handle::append`,
+//! `Handle::truncate`, `punch_hole`, journals, and any other process
+//! writing the file. Callers must not run those against a file while it
+//! is being read through `Method::Mmap`.
 
 use std::path::Path;
 
@@ -209,11 +226,19 @@ pub(crate) fn read(path: &Path) -> Result<Vec<u8>> {
         });
     }
 
-    // SAFETY: a `MAP_PRIVATE` mapping (the default for
-    // `memmap2::Mmap::map`) gives us a copy-on-write view: concurrent
-    // modifications by other processes via the page cache do not
-    // corrupt our snapshot. We never write through this mapping. The
-    // mapping does not outlive `file` (both drop at end of scope).
+    // SAFETY: `memmap2::Mmap::map` creates a read-only *shared*
+    // mapping (`MAP_SHARED` on Unix), not a private snapshot. The
+    // mapping is only sound while nobody modifies or truncates the
+    // file for the duration of the `to_vec()` copy below; a
+    // concurrent in-place write would make the bytes change under a
+    // `&[u8]`, and a truncation would raise SIGBUS on the next page
+    // touched. That requirement is part of `Method::Mmap`'s documented
+    // contract (see the module docs and `Method::Mmap`): fsys's own
+    // atomic-replace writes rename a new file over the target and
+    // never touch a mapped inode, and callers must not combine mmap
+    // reads with in-place modification of the same file. We never
+    // write through this mapping, and it does not outlive `file`
+    // (both drop at end of scope).
     let mmap = match unsafe { Mmap::map(&file) } {
         Ok(m) => m,
         Err(e) => {

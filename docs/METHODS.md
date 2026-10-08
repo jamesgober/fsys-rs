@@ -14,7 +14,7 @@ Pick the cheapest method that satisfies your durability requirement.
 | Method | Linux | macOS | Windows | Cost (consumer NVMe) | Use when |
 |---|---|---|---|---|---|
 | `Sync` | `fsync(2)` | `fcntl(F_FULLFSYNC)` | `FlushFileBuffers` | ~1–10 ms | universal correctness floor |
-| `Data` | `fdatasync(2)` | falls back to `Sync` | falls back to `Sync` | ~500 µs–5 ms | data-only durability, no metadata |
+| `Data` | `fdatasync(2)` | `F_FULLFSYNC` (same as `Sync`) | `FlushFileBuffers` (same as `Sync`) | ~500 µs–5 ms | data-only durability, no metadata |
 | `Mmap` | `mmap` + `msync(MS_SYNC)` | `mmap` + `msync` | `MapViewOfFile` + `FlushViewOfFile` | size-dependent | read-heavy random access |
 | `Direct` | `O_DIRECT` + io_uring (+ NVMe FLUSH on capable HW) | `F_NOCACHE` + `F_FULLFSYNC` | `FILE_FLAG_WRITE_THROUGH` (+ NVMe IOCTL on capable HW) | < 100 µs target | append-heavy or cache-bypass writes |
 | `Journal` | reserved variant — no committed implementation | reserved variant | reserved variant | n/a | reserved enum slot only; see note below |
@@ -37,13 +37,20 @@ Pick the cheapest method that satisfies your durability requirement.
 
 3. **You care about metadata-vs-data distinction (e.g. you control
    inode atime/mtime separately):** `Method::Data`. Linux-only
-   speedup; falls back to `Sync` elsewhere — observable via
-   `Handle::active_method()`.
+   speedup; elsewhere it issues the same primitive as `Sync`
+   (observable via `Handle::active_durability_primitive()`;
+   `active_method()` keeps reporting `Data`).
 
 4. **You're doing a lot of small random writes and the dataset
    fits in memory:** `Method::Mmap`. Sub-page payloads
    transparently fall back to `Sync` (the kernel can't `msync` a
-   sub-page region durably).
+   sub-page region durably). Reads copy out of a shared mapping:
+   do not modify the same file in place (`write_at`, `append`,
+   `truncate`, `punch_hole`, another process) while it is being
+   read. In-place writes can show up in the result, and a
+   truncation during the read raises `SIGBUS` (Unix) or an in-page
+   exception (Windows) and terminates the process. fsys's own
+   atomic-replace writes are safe to run concurrently.
 
 5. **You're doing append-heavy writes on an NVMe SSD with PLP
    (Power Loss Protection):** `Method::Direct`. Best-case latency;
@@ -61,13 +68,15 @@ Linux + io_uring + NVMe                                →  Direct (fdatasync fl
 Linux + NVMe (no io_uring)                             →  Data
 Linux + non-NVMe SSD                                   →  Data
 Linux + HDD or unknown                                 →  Sync
-macOS + NVMe                                           →  Direct (F_NOCACHE+F_FULLFSYNC)
-macOS + non-NVMe                                       →  Sync
-Windows + NVMe + IOCTL access                          →  Direct (NVMe IOCTL)
-Windows + NVMe (no IOCTL access)                       →  Direct (WRITE_THROUGH)
-Windows + non-NVMe                                     →  Sync
+macOS (any drive)                                      →  Sync
+Windows (any drive)                                    →  Sync
 Anything that fails to probe                           →  Sync (universal safety)
 ```
+
+The macOS and Windows hardware probes do not detect the drive kind
+yet, so `Auto` resolves to `Sync` on both. Select `Method::Direct`
+explicitly to use `F_NOCACHE` + `F_FULLFSYNC` (macOS) or
+`FILE_FLAG_NO_BUFFERING` + `FILE_FLAG_WRITE_THROUGH` (Windows).
 
 `Auto` never falls through to user code at runtime — the choice is
 locked at handle construction. Subsequent runtime fallbacks (e.g.
@@ -107,6 +116,11 @@ across the 0.9.x series:
 If you requested `Method::Direct` and the filesystem rejected
 `O_DIRECT` at open time, the handle's active method downgrades to
 `Method::Data`. You can read it back at any time.
+
+`Method::Direct` writes are fenced before the rename on every path:
+`fdatasync` (Linux, through io_uring or `pwrite`), `F_FULLFSYNC`
+(macOS), or `FILE_FLAG_WRITE_THROUGH` (Windows). Batch writes take
+the same path as solo writes.
 
 `Handle::active_durability_primitive()` (new in 0.6.0) returns the
 canonical *primitive* string — e.g. `"io_uring + NVMe FLUSH"`,

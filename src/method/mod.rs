@@ -152,6 +152,18 @@ pub enum Method {
     /// LSM-tree level files, mmap'd indexes). Not a fit for sequential
     /// streaming writes — use [`Method::Sync`] / [`Method::Data`] /
     /// [`Method::Direct`] for that.
+    ///
+    /// **Concurrent modification during reads.** [`Handle::read`](crate::Handle::read)
+    /// copies the file out of a shared mapping. It is safe alongside
+    /// fsys's atomic-replace writes (which publish a new file instead
+    /// of changing the mapped one), but not alongside in-place
+    /// modification of the same file: `write_at`, `append`,
+    /// `truncate`, `punch_hole`, journals, or another process writing
+    /// it. Concurrent in-place writes can show up in the returned
+    /// bytes, and a concurrent truncation makes the read fault with
+    /// `SIGBUS` (Unix) or an in-page exception (Windows), terminating
+    /// the process. Use another method for files that are modified in
+    /// place while being read.
     Mmap = 3,
 
     /// Intent-log (journal) durability mode.
