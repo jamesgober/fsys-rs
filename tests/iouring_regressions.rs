@@ -270,5 +270,75 @@ mod async_tests {
                 assert_bytes(&got, &payload_for(i), &format!("file {i}"));
             }
         }
+        // A cancelled write must not leave its temp file behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".fsys-tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    /// Finding 8: when the filesystem rejects `O_DIRECT` (tmpfs before
+    /// Linux 6.6),
+    /// `write_async` must fall back like the sync `Handle::write`
+    /// (finish the write buffered, downgrade to `Method::Data`)
+    /// instead of failing the call.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_write_async_direct_on_tmpfs_falls_back_like_sync() {
+        let shm = std::path::Path::new("/dev/shm");
+        if !shm.is_dir() {
+            return;
+        }
+        let dir = shm.join(format!(
+            "fsys_iouring_regress_tmpfs_{}_{}",
+            std::process::id(),
+            C.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let dir = TempDir(dir);
+        // tmpfs accepts O_DIRECT since Linux 6.6; there is nothing to
+        // fall back from on such kernels.
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let probe = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(dir.0.join("probe"));
+            if probe.is_ok() {
+                return;
+            }
+        }
+        let fs = Arc::new(
+            builder()
+                .method(Method::Direct)
+                .root(&dir.0)
+                .build()
+                .expect("handle"),
+        );
+        // The first async Direct op builds the native ring and takes
+        // the native path.
+        let payload = payload_for(7);
+        fs.clone()
+            .write_async("tmpfs.bin", payload.clone())
+            .await
+            .expect("write_async on tmpfs must fall back, not fail");
+        assert_bytes(
+            &std::fs::read(dir.0.join("tmpfs.bin")).unwrap(),
+            &payload,
+            "tmpfs.bin",
+        );
+        // tmpfs rejects O_DIRECT, so the handle must have downgraded.
+        assert_eq!(fs.active_method(), Method::Data);
     }
 }
