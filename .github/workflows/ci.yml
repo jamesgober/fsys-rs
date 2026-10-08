@@ -84,6 +84,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # Every feature except `oom_inject`, which swaps the global
+      # allocator and is only meant for its own test job.
+      - name: Clippy (optional features)
+        run: cargo clippy --all-targets --features async,tracing,spdk,stress,fuzz -- -D warnings
+
   docs:
     name: Docs build
     runs-on: ubuntu-latest
