@@ -414,8 +414,9 @@ on Linux + Direct. Useful for:
 `write_async` reads the variable once per process (on its first
 call) and caches the answer, so set it before the first async
 write; changing it later does not move `write_async` between
-substrates. `async_substrate()` still checks the variable on each
-call.
+substrates. `async_substrate()` uses the same cached answer (since
+1.1.1; before that it re-read the variable on every call and could
+report `SpawnBlocking` while `write_async` ran natively).
 
 ### Why Linux-only
 

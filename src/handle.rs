@@ -463,8 +463,14 @@ impl Handle {
     /// On non-Linux platforms, on Linux without the `async` Cargo
     /// feature, when `Method::Direct` is not active, when the
     /// io_uring ring failed to construct, or when
-    /// `FSYS_DISABLE_NATIVE_ASYNC=1` is set, this returns
+    /// `FSYS_DISABLE_NATIVE_ASYNC` is set, this returns
     /// [`crate::AsyncSubstrate::SpawnBlocking`].
+    ///
+    /// `FSYS_DISABLE_NATIVE_ASYNC` is read once per process, by the
+    /// first call to this method or to `write_async`, and that answer
+    /// is used from then on by both, so the reported substrate always
+    /// matches the one `write_async` takes. Set the variable before
+    /// the process first uses the async layer.
     ///
     /// # Examples
     ///
@@ -497,7 +503,7 @@ impl Handle {
     /// always returns `false` — the native substrate is unreachable.
     #[cfg(all(target_os = "linux", feature = "async"))]
     fn substrate_is_native(&self) -> bool {
-        if std::env::var_os("FSYS_DISABLE_NATIVE_ASYNC").is_some() {
+        if crate::async_io::native_async_disabled() {
             return false;
         }
         if self.active_method() != Method::Direct {

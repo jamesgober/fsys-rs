@@ -54,9 +54,11 @@ pub(crate) mod iouring_substrate;
 ///
 /// Read from the environment on the first call and cached for the
 /// life of the process, so the async write hot path does not take
-/// the environment lock and scan `environ` on every call. Set the
-/// variable before the process performs its first async write;
-/// changing it afterwards has no effect on `write_async`.
+/// the environment lock and scan `environ` on every call. Both
+/// `write_async` and `Handle::async_substrate` use this answer, so
+/// the reported substrate matches the one taken. Set the variable
+/// before the process first uses the async layer; changing it
+/// afterwards has no effect.
 #[cfg(target_os = "linux")]
 pub(crate) fn native_async_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

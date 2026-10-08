@@ -111,17 +111,48 @@ async fn write_async_through_direct_works_on_either_substrate() {
     assert_eq!(read, b"hello via Direct async");
 }
 
-#[tokio::test]
-async fn env_override_forces_spawn_blocking_substrate() {
-    // SAFETY: this test mutates process env. Single-threaded
-    // libtest invocation per `--test-threads=1`; no concurrent
-    // env mutation in this binary.
-    let prior = std::env::var_os("FSYS_DISABLE_NATIVE_ASYNC");
-    // SAFETY: documented racy-in-multi-threaded-process std API;
-    // we run single-threaded.
-    unsafe {
-        std::env::set_var("FSYS_DISABLE_NATIVE_ASYNC", "1");
+/// Marks the child process started by
+/// [`env_override_forces_spawn_blocking_substrate`].
+const OVERRIDE_CHILD_VAR: &str = "FSYS_TEST_SUBSTRATE_OVERRIDE_CHILD";
+
+/// `FSYS_DISABLE_NATIVE_ASYNC` is read once per process, so the
+/// override is tested in a fresh child process that has it set from
+/// the start (setting it here could not undo an earlier test's first
+/// read, and would leak into the other tests of this binary). The
+/// child runs [`env_override_child`] from this same test binary.
+#[test]
+fn env_override_forces_spawn_blocking_substrate() {
+    if std::env::var_os(OVERRIDE_CHILD_VAR).is_some() {
+        return;
     }
+    let exe = std::env::current_exe().expect("test binary path");
+    let output = std::process::Command::new(exe)
+        .args(["--exact", "env_override_child", "--test-threads=1"])
+        .env("FSYS_DISABLE_NATIVE_ASYNC", "1")
+        .env(OVERRIDE_CHILD_VAR, "1")
+        .output()
+        .expect("spawn child test process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "child failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Guard against the filter silently matching nothing.
+    assert!(
+        stdout.contains("1 passed"),
+        "child did not run env_override_child:\n{stdout}"
+    );
+}
+
+/// Body of [`env_override_forces_spawn_blocking_substrate`]; a no-op
+/// unless started as its child process.
+#[tokio::test]
+async fn env_override_child() {
+    if std::env::var_os(OVERRIDE_CHILD_VAR).is_none() {
+        return;
+    }
+    assert!(std::env::var_os("FSYS_DISABLE_NATIVE_ASYNC").is_some());
 
     let fs = Arc::new(
         builder()
@@ -130,32 +161,31 @@ async fn env_override_forces_spawn_blocking_substrate() {
             .expect("handle"),
     );
 
-    let path = tmp_path("override");
+    // Under the target tmpdir rather than /tmp, which is tmpfs on many
+    // Linux hosts: tmpfs may reject O_DIRECT, and the handle would
+    // then leave Method::Direct and report SpawnBlocking regardless
+    // of the override.
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "fsys_async_substrate_override_{}",
+        std::process::id()
+    ));
     let _g = Cleanup(path.clone());
 
-    // Trigger an async Direct op so the substrate would normally
-    // construct the native ring.
-    let _ = fs
-        .clone()
-        .write_async(&path, b"forced fallback".to_vec())
-        .await;
+    // Run several async Direct ops. Without the override the first
+    // one constructs the native ring and later ones use it.
+    for i in 0..3u8 {
+        fs.clone()
+            .write_async(&path, vec![i; 4096])
+            .await
+            .expect("write_async under the override");
+    }
+    assert_eq!(std::fs::read(&path).expect("read"), vec![2u8; 4096]);
 
-    // With override set, substrate must be SpawnBlocking — even
-    // though we just ran an async Direct op.
     assert_eq!(
         fs.async_substrate(),
         AsyncSubstrate::SpawnBlocking,
         "FSYS_DISABLE_NATIVE_ASYNC=1 must force SpawnBlocking"
     );
-
-    // Restore.
-    // SAFETY: same reasoning as the set above.
-    unsafe {
-        match prior {
-            Some(v) => std::env::set_var("FSYS_DISABLE_NATIVE_ASYNC", v),
-            None => std::env::remove_var("FSYS_DISABLE_NATIVE_ASYNC"),
-        }
-    }
 }
 
 #[tokio::test]
