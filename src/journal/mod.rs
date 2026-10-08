@@ -440,14 +440,20 @@ impl JournalHandle {
             0
         };
 
-        let sector_size = crate::platform::probe_sector_size(path);
         // Open the journal file with the platform's Direct-IO
         // flag. `open_direct_journal` returns
         // `(file, direct_active)`; `direct_active = false` means
         // the filesystem rejected the flag and we silently fell
         // back to a buffered handle (still functional, observable
         // via `is_direct_active`).
-        let (file, direct_active) = open_direct_journal(path, sector_size)?;
+        let (file, direct_active) = open_direct_journal(path)?;
+
+        // 1.1.1: probe the sector size only once the file exists.
+        // Pre-1.1.1 the probe ran before the open, so on Linux the
+        // first session of a new journal fell back to 512 (statfs
+        // fails on a missing path) while every reopen used the real
+        // block size, and 4Kn devices rejected the 512-byte writes.
+        let sector_size = crate::platform::probe_sector_size(path);
 
         // 0.9.4 — apply the optional NVMe write-lifetime hint.
         // Same non-fatal-on-failure contract as the buffered
@@ -457,8 +463,9 @@ impl JournalHandle {
         // If Direct-IO was rejected by the filesystem
         // (`open_direct_journal` returned `direct_active = false`),
         // fall back to the buffered path. We do NOT silently lose
-        // the "direct" intent — the caller can observe via
+        // the "direct" intent: the caller can observe it via
         // [`Self::is_direct_active`].
+        let file_len = file.metadata().map_err(Error::Io)?.len();
         let log_buffer = if direct_active {
             // Allocate the log buffer. Resume puts `flush_pos` at
             // the largest sector boundary ≤ resume_lsn; the buffer
@@ -470,11 +477,31 @@ impl JournalHandle {
             // implementation). Total memory: 2 × cap_bytes.
             let cap_bytes = options.log_buffer_kib.saturating_mul(1024);
             let buf = LogBuffer::new(cap_bytes, sector_size, 0)?;
+            let ss = u64::from(sector_size);
+            let resume_sector = resume_lsn - resume_lsn % ss;
+            // 1.1.1: drop stale bytes past the resume sector (a torn
+            // frame, an unwritten hole, records past a hole). They
+            // were left in place before, and a later flush that did
+            // not reach them could leave old frames readable after
+            // the new tail.
+            let keep = if resume_lsn > resume_sector {
+                resume_sector + ss
+            } else {
+                resume_sector
+            };
+            if file_len > keep {
+                file.set_len(keep).map_err(Error::Io)?;
+            }
             if resume_lsn > 0 {
-                rehydrate_log_buffer(&buf, &file, sector_size, resume_lsn)?;
+                let prefix = read_resume_prefix(path, resume_sector, resume_lsn)?;
+                buf.set_flush_pos_for_resume(resume_sector, &prefix)?;
             }
             Some(buf)
         } else {
+            // Buffered fallback: same resume rule as `open_buffered`.
+            if file_len > resume_lsn {
+                file.set_len(resume_lsn).map_err(Error::Io)?;
+            }
             None
         };
 
@@ -1693,24 +1720,33 @@ fn scan_clean_end(path: &Path) -> Result<u64> {
     }
 }
 
+/// Creation mode for Direct-IO journal files on Linux: `0o666`
+/// filtered by the process umask, the same default `std` uses for
+/// buffered journals. Pre-1.1.1 Direct-IO journals were created
+/// `0o600`, so the file mode depended on the IO mode.
+#[cfg(target_os = "linux")]
+const JOURNAL_CREATE_MODE: libc::c_int = 0o666;
+
 /// Open the journal file with the platform's Direct-IO flag.
 /// Returns `(file, direct_active)`. `direct_active = false` means
 /// the filesystem rejected `O_DIRECT` and the caller should fall
 /// back to buffered semantics.
 #[cfg(target_os = "linux")]
-fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
+fn open_direct_journal(path: &Path) -> Result<(File, bool)> {
     use std::os::fd::FromRawFd;
-    let path_cstr =
-        std::ffi::CString::new(path.as_os_str().to_string_lossy().as_bytes()).map_err(|_| {
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "journal path contains a NUL byte",
-            ))
-        })?;
+    use std::os::unix::ffi::OsStrExt;
+    // 1.1.1: pass the path's raw bytes. `to_string_lossy` replaced
+    // non-UTF-8 bytes with U+FFFD and opened a different file.
+    let path_cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "journal path contains a NUL byte",
+        ))
+    })?;
     let mut flags = libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_DIRECT;
     // SAFETY: path_cstr is a valid NUL-terminated string; flags +
     // mode are valid open(2) arguments.
-    let fd = unsafe { libc::open(path_cstr.as_ptr(), flags, 0o600_i32) };
+    let fd = unsafe { libc::open(path_cstr.as_ptr(), flags, JOURNAL_CREATE_MODE) };
     if fd >= 0 {
         // SAFETY: fd is a valid open file descriptor we just
         // created/opened.
@@ -1722,7 +1758,7 @@ fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
         // Retry without it; the caller falls back to buffered.
         flags &= !libc::O_DIRECT;
         // SAFETY: same as above.
-        let fd2 = unsafe { libc::open(path_cstr.as_ptr(), flags, 0o600_i32) };
+        let fd2 = unsafe { libc::open(path_cstr.as_ptr(), flags, JOURNAL_CREATE_MODE) };
         if fd2 >= 0 {
             // SAFETY: fd2 is a valid open file descriptor.
             return Ok((unsafe { File::from_raw_fd(fd2) }, false));
@@ -1733,7 +1769,7 @@ fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
 }
 
 #[cfg(target_os = "macos")]
-fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
+fn open_direct_journal(path: &Path) -> Result<(File, bool)> {
     use std::os::unix::io::AsRawFd;
     let file = OpenOptions::new()
         .read(true)
@@ -1749,7 +1785,7 @@ fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
 }
 
 #[cfg(target_os = "windows")]
-fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
+fn open_direct_journal(path: &Path) -> Result<(File, bool)> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
@@ -1802,7 +1838,7 @@ fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
+fn open_direct_journal(path: &Path) -> Result<(File, bool)> {
     // No Direct-IO on unknown platforms — fall back silently.
     let file = OpenOptions::new()
         .read(true)
@@ -1814,30 +1850,36 @@ fn open_direct_journal(path: &Path, _sector_size: u32) -> Result<(File, bool)> {
     Ok((file, false))
 }
 
-/// Rehydrate the log buffer's first sector from the on-disk
-/// content of the partial trailing sector. Used on resume so that
-/// subsequent flushes overwrite the zero-pad cleanly without
-/// destroying records.
-fn rehydrate_log_buffer(
-    buf: &LogBuffer,
-    file: &File,
-    sector_size: u32,
-    resume_lsn: u64,
-) -> Result<()> {
-    let ss = sector_size as u64;
-    let last_sector_start = (resume_lsn / ss) * ss;
-    let in_sector_offset = (resume_lsn - last_sector_start) as usize;
-    if in_sector_offset == 0 {
-        // resume_lsn lands exactly on a sector boundary; nothing
-        // to rehydrate, the buffer is already initialised to
-        // (flush_pos = 0, len = 0). Move flush_pos forward.
-        buf.set_flush_pos_for_resume(resume_lsn, 0, &[]);
-        return Ok(());
+/// Reads the bytes of the resume LSN's sector that precede the
+/// resume LSN (`[resume_sector, resume_lsn)`), used to prime the
+/// log buffer on a Direct-IO reopen.
+///
+/// The read goes through a separate buffered read-only handle
+/// rather than the Direct-IO handle: `O_DIRECT` /
+/// `FILE_FLAG_NO_BUFFERING` reads need a sector-aligned buffer,
+/// offset and length, and a short read past the end of file is
+/// not reliable on every platform. Pre-1.1.1 the Direct-IO handle
+/// was read into an unaligned `Vec`; a short or failed read
+/// silently primed the buffer with fewer bytes than the resume
+/// LSN implied, and the next flush overwrote the last records.
+fn read_resume_prefix(path: &Path, resume_sector: u64, resume_lsn: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let len = usize::try_from(resume_lsn - resume_sector).map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "journal resume sector offset does not fit in usize",
+        ))
+    })?;
+    let mut prefix = vec![0u8; len];
+    if len == 0 {
+        return Ok(prefix);
     }
-    // Read the partial trailing sector from disk.
-    let bytes = crate::platform::read_range(file, last_sector_start, sector_size as usize)?;
-    buf.set_flush_pos_for_resume(last_sector_start, in_sector_offset, &bytes);
-    Ok(())
+    let mut reader = File::open(path).map_err(Error::Io)?;
+    let _ = reader
+        .seek(std::io::SeekFrom::Start(resume_sector))
+        .map_err(Error::Io)?;
+    reader.read_exact(&mut prefix).map_err(Error::Io)?;
+    Ok(prefix)
 }
 
 #[cfg(test)]
@@ -3289,5 +3331,22 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         watcher.join().expect("watcher");
         assert_eq!(j.next_lsn().as_u64(), highest);
+    }
+
+    #[test]
+    fn test_direct_open_probes_sector_size_after_creating_file() {
+        // FS-J7: the probe ran before the file existed, so on Linux
+        // a new journal's first session used 512-byte sectors and
+        // every reopen used the filesystem block size.
+        let path = tmp_path("sector_probe");
+        let _g = Cleanup(path.clone());
+        let j = JournalHandle::open_with_options(&path, JournalOptions::new().direct(true))
+            .expect("open direct");
+        if let Some(log_buffer) = &j.log_buffer {
+            assert_eq!(
+                log_buffer.sector_size(),
+                crate::platform::probe_sector_size(&path) as usize
+            );
+        }
     }
 }

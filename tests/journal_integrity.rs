@@ -404,45 +404,46 @@ fn test_reopen_after_zero_tail_resumes_at_last_record() {
 /// journal stays a readable prefix.
 #[test]
 fn test_reopen_after_unwritten_reservation_hole_resumes_at_hole() {
-    let direct = false;
-    let path = tmp_path("hole_reopen");
-    let _g = Cleanup(path.clone());
-    let fs = builder().build().expect("handle");
-    let durable_end;
-    {
-        let log = fs.journal(&path).expect("open");
-        durable_end = log.append(b"durable").expect("append").as_u64();
-        log.close().expect("close");
-    }
-    // 40 zero bytes (the unwritten reservation), then a frame
-    // that a later appender did write.
-    let mut bytes = std::fs::read(&path).expect("read");
-    bytes.resize(bytes.len() + 40, 0);
-    {
-        let tmp = tmp_path("hole_frame");
-        let _g2 = Cleanup(tmp.clone());
-        let log = fs.journal(&tmp).expect("frame source");
-        let _ = log.append(b"orphan").expect("append");
-        log.close().expect("close");
-        bytes.extend_from_slice(&std::fs::read(&tmp).expect("read frame"));
-    }
-    std::fs::write(&path, &bytes).expect("write crashed image");
+    for direct in [false, true] {
+        let path = tmp_path("hole_reopen");
+        let _g = Cleanup(path.clone());
+        let fs = builder().build().expect("handle");
+        let durable_end;
+        {
+            let log = fs.journal(&path).expect("open");
+            durable_end = log.append(b"durable").expect("append").as_u64();
+            log.close().expect("close");
+        }
+        // 40 zero bytes (the unwritten reservation), then a frame
+        // that a later appender did write.
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes.resize(bytes.len() + 40, 0);
+        {
+            let tmp = tmp_path("hole_frame");
+            let _g2 = Cleanup(tmp.clone());
+            let log = fs.journal(&tmp).expect("frame source");
+            let _ = log.append(b"orphan").expect("append");
+            log.close().expect("close");
+            bytes.extend_from_slice(&std::fs::read(&tmp).expect("read frame"));
+        }
+        std::fs::write(&path, &bytes).expect("write crashed image");
 
-    let (records, state) = read_all(&path);
-    assert_eq!(records.len(), 1);
-    assert_eq!(state, JournalTailState::TruncatedHeader);
+        let (records, state) = read_all(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(state, JournalTailState::TruncatedHeader);
 
-    let log = fs
-        .journal_with(&path, JournalOptions::new().direct(direct))
-        .expect("reopen");
-    assert_eq!(log.next_lsn().as_u64(), durable_end, "direct={direct}");
-    let _ = log.append(b"after-recovery").expect("append");
-    log.close().expect("close");
-    assert_eq!(
-        payloads(&path),
-        vec![b"durable".to_vec(), b"after-recovery".to_vec()],
-        "direct={direct}"
-    );
+        let log = fs
+            .journal_with(&path, JournalOptions::new().direct(direct))
+            .expect("reopen");
+        assert_eq!(log.next_lsn().as_u64(), durable_end, "direct={direct}");
+        let _ = log.append(b"after-recovery").expect("append");
+        log.close().expect("close");
+        assert_eq!(
+            payloads(&path),
+            vec![b"durable".to_vec(), b"after-recovery".to_vec()],
+            "direct={direct}"
+        );
+    }
 }
 
 /// A journal whose tail is not recoverable (bad magic) is refused
@@ -551,4 +552,90 @@ fn test_preallocate_fallback_with_concurrent_appends_keeps_every_record() {
             .expect("reopen");
         assert_eq!(log.next_lsn().as_u64(), end, "direct={direct}");
     }
+}
+
+/// FS-J8: a Direct-IO reopen resumed at the last clean frame but
+/// left every byte after it in place. Bytes past the first flushed
+/// sector survived the next session; here a stale frame after a
+/// zero run came back as a record after the new tail.
+#[test]
+fn test_direct_reopen_drops_stale_frames_past_resume_point() {
+    let path = tmp_path("stale_tail");
+    let _g = Cleanup(path.clone());
+    let fs = builder().build().expect("handle");
+    let frame_of = |payload: &[u8]| -> Vec<u8> {
+        let tmp = tmp_path("frame_src");
+        let _g2 = Cleanup(tmp.clone());
+        let log = fs.journal(&tmp).expect("frame source");
+        let _ = log.append(payload).expect("append");
+        log.close().expect("close");
+        std::fs::read(&tmp).expect("read frame")
+    };
+    // durable frame, a torn frame (bad CRC), zeros to 64 KiB, and a
+    // stale but valid frame on that 64 KiB boundary.
+    let mut bytes = frame_of(b"durable");
+    let durable_end = bytes.len() as u64;
+    let mut torn = frame_of(b"torn-frame");
+    let last = torn.len() - 1;
+    torn[last] ^= 0xFF;
+    bytes.extend_from_slice(&torn);
+    bytes.resize(64 * 1024, 0);
+    bytes.extend_from_slice(&frame_of(b"stale"));
+    std::fs::write(&path, &bytes).expect("write crashed image");
+
+    let log = fs
+        .journal_with(&path, JournalOptions::new().direct(true))
+        .expect("reopen direct");
+    assert_eq!(log.next_lsn().as_u64(), durable_end);
+    let _ = log.append(b"new").expect("append");
+    log.close().expect("close");
+    assert_eq!(payloads(&path), vec![b"durable".to_vec(), b"new".to_vec()]);
+}
+
+/// FS-J13: the Linux Direct-IO open converted the path with
+/// `to_string_lossy`, so a non-UTF-8 path opened a different file.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_direct_open_uses_exact_non_utf8_path() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = std::env::temp_dir();
+    let name = format!("fsys_journal_integrity_{}_\u{0}", std::process::id());
+    let mut raw = name.into_bytes();
+    // Replace the placeholder NUL with an invalid UTF-8 byte.
+    let last = raw.len() - 1;
+    raw[last] = 0xFF;
+    let path = dir.join(OsStr::from_bytes(&raw));
+    let lossy = dir.join(OsStr::from_bytes(&raw).to_string_lossy().as_ref());
+    let _g = Cleanup(path.clone());
+    let _g2 = Cleanup(lossy.clone());
+    let fs = builder().build().expect("handle");
+    let log = fs
+        .journal_with(&path, JournalOptions::new().direct(true))
+        .expect("open direct");
+    let _ = log.append(b"x").expect("append");
+    log.close().expect("close");
+    assert!(path.exists(), "journal not created at the requested path");
+    assert!(!lossy.exists(), "journal created at the lossy path");
+    assert_eq!(payloads(&path), vec![b"x".to_vec()]);
+}
+
+/// FS-J13: Direct-IO journals were created 0o600 while buffered
+/// journals got the umask default; the mode must not depend on the
+/// IO mode.
+#[cfg(unix)]
+#[test]
+fn test_direct_and_buffered_journals_share_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let a = tmp_path("mode_buffered");
+    let b = tmp_path("mode_direct");
+    let (_ga, _gb) = (Cleanup(a.clone()), Cleanup(b.clone()));
+    let fs = builder().build().expect("handle");
+    fs.journal(&a).expect("buffered").close().expect("close");
+    fs.journal_with(&b, JournalOptions::new().direct(true))
+        .expect("direct")
+        .close()
+        .expect("close");
+    let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode(&a), mode(&b));
 }

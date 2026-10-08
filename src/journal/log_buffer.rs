@@ -822,42 +822,47 @@ impl LogBuffer {
 
     /// Repositions the buffer for resume-after-crash. Called by
     /// `JournalHandle::open_direct` after `scan_clean_end` finds
-    /// the last good LSN. Sets `active_flush_pos` to the last
-    /// sector boundary at or before `resume_lsn`, primes slot 0
-    /// with the partial-sector tail from disk (`prefix_bytes`)
-    /// so subsequent flushes overwrite the existing on-disk
-    /// zero-pad cleanly, and sets `active_len` to the in-sector
-    /// resume offset.
-    pub(crate) fn set_flush_pos_for_resume(
-        &self,
-        flush_pos: u64,
-        in_sector_offset: usize,
-        prefix_bytes: &[u8],
-    ) {
+    /// the last good LSN. Sets `active_flush_pos` to `flush_pos`
+    /// (the last sector boundary at or before the resume LSN) and
+    /// primes the active slot with `prefix`, the bytes of the
+    /// partial trailing sector that precede the resume LSN, so the
+    /// next flush rewrites that sector with the same leading bytes.
+    /// `active_len` becomes `prefix.len()`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] with `InvalidInput` if `flush_pos` is not
+    /// sector-aligned or `prefix` is not shorter than a sector.
+    pub(crate) fn set_flush_pos_for_resume(&self, flush_pos: u64, prefix: &[u8]) -> Result<()> {
+        if flush_pos % self.sector_size as u64 != 0 || prefix.len() >= self.sector_size {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "journal resume position is not sector-aligned",
+            )));
+        }
         let mut state = self.state.lock();
         debug_assert_eq!(state.active_len, 0, "rehydrate must run on a fresh buffer");
-        debug_assert!(
-            flush_pos % self.sector_size as u64 == 0,
-            "flush_pos must be sector-aligned"
-        );
         debug_assert!(
             state.flushing.is_none(),
             "rehydrate must run before any flush has started"
         );
         state.active_flush_pos = flush_pos;
-        if in_sector_offset > 0 {
-            let copy_len = in_sector_offset
-                .min(prefix_bytes.len())
-                .min(self.sector_size);
-            let active_idx = state.active_idx as usize;
-            // SAFETY: we hold the state lock; the active slot is
-            // exclusively ours during this resume init.
-            unsafe {
-                let slice = (*self.bufs[active_idx].get()).as_mut_slice();
-                slice[..copy_len].copy_from_slice(&prefix_bytes[..copy_len]);
-            }
-            state.active_len = copy_len;
+        let active_idx = state.active_idx as usize;
+        // SAFETY: we hold the state lock; the active slot is
+        // exclusively ours during this resume init. `prefix` is
+        // shorter than a sector, and a slot holds at least one.
+        unsafe {
+            let slice = (*self.bufs[active_idx].get()).as_mut_slice();
+            slice[..prefix.len()].copy_from_slice(prefix);
         }
+        state.active_len = prefix.len();
+        Ok(())
+    }
+
+    /// Device sector size this buffer aligns every write to.
+    #[inline]
+    pub(crate) fn sector_size(&self) -> usize {
+        self.sector_size
     }
 }
 
