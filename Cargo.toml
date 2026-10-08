@@ -4,7 +4,7 @@
 ######################################################
 [package]
 name    = "fsys"
-version = "1.1.1"
+version = "1.1.2"
 
 # METADATA
 readme  = "README.md"
@@ -225,12 +225,11 @@ crc32c = "0.6"
 # Condvar}` for the deep-internal coordination paths fsys uses.
 parking_lot = "0.12"
 
-# Cross-platform memory-mapped IO for `Method::Mmap` (D-6 +
-# `CHANGELOG.md`). The original `memmap` crate is unmaintained;
-# `memmap2` is the maintained successor, widely vetted in production
-# Rust storage projects (RocksDB-rs bindings, sled, etc.). Minimal
-# transitive deps.
-memmap2 = "0.9.11"
+# Memory mapping for `Method::Mmap`: the first-party `mmap_io::raw`
+# layer (replaces `memmap2` since 1.1.2). Default features off: only
+# the raw tier is used, which adds `log` beyond what fsys already
+# depends on (`parking_lot`, `libc`).
+mmap-io = { version = "1.1.0", default-features = false }
 
 # Glob-pattern matching for `Handle::find`. Standard syntax (`*`,
 # `**`, `?`, `[abc]`, `{foo,bar}`) — the de-facto pattern crate in

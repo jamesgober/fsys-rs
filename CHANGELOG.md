@@ -5,6 +5,14 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-10-07
+
+**Dependency swap: `memmap2` -> `mmap-io`.** `Method::Mmap` now maps files through the first-party [`mmap_io::raw`](https://docs.rs/mmap-io/1.1.0/mmap_io/raw/) layer instead of `memmap2`. No public API, behavior or on-disk change.
+
+### Changed
+
+- **`memmap2` replaced by `mmap-io` 1.1 (`default-features = false`).** `mmap_io::raw` checks every offset and length with overflow-checked arithmetic before any pointer math or syscall (the bug class of [RUSTSEC-2026-0186](https://rustsec.org/advisories/RUSTSEC-2026-0186.html)), rejects mappings past end of file up front, and flushes durably on every platform (`msync(MS_SYNC)`; `FlushViewOfFile` + `FlushFileBuffers` on Windows). The only new crate in the dependency tree is `log`; `memmap2` is gone.
+
 ## [1.1.1] - 2026-10-07
 
 **Security, durability and correctness release.** Fixes data-integrity bugs in the Direct-IO, io_uring, journal and batch paths, a root-jail escape, and two RUSTSEC advisories in the dependency tree. Upgrading is recommended for every user, especially on Linux with NVMe + io_uring (the default `Method::Auto` resolution there) and for anyone using `JournalHandle`. No public item was removed or renamed, no signature changed, and the on-disk journal frame format is unchanged (1.1.1 reads every journal 1.1.0 wrote, including the ones 1.1.0's own reader could not). Behavior changes are listed under **Changed**.
@@ -2898,7 +2906,8 @@ release-candidate-to-1.0 runway.
 ### Added
 - Initial release. Reserved name on crates.io. No public API.
 
-[Unreleased]: https://github.com/jamesgober/fsys-rs/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/jamesgober/fsys-rs/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/jamesgober/fsys-rs/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/jamesgober/fsys-rs/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jamesgober/fsys-rs/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/fsys-rs/compare/v0.9.8...v1.0.0

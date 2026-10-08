@@ -30,7 +30,7 @@
 //!
 //! ## Reads and concurrent modification
 //!
-//! The read path maps the file with `memmap2::Mmap::map`, which is a
+//! The read path maps the file with `mmap_io::raw::RawMmap::map`, which is a
 //! **shared** (`MAP_SHARED`, `PROT_READ`) mapping on Unix and a
 //! read-only file view on Windows, then copies it into a `Vec`. It is
 //! not a snapshot: bytes changed in place by another writer while the
@@ -47,7 +47,7 @@
 
 use std::path::Path;
 
-use memmap2::{Mmap, MmapMut};
+use mmap_io::raw::{RawMmap, RawMmapMut};
 
 use crate::{Error, Result};
 
@@ -142,12 +142,12 @@ pub(crate) fn write(path: &Path, data: &[u8]) -> Result<()> {
     // a handle to it; modifications via the mapping are private until
     // `atomic_rename` reveals the file at `path`. The mapping does not
     // outlive `temp_file` (both drop at end of scope).
-    let mut mmap = match unsafe { MmapMut::map_mut(&temp_file) } {
+    let mut mmap = match unsafe { RawMmapMut::map_mut(&temp_file) } {
         Ok(m) => m,
         Err(e) => {
             let _ = std::fs::remove_file(&temp);
             return Err(Error::MmapFailed {
-                reason: format!("MmapMut::map_mut failed for temp: {e}"),
+                reason: format!("RawMmapMut::map_mut failed for temp: {e}"),
             });
         }
     };
@@ -160,7 +160,7 @@ pub(crate) fn write(path: &Path, data: &[u8]) -> Result<()> {
         drop(mmap);
         let _ = std::fs::remove_file(&temp);
         return Err(Error::MmapFailed {
-            reason: format!("Mmap::flush (msync/FlushViewOfFile) failed: {e}"),
+            reason: format!("RawMmapMut::flush (msync/FlushViewOfFile) failed: {e}"),
         });
     }
 
@@ -226,7 +226,7 @@ pub(crate) fn read(path: &Path) -> Result<Vec<u8>> {
         });
     }
 
-    // SAFETY: `memmap2::Mmap::map` creates a read-only *shared*
+    // SAFETY: `mmap_io::raw::RawMmap::map` creates a read-only *shared*
     // mapping (`MAP_SHARED` on Unix), not a private snapshot. The
     // mapping is only sound while nobody modifies or truncates the
     // file for the duration of the `to_vec()` copy below; a
@@ -239,11 +239,11 @@ pub(crate) fn read(path: &Path) -> Result<Vec<u8>> {
     // reads with in-place modification of the same file. We never
     // write through this mapping, and it does not outlive `file`
     // (both drop at end of scope).
-    let mmap = match unsafe { Mmap::map(&file) } {
+    let mmap = match unsafe { RawMmap::map(&file) } {
         Ok(m) => m,
         Err(e) => {
             return Err(Error::MmapFailed {
-                reason: format!("Mmap::map failed: {e}"),
+                reason: format!("RawMmap::map failed: {e}"),
             });
         }
     };
