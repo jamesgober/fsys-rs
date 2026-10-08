@@ -27,12 +27,28 @@
 //!   exceeds benefit).
 //! - The target/source is not a regular file.
 //! - The kernel rejects the `mmap` syscall.
+//!
+//! ## Reads and concurrent modification
+//!
+//! The read path maps the file with `memmap2::Mmap::map`, which is a
+//! **shared** (`MAP_SHARED`, `PROT_READ`) mapping on Unix and a
+//! read-only file view on Windows, then copies it into a `Vec`. It is
+//! not a snapshot: bytes changed in place by another writer while the
+//! copy runs can show up in the result, and if the file is truncated
+//! below the mapped length during the copy, touching the vanished pages
+//! raises `SIGBUS` (Unix) or an in-page exception (Windows), which
+//! terminates the process. fsys's own atomic-replace writes never
+//! modify a published file in place (they rename a new file over it),
+//! so they are safe to run concurrently with mmap reads. In-place
+//! modifiers are not: `Handle::write_at`, `Handle::append`,
+//! `Handle::truncate`, `punch_hole`, journals, and any other process
+//! writing the file. Callers must not run those against a file while it
+//! is being read through `Method::Mmap`.
 
 use std::path::Path;
 
 use memmap2::{Mmap, MmapMut};
 
-use crate::handle::Handle;
 use crate::{Error, Result};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -98,18 +114,20 @@ pub(crate) fn write(path: &Path, data: &[u8]) -> Result<()> {
         });
     }
 
-    let temp = Handle::gen_temp_path(path);
-
-    // Step 1 — create + size the temp file.
-    let temp_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map_err(|e| Error::AtomicReplaceFailed {
-            step: "open_temp",
-            source: e,
-        })?;
+    // Step 1: create + size the temp file. The name carries the pid
+    // and a nonce; an exclusive create retries on the rare collision.
+    let (temp, temp_file) = crate::crud::atomic::with_unique_temp(path, |temp| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(temp)
+            .map_err(Error::Io)
+    })
+    .map_err(|e| Error::AtomicReplaceFailed {
+        step: "open_temp",
+        source: crate::crud::atomic::as_io_error(e),
+    })?;
     if let Err(e) = temp_file.set_len(data.len() as u64) {
         let _ = std::fs::remove_file(&temp);
         return Err(Error::AtomicReplaceFailed {
@@ -175,7 +193,7 @@ pub(crate) fn write(path: &Path, data: &[u8]) -> Result<()> {
     }
 
     // Step 6 — best-effort parent-dir sync (no-op on Windows).
-    let _ = crate::platform::sync_parent_dir(path);
+    let _ = crate::crud::sync_parent(path);
 
     Ok(())
 }
@@ -208,11 +226,19 @@ pub(crate) fn read(path: &Path) -> Result<Vec<u8>> {
         });
     }
 
-    // SAFETY: a `MAP_PRIVATE` mapping (the default for
-    // `memmap2::Mmap::map`) gives us a copy-on-write view: concurrent
-    // modifications by other processes via the page cache do not
-    // corrupt our snapshot. We never write through this mapping. The
-    // mapping does not outlive `file` (both drop at end of scope).
+    // SAFETY: `memmap2::Mmap::map` creates a read-only *shared*
+    // mapping (`MAP_SHARED` on Unix), not a private snapshot. The
+    // mapping is only sound while nobody modifies or truncates the
+    // file for the duration of the `to_vec()` copy below; a
+    // concurrent in-place write would make the bytes change under a
+    // `&[u8]`, and a truncation would raise SIGBUS on the next page
+    // touched. That requirement is part of `Method::Mmap`'s documented
+    // contract (see the module docs and `Method::Mmap`): fsys's own
+    // atomic-replace writes rename a new file over the target and
+    // never touch a mapped inode, and callers must not combine mmap
+    // reads with in-place modification of the same file. We never
+    // write through this mapping, and it does not outlive `file`
+    // (both drop at end of scope).
     let mmap = match unsafe { Mmap::map(&file) } {
         Ok(m) => m,
         Err(e) => {

@@ -137,7 +137,6 @@ impl Drop for AlignedBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::buffer::pool::AlignedBufferPool;
 
     #[test]

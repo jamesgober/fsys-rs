@@ -31,14 +31,14 @@ use std::sync::Arc;
 /// - `method` defaults to [`Method::Auto`] (hardware-aware selection).
 /// - `root` defaults to `None` (no path scope enforcement).
 /// - `mode` defaults to [`Mode::Auto`] (resolved from environment).
-/// - `batch_window_ms` defaults to `1` (group-lane time threshold).
-/// - `batch_size_max` defaults to `128` (group-lane count threshold).
+/// - `batch_window_ms` is accepted but unused since 1.1.1 (the
+///   group-lane dispatcher no longer waits for more jobs).
+/// - `batch_size_max` defaults to `128` (ops taken per dispatcher pass).
 /// - `batch_queue_max` defaults to `1024` (group-lane queue capacity;
 ///   producers block when full).
-/// - `buffer_pool_count` defaults to `64` (per-handle aligned buffer
-///   pool capacity; see locked decision #6 in
-///   `.dev/DECISIONS-0.5.0.md`).
-/// - `buffer_pool_block_size` defaults to `4096` (per-buffer size in bytes).
+/// - `buffer_pool_count` defaults to `64` and `buffer_pool_block_size`
+///   to `4096`. Both are reserved: stored, but not consulted by any IO
+///   path in 1.1.x (see [`Builder::buffer_pool_count`]).
 /// - `io_uring_queue_depth` defaults to `128` (Linux io_uring SQ
 ///   depth). Real `io_uring` integration shipped in `0.5.1` after
 ///   the rustc 1.95 ICE workaround landed; see the io_uring blocker
@@ -222,42 +222,32 @@ impl Builder {
         self
     }
 
-    /// Sets the group-lane time threshold in milliseconds.
+    /// Accepted for compatibility; the value is not used.
     ///
-    /// The dispatcher flushes the current batch when *either* this many
-    /// milliseconds elapse since the first job in the batch arrived,
-    /// *or* [`Builder::batch_size_max`] ops have accumulated, whichever
-    /// comes first. Default: `1` ms.
-    ///
-    /// Larger values amortise more syscall overhead per flush at the
-    /// cost of higher per-batch latency. Smaller values approach the
-    /// solo lane's latency at the cost of less amortisation. The
-    /// default is tuned for storage-engine workloads that mix latency-
-    /// sensitive and throughput-sensitive paths.
-    ///
-    /// Setting this to `0` is allowed but defeats the time-window
-    /// component of the hybrid trigger — flushes will be driven solely
-    /// by the count threshold.
+    /// Before 1.1.1 the group-lane dispatcher held a job for up to this
+    /// many milliseconds when other jobs were already queued, hoping to
+    /// amortise work across them. Every op carries its own fence (each
+    /// write's temp file must be durable before its own rename), so the
+    /// wait shared nothing and only added latency. The dispatcher now
+    /// executes queued jobs as soon as it picks them up.
     #[must_use]
-    pub fn batch_window_ms(mut self, ms: u64) -> Self {
-        self.pipeline_config.batch_window_ms = ms;
+    pub fn batch_window_ms(self, ms: u64) -> Self {
+        let _ = ms;
         self
     }
 
-    /// Sets the group-lane count threshold.
+    /// Sets how many ops the group-lane dispatcher takes from its queue
+    /// in one pass.
     ///
-    /// The dispatcher flushes the current batch when *either* this many
-    /// ops have accumulated, *or* [`Builder::batch_window_ms`] elapses,
-    /// whichever comes first. Default: `128` ops.
+    /// The dispatcher always takes at least one job, then keeps taking
+    /// jobs that are already queued until this many ops are gathered or
+    /// the queue is empty, and executes them in queue order. It never
+    /// waits for more jobs. Default: `128` ops.
     ///
-    /// Larger values reduce per-batch overhead at the cost of higher
-    /// memory residency for in-flight batches. Smaller values reduce
-    /// memory residency at the cost of more frequent dispatcher
-    /// scheduling overhead.
-    ///
-    /// Setting this to `0` is allowed but defeats the count component
-    /// of the hybrid trigger — flushes will be driven solely by the
-    /// time-window deadline.
+    /// The value bounds how much work one pass picks up (and therefore
+    /// the memory held by jobs taken off the queue but not yet
+    /// executed); it does not change ordering or durability. `0` means
+    /// one job per pass.
     #[must_use]
     pub fn batch_size_max(mut self, n: usize) -> Self {
         self.pipeline_config.batch_size_max = n;
@@ -271,54 +261,47 @@ impl Builder {
     /// [`Handle::delete_batch`](crate::Handle::delete_batch),
     /// [`Handle::copy_batch`](crate::Handle::copy_batch), and
     /// [`crate::Batch::commit`] **block** until space is available
-    /// (decision #4 — bounded queue with blocking submission).
+    /// (decision #4: bounded queue with blocking submission). The
+    /// async batch methods wait without blocking the runtime worker.
     ///
     /// Default: `1024` jobs. Each job carries one batch (a `Vec` of
     /// ops + a oneshot response channel + a `HandleSnapshot`); the
     /// memory footprint of a full queue is bounded by the size of the
     /// largest job.
     ///
-    /// Setting this to `0` is rejected at runtime by the underlying
-    /// channel implementation — `0` would make every send block
-    /// indefinitely. Use `1` for an "at most one job in flight at a
-    /// time" workload.
+    /// `0` creates a zero-capacity (rendezvous) queue: every submit
+    /// waits until the dispatcher takes its job directly. Use `1` for
+    /// "at most one job waiting at a time".
     #[must_use]
     pub fn batch_queue_max(mut self, n: usize) -> Self {
         self.pipeline_config.batch_queue_max = n;
         self
     }
 
-    /// Sets the per-handle aligned buffer pool capacity (number of
-    /// reusable buffers).
+    /// Sets the capacity of the per-handle aligned buffer pool.
     ///
-    /// Default: `64`. Buffers are allocated lazily on the first
-    /// Direct-method op; idle handles cost zero buffer memory. The
-    /// pool is shared between caller threads and the group-lane
-    /// dispatcher; access is lock-free on the fast path
-    /// (`crossbeam_queue::ArrayQueue`).
+    /// **Reserved.** The value is stored but no IO path draws buffers
+    /// from the pool in 1.1.x: every Direct-IO operation allocates its
+    /// own sector-aligned buffer sized to the payload, and that
+    /// allocation is small next to the durability fence each Direct
+    /// write issues. The knob keeps its place in the API so code that
+    /// sets it keeps compiling; it has no effect on memory use or
+    /// throughput today. Any value, including `0`, is accepted.
     ///
-    /// `0` is rejected at [`build`](Builder::build) time. Larger
-    /// values reduce allocation pressure on Direct workloads at the
-    /// cost of higher per-handle resident memory
-    /// (`buffer_pool_count × buffer_pool_block_size` bytes when fully
-    /// populated).
+    /// Default: `64`.
     #[must_use]
     pub fn buffer_pool_count(mut self, n: usize) -> Self {
         self.buffer_pool_count = n;
         self
     }
 
-    /// Sets the per-buffer size in the aligned buffer pool, in bytes.
+    /// Sets the per-buffer size of the aligned buffer pool, in bytes.
     ///
-    /// Default: `4096`. Must be a non-zero multiple of the
-    /// platform's logical sector size (typically 512 or 4096) and a
-    /// power of two when alignment matters; `build()` validates this
-    /// against the probed sector size.
+    /// **Reserved**, like [`Builder::buffer_pool_count`]: stored (and
+    /// rounded up to the probed sector size) but not consulted by any
+    /// IO path in 1.1.x.
     ///
-    /// For Direct IO workloads with payloads larger than the default,
-    /// a 64 KiB or 1 MiB block reduces the number of buffer leases per
-    /// op at the cost of higher per-handle memory (see
-    /// [`Builder::buffer_pool_count`]).
+    /// Default: `4096`.
     #[must_use]
     pub fn buffer_pool_block_size(mut self, bytes: usize) -> Self {
         self.buffer_pool_block_size = bytes;
@@ -445,14 +428,15 @@ impl Builder {
     /// **`Workload::Database`** — tuned for storage-engine
     /// workloads (HiveDB, embedded KV stores, log-structured
     /// merge trees) on NVMe with sustained bulk writes. Sets:
-    /// - `buffer_pool_count = 1024`,
-    ///   `buffer_pool_block_size = 8192` (= 8 MiB resident per
-    ///   handle, 32× the 256 KiB pre-0.9.2 default).
-    /// - `io_uring_queue_depth = 256` (= 2× the pre-0.9.2 default).
-    /// - `batch_queue_max = 4096` (= 4× the pre-0.9.2 default).
+    /// - `io_uring_queue_depth = 256` (= 2× the default).
+    /// - `batch_queue_max = 4096` (= 4× the default).
+    /// - `buffer_pool_count = 1024`, `buffer_pool_block_size = 8192`.
+    ///   These two are reserved knobs with no effect in 1.1.x (see
+    ///   [`Builder::buffer_pool_count`]); no pool memory is allocated.
     ///
     /// **`Workload::Default`** — restores the library defaults
-    /// (256 KiB pool, 128-deep ring, 1024-deep batch queue).
+    /// (128-deep ring, 1024-deep batch queue, default reserved pool
+    /// values).
     /// Useful for tests and for callers who want to revert a
     /// preset before applying a different one.
     #[must_use]
@@ -521,8 +505,8 @@ impl Builder {
     /// Resolves `Method::Auto` using the hardware-detection ladder,
     /// probes the sector size for the root (or current directory), and
     /// validates that no reserved method was requested. The dispatcher
-    /// thread, io_uring ring, buffer pool, and NVMe-passthrough slot
-    /// are all constructed lazily on first use — idle handles cost zero
+    /// thread, io_uring ring, and NVMe-passthrough slot are all
+    /// constructed lazily on first use; idle handles cost zero
     /// threads and zero ring memory.
     ///
     /// # Errors
@@ -539,43 +523,7 @@ impl Builder {
     ///   canonicalisation fails (the path must exist and be a directory
     ///   — `Builder::root` does not `mkdir`).
     pub fn build(self) -> Result<Handle> {
-        if self.method.is_reserved() {
-            return Err(Error::UnsupportedMethod {
-                method: self.method.as_str(),
-            });
-        }
-
-        // 1.1.0 — SPDK gating. `Method::Spdk` is runtime-validated:
-        // the `spdk` Cargo feature must be enabled at compile time AND
-        // the capability probe must report `spdk_eligible = true`.
-        // The actual backend construction lives in the `fsys-spdk`
-        // companion crate; this is the gate that decides whether
-        // forwarding to that crate is even sensible.
-        if self.method == Method::Spdk {
-            #[cfg(not(feature = "spdk"))]
-            {
-                return Err(Error::FeatureNotEnabled { feature: "spdk" });
-            }
-            #[cfg(feature = "spdk")]
-            {
-                let caps = crate::capability::capabilities();
-                if !caps.spdk_eligible {
-                    let reason = caps
-                        .first_spdk_skip_reason()
-                        .cloned()
-                        .unwrap_or(crate::capability::SpdkSkipReason::NotLinux);
-                    return Err(Error::SpdkUnavailable { reason });
-                }
-                // Feature on + eligible — but the `fsys-spdk` companion
-                // crate is in scaffold state in 1.1.0. Surface a clear
-                // error here rather than constructing a half-wired
-                // handle. This branch goes away when the companion
-                // crate ships the real backend.
-                return Err(Error::SpdkUnavailable {
-                    reason: crate::capability::SpdkSkipReason::SpdkLibraryNotFound,
-                });
-            }
-        }
+        check_method_selectable(self.method)?;
 
         let resolved_method = self.method.resolve();
         let mode = self.mode.resolve();
@@ -645,6 +593,59 @@ impl Builder {
     }
 }
 
+/// Rejects methods that cannot back a handle on this build / host.
+/// Shared by [`Builder::build`] and [`Handle::set_method`] so both
+/// return the same error for the same method.
+///
+/// # Errors
+///
+/// - [`Error::UnsupportedMethod`] for reserved variants
+///   ([`Method::Journal`]).
+/// - [`Error::FeatureNotEnabled`] for [`Method::Spdk`] without the
+///   `spdk` Cargo feature.
+/// - [`Error::SpdkUnavailable`] for [`Method::Spdk`] when the host is
+///   not eligible or the backend is not available.
+pub(crate) fn check_method_selectable(method: Method) -> Result<()> {
+    if method.is_reserved() {
+        return Err(Error::UnsupportedMethod {
+            method: method.as_str(),
+        });
+    }
+
+    // 1.1.0 SPDK gating. `Method::Spdk` is runtime-validated:
+    // the `spdk` Cargo feature must be enabled at compile time AND
+    // the capability probe must report `spdk_eligible = true`.
+    // The actual backend construction lives in the `fsys-spdk`
+    // companion crate; this is the gate that decides whether
+    // forwarding to that crate is even sensible.
+    if method == Method::Spdk {
+        #[cfg(not(feature = "spdk"))]
+        {
+            return Err(Error::FeatureNotEnabled { feature: "spdk" });
+        }
+        #[cfg(feature = "spdk")]
+        {
+            let caps = crate::capability::capabilities();
+            if !caps.spdk_eligible {
+                let reason = caps
+                    .first_spdk_skip_reason()
+                    .cloned()
+                    .unwrap_or(crate::capability::SpdkSkipReason::NotLinux);
+                return Err(Error::SpdkUnavailable { reason });
+            }
+            // Feature on + eligible, but the `fsys-spdk` companion
+            // crate is in scaffold state in 1.1.0. Surface a clear
+            // error rather than running a half-wired handle. This
+            // branch goes away when the companion crate ships the
+            // real backend.
+            return Err(Error::SpdkUnavailable {
+                reason: crate::capability::SpdkSkipReason::SpdkLibraryNotFound,
+            });
+        }
+    }
+    Ok(())
+}
+
 impl Default for Builder {
     fn default() -> Self {
         Self::new()
@@ -666,15 +667,14 @@ impl Default for Builder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Workload {
-    /// The library defaults — 256 KiB buffer pool, 128-deep
-    /// io_uring ring, 1024-deep batch queue. Suitable for
-    /// general file IO; NOT tuned for sustained database
-    /// throughput.
+    /// The library defaults: 128-deep io_uring ring, 1024-deep
+    /// batch queue. Suitable for general file IO; NOT tuned for
+    /// sustained database throughput.
     Default,
-    /// Storage-engine / database workload preset. 8 MiB buffer
-    /// pool, 256-deep ring, 4096-deep batch queue. Suitable for
-    /// HiveDB, embedded KV stores, log-structured merge trees,
-    /// and any workload with sustained bulk writes against an
+    /// Storage-engine / database workload preset. 256-deep ring,
+    /// 4096-deep batch queue (plus the reserved buffer-pool knobs).
+    /// Suitable for HiveDB, embedded KV stores, log-structured merge
+    /// trees, and any workload with sustained bulk writes against an
     /// NVMe target.
     Database,
 }
@@ -781,15 +781,14 @@ mod tests {
     #[test]
     fn test_builder_default_pipeline_config_matches_prompt() {
         let b = Builder::new();
-        assert_eq!(b.pipeline_config.batch_window_ms, 1);
         assert_eq!(b.pipeline_config.batch_size_max, 128);
         assert_eq!(b.pipeline_config.batch_queue_max, 1024);
     }
 
     #[test]
-    fn test_builder_batch_window_ms_overrides_default() {
+    fn test_builder_batch_window_ms_is_accepted_and_ignored() {
         let b = Builder::new().batch_window_ms(5);
-        assert_eq!(b.pipeline_config.batch_window_ms, 5);
+        assert_eq!(b.pipeline_config, PipelineConfig::DEFAULT);
     }
 
     #[test]
@@ -810,7 +809,6 @@ mod tests {
             .batch_window_ms(3)
             .batch_size_max(200)
             .batch_queue_max(2048);
-        assert_eq!(b.pipeline_config.batch_window_ms, 3);
         assert_eq!(b.pipeline_config.batch_size_max, 200);
         assert_eq!(b.pipeline_config.batch_queue_max, 2048);
     }
@@ -855,17 +853,33 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_batch_window_zero_is_accepted() {
-        // Documented as defeating the time-window component, but
-        // legal at the API level.
-        let b = Builder::new().batch_window_ms(0);
-        assert_eq!(b.pipeline_config.batch_window_ms, 0);
-    }
-
-    #[test]
     fn test_builder_batch_size_zero_is_accepted() {
         let b = Builder::new().batch_size_max(0);
         assert_eq!(b.pipeline_config.batch_size_max, 0);
+    }
+
+    #[test]
+    fn test_builder_zero_queue_and_batch_size_run_batches_end_to_end() {
+        // Both `0` settings are documented as valid; a batch must flow.
+        let h = Builder::new()
+            .method(Method::Sync)
+            .batch_size_max(0)
+            .batch_queue_max(0)
+            .build()
+            .expect("build");
+        let p = std::env::temp_dir().join(format!(
+            "fsys_builder_zero_knobs_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _g = scopeguard_remove_file(p.clone());
+        for payload in [b"a".as_slice(), b"b".as_slice()] {
+            h.write_batch(&[(p.as_path(), payload)]).expect("batch");
+        }
+        assert_eq!(std::fs::read(&p).unwrap(), b"b");
     }
 
     // ── 0.5.0 buffer pool + io_uring knobs ────────────────────────

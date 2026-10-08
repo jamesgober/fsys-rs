@@ -1,15 +1,16 @@
 //! File CRUD operations implemented as `impl Handle`.
 //!
-//! All writes use an atomic temp-rename pattern:
-//! 1. Write to a temp file (`.fsys-tmp-<n>.<target>`).
-//! 2. Flush to the requested durability level.
-//! 3. `rename(temp, target)` — atomic on POSIX; `MoveFileExW` on Windows.
+//! Whole-file writes (`write`, `write_copy`) use the atomic temp-rename
+//! sequence in [`super::atomic`]:
+//! 1. Write to a fresh temp file next to the target.
+//! 2. Make it durable at the handle's durability level.
+//! 3. `rename(temp, target)`: atomic on POSIX; `MoveFileExW` on Windows.
 //! 4. Sync the parent directory (Linux/macOS; no-op on Windows).
 //!
-//! On any failure after temp creation, the temp file is removed with a
-//! best-effort delete (failure to clean up is not reported back to the
-//! caller because the primary error has already been set).
+//! On any failure after temp creation the temp file is removed; the
+//! primary error is what the caller sees.
 
+use super::atomic::{atomic_replace, BufferedFlush, ReplaceHooks, ReplacePlan, StepResult};
 use crate::handle::Handle;
 use crate::meta::FileMeta;
 use crate::method::Method;
@@ -25,7 +26,8 @@ impl Handle {
     /// Atomically writes `data` to `path`, replacing any existing file.
     ///
     /// The write follows the temp-file + atomic-rename pattern: a new
-    /// file is created at `<path>.fsys-tmp-<n>`, `data` is written and
+    /// file is created next to the target as
+    /// `.fsys-tmp-<pid>-<nonce>.<name>`, `data` is written and
     /// flushed at the handle's durability level, then a single
     /// `rename(2)` / `MoveFileExW` swaps it into place. After this
     /// method returns successfully, the target file is durably on
@@ -62,6 +64,22 @@ impl Handle {
     /// # }
     /// ```
     pub fn write(&self, path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
+        // Observer hook: when no observer is registered this is one
+        // branch, with no clock read.
+        let Some(observer) = self.observer.as_deref() else {
+            return self.write_unobserved(path.as_ref(), data);
+        };
+        let start = std::time::Instant::now();
+        let result = self.write_unobserved(path.as_ref(), data);
+        observer.on_handle_write(crate::observer::HandleWriteEvent {
+            bytes_written: data.len() as u64,
+            duration: start.elapsed(),
+            error: result.is_err(),
+        });
+        result
+    }
+
+    fn write_unobserved(&self, path: &Path, data: &[u8]) -> Result<()> {
         #[cfg(feature = "tracing")]
         let _span = tracing::trace_span!(
             "fsys::Handle::write",
@@ -70,7 +88,7 @@ impl Handle {
         )
         .entered();
 
-        let path = self.resolve_path(path.as_ref())?;
+        let path = self.resolve_path(path)?;
 
         // 0.5.0: route Method::Mmap through the mmap atomic-replace
         // path when the payload is suitable. Sub-page payloads (and
@@ -86,83 +104,15 @@ impl Handle {
             self.update_active_method(Method::Sync);
         }
 
-        let temp = Self::gen_temp_path(&path);
-
-        // Step 1: open the temp file.
-        let (file, direct_ok) =
-            platform::open_write_new(&temp, self.use_direct()).map_err(|e| {
-                Error::AtomicReplaceFailed {
-                    step: "open_temp",
-                    source: as_io_error(e),
-                }
-            })?;
-
-        if self.use_direct() && !direct_ok {
-            self.update_active_method(Method::Data);
-        }
-
-        // Step 2: write data.
-        let write_result = if direct_ok {
-            self.direct_write(&file, &path, data)
-        } else {
-            platform::write_all(&file, data)
-        };
-        if let Err(e) = write_result {
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "write",
-                source: as_io_error(e),
-            });
-        }
-
-        if direct_ok {
-            // Step 3 (Direct IO path): FILE_FLAG_NO_BUFFERING /
-            // O_DIRECT writes are sector-padded. Truncate to the
-            // actual data length on the SAME open file handle —
-            // `set_len` on the original `file` calls `ftruncate`
-            // (Unix) or `SetFilePointerEx + SetEndOfFile` (Windows).
-            // Both work regardless of the open flags. Earlier
-            // versions dropped the file and reopened buffered just
-            // to call `set_len` — that wasted two syscalls
-            // (close + open) per Direct write. (0.8.0 I-checkpoint
-            // perf fix.)
-            if let Err(e) = file.set_len(data.len() as u64) {
-                drop(file);
-                let _ = std::fs::remove_file(&temp);
-                return Err(Error::AtomicReplaceFailed {
-                    step: "truncate",
-                    source: e,
-                });
-            }
-            drop(file);
-        } else {
-            // Step 3 (Buffered path): explicit flush for durability.
-            let flush_result = self.flush_file(&file, false);
-            if let Err(e) = flush_result {
-                let _ = std::fs::remove_file(&temp);
-                return Err(Error::AtomicReplaceFailed {
-                    step: "flush",
-                    source: as_io_error(e),
-                });
-            }
-
-            // Step 4: close before rename.
-            drop(file);
-        }
-
-        // Step 5: atomic rename.
-        if let Err(e) = platform::atomic_rename(&temp, &path) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "rename",
-                source: as_io_error(e),
-            });
-        }
-
-        // Step 6: sync parent dir (no-op on Windows; best-effort on others).
-        let _ = platform::sync_parent_dir(&path);
-
-        Ok(())
+        atomic_replace(
+            &path,
+            data,
+            &self.replace_plan(),
+            &SoloHooks {
+                handle: self,
+                target: &path,
+            },
+        )
     }
 
     /// Appends `data` to `path`, creating the file if it does not exist.
@@ -189,9 +139,9 @@ impl Handle {
     /// **What "copy" means here:** this is *not* a file-to-file copy
     /// operation (no source path argument). It is a write that
     /// **copies the existing target's metadata onto the new payload
-    /// before swapping it in** — mode, ACLs, ownership, timestamps. If
-    /// you need a real file-to-file copy, use
-    /// [`std::fs::copy`]; fsys does not provide one.
+    /// before swapping it in**: mode, ACLs, ownership, timestamps. For
+    /// a file-to-file copy use [`Handle::copy`] or
+    /// [`Handle::copy_batch`].
     ///
     /// Implemented as **atomic swap only** — the file at `path` is
     /// either entirely-old or entirely-new at every observable point.
@@ -200,11 +150,13 @@ impl Handle {
     /// existing metadata where the OS supports it and the calling
     /// process has permission:
     ///
-    /// - **Unix:** mode is preserved unconditionally; owner/group is
-    ///   preserved only when the process has `CAP_CHOWN` or
-    ///   equivalent (silently skipped otherwise).
-    /// - **Windows:** ACLs are preserved via `GetSecurityInfo` /
-    ///   `SetSecurityInfo`.
+    /// - **Unix:** mode (including setuid / setgid) is preserved
+    ///   unconditionally; owner/group is preserved only when the
+    ///   process has `CAP_CHOWN` or equivalent (silently skipped
+    ///   otherwise).
+    /// - **Windows:** the DACL is preserved via `GetNamedSecurityInfoW`
+    ///   / `SetNamedSecurityInfoW`; owner / group are copied when the
+    ///   process may set them (silently skipped otherwise).
     /// - **All platforms:** `mtime` and `atime` are preserved.
     ///
     /// If `path` does not exist, `write_copy` behaves identically to
@@ -247,87 +199,36 @@ impl Handle {
         //    with default permissions (the same as `write`).
         let existing_meta = std::fs::metadata(&path).ok();
 
-        // 2. Build the staging file via the same atomic-replace
-        //    primitives as `write`. We do not call `self.write`
-        //    directly because we need access to the staging path
-        //    before the rename in order to apply metadata.
-        let temp = Self::gen_temp_path(&path);
-        let (file, direct_ok) =
-            platform::open_write_new(&temp, self.use_direct()).map_err(|e| {
-                Error::AtomicReplaceFailed {
-                    step: "open_temp",
-                    source: as_io_error(e),
-                }
-            })?;
-
-        if self.use_direct() && !direct_ok {
-            self.update_active_method(Method::Data);
-        }
-
-        let write_result = if direct_ok {
-            self.direct_write(&file, &path, data)
-        } else {
-            platform::write_all(&file, data)
-        };
-        if let Err(e) = write_result {
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "write",
-                source: as_io_error(e),
-            });
-        }
-
-        if direct_ok {
-            drop(file);
-            if let Err(e) = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&temp)
-                .and_then(|f| f.set_len(data.len() as u64))
-            {
-                let _ = std::fs::remove_file(&temp);
-                return Err(Error::AtomicReplaceFailed {
-                    step: "truncate",
-                    source: e,
-                });
-            }
-        } else {
-            let flush_result = self.flush_file(&file, false);
-            if let Err(e) = flush_result {
-                let _ = std::fs::remove_file(&temp);
-                return Err(Error::AtomicReplaceFailed {
-                    step: "flush",
-                    source: as_io_error(e),
-                });
-            }
-            drop(file);
-        }
-
-        // 3. Apply preserved metadata to the staging file BEFORE
-        //    the rename, so that the rename is the single
-        //    observable transition.
-        if let Some(meta) = existing_meta.as_ref() {
-            apply_preserved_metadata(&temp, &path, meta);
-        }
-
-        // 4. Atomic rename.
-        if let Err(e) = platform::atomic_rename(&temp, &path) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "rename",
-                source: as_io_error(e),
-            });
-        }
-
-        let _ = platform::sync_parent_dir(&path);
-        Ok(())
+        // 2. Run the shared atomic-replace sequence; the preserved
+        //    metadata is applied to the staging file before the
+        //    rename, so that the rename is the single observable
+        //    transition.
+        atomic_replace(
+            &path,
+            data,
+            &self.replace_plan(),
+            &WriteCopyHooks {
+                solo: SoloHooks {
+                    handle: self,
+                    target: &path,
+                },
+                existing: existing_meta.as_ref(),
+            },
+        )
     }
 
     /// Writes `data` at byte `offset` in `path`.
     ///
     /// Direct IO is NOT used for positioned writes because arbitrary offsets
     /// require a read-modify-write cycle at the sector boundary, which
-    /// removes the performance benefit of Direct IO. The write is buffered
-    /// and uses the standard sync primitive for this handle's method.
+    /// removes the performance benefit of Direct IO. The write is buffered.
+    ///
+    /// Like [`Handle::append`], the write is **not** flushed and is not
+    /// crash-atomic: a power cut can lose it or leave the range partly
+    /// updated. Call [`Handle::sync`] after a series of positioned writes
+    /// when they must be durable; that issues the handle's durability
+    /// primitive once for all of them. The file is created if it does
+    /// not exist.
     ///
     /// # Errors
     ///
@@ -352,7 +253,21 @@ impl Handle {
     /// - [`Error::InvalidPath`] if `path` escapes the handle root.
     /// - [`Error::Io`] on any IO error.
     pub fn read(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
-        let path = self.resolve_path(path.as_ref())?;
+        let Some(observer) = self.observer.as_deref() else {
+            return self.read_unobserved(path.as_ref());
+        };
+        let start = std::time::Instant::now();
+        let result = self.read_unobserved(path.as_ref());
+        observer.on_handle_read(crate::observer::HandleReadEvent {
+            bytes_read: result.as_ref().map_or(0, |v| v.len() as u64),
+            duration: start.elapsed(),
+            error: result.is_err(),
+        });
+        result
+    }
+
+    fn read_unobserved(&self, path: &Path) -> Result<Vec<u8>> {
+        let path = self.resolve_path(path)?;
 
         // 0.5.0: Method::Mmap reads consult metadata first to check
         // suitability. Files smaller than the page size, zero-byte
@@ -376,7 +291,11 @@ impl Handle {
         }
 
         if direct_ok {
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            // Size of the file that was opened, not of whatever the
+            // path names now: a concurrent atomic replace must not mix
+            // one file's length with another file's bytes, and a stat
+            // failure must not turn into an empty read.
+            let size = file.metadata().map_err(Error::Io)?.len();
             self.direct_read(&file, size)
         } else {
             platform::read_all(&file)
@@ -386,7 +305,9 @@ impl Handle {
     /// Reads `len` bytes from `path` starting at byte `offset`.
     ///
     /// If fewer than `len` bytes are available (EOF), the returned `Vec`
-    /// will be shorter than `len`.
+    /// will be shorter than `len`. `len` is clamped to the bytes the
+    /// file holds past `offset` when it is opened, so a large `len`
+    /// (up to `usize::MAX`) never allocates more than the file size.
     ///
     /// Symmetric with [`Handle::write_at`] — both target a positioned
     /// IO operation. Renamed from `read_range` in `0.7.0` per the
@@ -400,6 +321,14 @@ impl Handle {
     pub fn read_at(&self, path: impl AsRef<Path>, offset: u64, len: usize) -> Result<Vec<u8>> {
         let path = self.resolve_path(path.as_ref())?;
         let (file, _) = platform::open_read(&path, false)?;
+        // Clamp to what the opened file actually holds past `offset`
+        // so the read buffer is sized by the file, not by the caller.
+        let size = file.metadata().map_err(Error::Io)?.len();
+        let available = size.saturating_sub(offset);
+        let len = usize::try_from(available).map_or(len, |avail| len.min(avail));
+        if len == 0 {
+            return Ok(Vec::new());
+        }
         platform::read_range(&file, offset, len)
     }
 
@@ -412,6 +341,11 @@ impl Handle {
     /// This operation is **idempotent**: if the file does not exist,
     /// `Ok(())` is returned.
     ///
+    /// After a successful unlink the parent directory is synced
+    /// (`fsync` on Linux / macOS; implicit on Windows), so the removal
+    /// survives a crash once this call returns. The directory sync is
+    /// best-effort: the unlink has already happened when it runs.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidPath`] if `path` escapes the handle root.
@@ -419,7 +353,10 @@ impl Handle {
     pub fn delete(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = self.resolve_path(path.as_ref())?;
         match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                let _ = super::sync_parent(&path);
+                Ok(())
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(Error::Io(e)),
         }
@@ -455,13 +392,25 @@ impl Handle {
     // Copy and metadata
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// Copies `src` to `dst` using a platform-optimised copy primitive.
+    /// Copies `src` to `dst` using the platform's fastest copy
+    /// primitive, returning the number of bytes copied.
     ///
-    /// Currently routes through `std::fs::copy`. Linux
-    /// `copy_file_range(2)` and macOS `clonefile(2)` reflink
-    /// optimisations are filed for a future release (deferred from
-    /// the originally-planned `0.5.0` slot; not part of the `0.6.0`
-    /// scope).
+    /// - **Linux:** `std::fs::copy`, which uses `copy_file_range(2)`
+    ///   (block sharing on filesystems that support it, such as btrfs
+    ///   and XFS with reflink) and falls back to `sendfile` / a
+    ///   buffered copy.
+    /// - **macOS:** `clonefile(2)` copy-on-write clone on APFS when
+    ///   `dst` does not exist yet; otherwise `std::fs::copy`.
+    /// - **Windows:** `FSCTL_DUPLICATE_EXTENTS_TO_FILE` block clone on
+    ///   ReFS; otherwise `std::fs::copy` (`CopyFileExW`).
+    ///
+    /// **Not atomic and not flushed.** `dst` is created or overwritten
+    /// in place: a concurrent reader or a crash mid-copy can observe a
+    /// partially written `dst`, and the copied bytes are not fenced.
+    /// Call [`Handle::sync`] on `dst` when the copy must be durable, or
+    /// use [`Handle::copy_batch`], which publishes `dst` through the
+    /// atomic-replace sequence (at the cost of reading the source into
+    /// memory).
     ///
     /// # Errors
     ///
@@ -527,98 +476,120 @@ impl Handle {
     // Durability helpers
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// Flushes the OS write buffers for an open file.
+    /// Flushes the file at `path` to stable storage.
     ///
-    /// The exact primitive depends on the handle's active method:
-    /// - `Sync`: full fsync (data + metadata).
-    /// - `Data`: fdatasync on Linux, full sync elsewhere.
-    /// - `Direct`: no separate flush (data is already on media).
+    /// Use it after [`Handle::append`] or [`Handle::write_at`], which
+    /// do not flush on their own. The primitive depends on the handle's
+    /// active method:
+    /// - `Data`: `fdatasync` on Linux, `F_FULLFSYNC` on macOS,
+    ///   `FlushFileBuffers` on Windows.
+    /// - every other method: `fsync` on Linux, `F_FULLFSYNC` on macOS,
+    ///   `FlushFileBuffers` on Windows.
+    ///
+    /// The file must already exist; `sync` never creates it. On Unix it
+    /// is opened read-only (`fsync` does not need write access), so a
+    /// file the process may only read can still be flushed. Windows'
+    /// `FlushFileBuffers` requires write access, so there the file is
+    /// opened for writing (without truncation).
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] if the flush syscall fails.
+    /// - [`Error::InvalidPath`] if `path` escapes the handle root.
+    /// - [`Error::Io`] if the file does not exist, cannot be opened, or
+    ///   the flush fails.
     pub fn sync(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = self.resolve_path(path.as_ref())?;
-        let (file, _) = platform::open_write_at(&path).map(|f| (f, false))?;
-        self.flush_file(&file, false)
+        #[cfg(not(windows))]
+        let file = std::fs::File::open(&path).map_err(Error::Io)?;
+        #[cfg(windows)]
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(Error::Io)?;
+        match self.active_method() {
+            Method::Data => platform::sync_data(&file),
+            _ => platform::sync_full(&file),
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
     // Internal
     // ──────────────────────────────────────────────────────────────────────────
 
-    fn flush_file(&self, file: &std::fs::File, is_direct: bool) -> Result<()> {
-        match self.active_method() {
-            Method::Direct if is_direct => {
-                // On Windows, FILE_FLAG_WRITE_THROUGH already flushed on each
-                // write. On Linux/macOS, issue fdatasync / F_FULLFSYNC.
-                #[cfg(not(target_os = "windows"))]
-                {
-                    platform::sync_data(file)
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    Ok(())
-                }
-            }
-            Method::Data => platform::sync_data(file),
-            _ => platform::sync_full(file),
+    /// Builds the atomic-replace plan for this handle's current
+    /// method.
+    fn replace_plan(&self) -> ReplacePlan {
+        ReplacePlan {
+            use_direct: self.use_direct(),
+            flush: BufferedFlush::for_method(self.active_method()),
+            sync_parent: true,
         }
     }
 
-    /// Direct-IO write helper.
+    /// Direct-IO write of a fresh temp file, leaving it durable at
+    /// exactly `data.len()` bytes.
     ///
-    /// On Linux, routes through the per-handle `io_uring` ring when
-    /// available. On `io_uring_setup(2)` rejection (cached on the
-    /// Handle as `Disabled`), or when the ring path errors at
-    /// runtime, falls through to the existing `O_DIRECT`+`pwrite`
-    /// path. On macOS / Windows / unknown, always uses the existing
-    /// platform `write_all_direct`.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(clippy::needless_pass_by_value, unused_imports)
-    )]
-    fn direct_write(&self, file: &std::fs::File, path: &Path, data: &[u8]) -> Result<()> {
+    /// Sequence: sector-padded write, trim to the real length on the
+    /// same handle, then the durability fence. `O_DIRECT` and
+    /// `F_NOCACHE` only bypass the page cache; neither makes the bytes
+    /// durable, so the fence is required before the caller renames the
+    /// temp file into place. The fence runs after the trim so the
+    /// length that the rename publishes is the one on stable storage.
+    ///
+    /// On Linux the per-handle `io_uring` ring is used when available
+    /// (linked write + `fdatasync`, or NVMe passthrough flush). When
+    /// the ring is unavailable or fails at runtime, the platform
+    /// `pwrite` path runs and rewrites the file from offset 0.
+    ///
+    /// On error, returns the atomic-replace step name that failed
+    /// together with the underlying error.
+    fn direct_write_durable(&self, file: &std::fs::File, path: &Path, data: &[u8]) -> StepResult {
         #[cfg(target_os = "linux")]
         {
-            use std::os::fd::AsRawFd;
             if let Some(ring) = self.io_uring_ring() {
                 // Probe NVMe passthrough capability lazily on the
                 // file fd's underlying block device. Returns None
                 // for non-NVMe devices, missing privileges, or when
                 // FSYS_DISABLE_NVME_PASSTHROUGH=1 is set.
-                let nvme = self.nvme_access(file.as_raw_fd());
+                let nvme = self.nvme_access(file);
                 let nvme_ref = nvme.as_deref();
-                if iouring_write_direct(&ring, file, data, self.sector_size(), nvme_ref).is_ok() {
+                let sector = self.sector_size();
+                let needs_trim = needs_trim(data.len(), sector);
+                if let Ok(fenced) =
+                    iouring_write_direct(&ring, file, data, sector, nvme_ref, !needs_trim)
+                {
+                    if needs_trim {
+                        file.set_len(data.len() as u64)
+                            .map_err(|e| ("truncate", Error::Io(e)))?;
+                    }
+                    if !fenced {
+                        iouring_fence(&ring, file, nvme_ref).map_err(|e| ("flush", e))?;
+                    }
                     return Ok(());
                 }
-                // Ring submit failed at runtime — surface the
-                // `pwrite` path's error so the caller observes a
-                // single, comparable error class regardless of which
-                // path produced it.
+                // Ring submit failed at runtime. Fall through to the
+                // `pwrite` path so the caller observes a single,
+                // comparable error class regardless of which path
+                // produced it.
             }
         }
-        let result = platform::write_all_direct(file, data, self.sector_size());
+
+        write_direct_durable_platform(file, data, self.sector_size())?;
 
         // Windows: when NVMe passthrough is available, issue a
         // controller-level FLUSH after the WRITE_THROUGH write. This
         // is redundant durability (WRITE_THROUGH already flushes per
         // write) but exercises the IOCTL path and surfaces it via
-        // `active_durability_primitive()`. Performance certification
-        // (F-9) decides whether to drop WRITE_THROUGH when the
-        // IOCTL is active.
+        // `active_durability_primitive()`.
         #[cfg(target_os = "windows")]
-        if result.is_ok() {
-            if let Some(access) = self.nvme_access_win(path) {
-                // Best-effort: ignore NVMe FLUSH errors at runtime —
-                // WRITE_THROUGH already provided durability. We log
-                // at the metrics placeholder later (F-1) if/when the
-                // metrics layer lands.
-                let _ = crate::platform::windows_nvme::nvme_flush(&access);
-            }
+        if let Some(access) = self.nvme_access_win(file, path) {
+            // Best-effort: WRITE_THROUGH already provided durability,
+            // so a failed controller flush does not fail the write.
+            let _ = crate::platform::windows_nvme::nvme_flush(&access);
         }
-        let _ = path; // path is unused on Linux; consumed on Windows above.
-        result
+        #[cfg(not(target_os = "windows"))]
+        let _ = path;
+        Ok(())
     }
 
     /// Direct-IO read helper. Mirror of [`direct_write`].
@@ -639,6 +610,98 @@ impl Handle {
     }
 }
 
+/// Atomic-replace hooks for solo-lane writes: Direct writes use the
+/// handle's `io_uring` ring and NVMe passthrough state, and a refused
+/// Direct open downgrades the handle's active method to `Data`.
+struct SoloHooks<'a> {
+    handle: &'a Handle,
+    target: &'a Path,
+}
+
+impl ReplaceHooks for SoloHooks<'_> {
+    fn direct_refused(&self) {
+        self.handle.update_active_method(Method::Data);
+    }
+
+    fn write_direct_durable(&self, file: &std::fs::File, data: &[u8]) -> StepResult {
+        self.handle.direct_write_durable(file, self.target, data)
+    }
+}
+
+/// [`SoloHooks`] plus the `write_copy` metadata step.
+struct WriteCopyHooks<'a> {
+    solo: SoloHooks<'a>,
+    existing: Option<&'a std::fs::Metadata>,
+}
+
+impl ReplaceHooks for WriteCopyHooks<'_> {
+    fn direct_refused(&self) {
+        self.solo.direct_refused();
+    }
+
+    fn write_direct_durable(&self, file: &std::fs::File, data: &[u8]) -> StepResult {
+        self.solo.write_direct_durable(file, data)
+    }
+
+    fn before_rename(&self, temp: &Path) -> StepResult {
+        match self.existing {
+            Some(meta) => apply_preserved_metadata(temp, self.solo.target, meta),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Returns `true` when a payload of `len` bytes does not end on a
+/// sector boundary, so the sector-padded Direct write leaves trailing
+/// padding that must be trimmed before the file is published.
+#[inline]
+fn needs_trim(len: usize, sector_size: u32) -> bool {
+    let ss = sector_size.max(1) as usize;
+    len % ss != 0
+}
+
+/// Platform (non-`io_uring`) Direct write of a fresh temp file, leaving
+/// it durable at exactly `data.len()` bytes.
+///
+/// Used by the solo lane when no ring is available and by the group
+/// lane for every Direct op. Sequence: padded `pwrite` / `WriteFile`,
+/// trim to the real length on the same handle, then fence.
+///
+/// - Linux / macOS / other Unix: the fence is [`super::fence_data`]
+///   (`fdatasync` / `F_FULLFSYNC`). `O_DIRECT` and `F_NOCACHE` do not
+///   make data durable on their own.
+/// - Windows: the handle was opened with `FILE_FLAG_WRITE_THROUGH`,
+///   which completes each write (and the end-of-file update made
+///   through the same handle) to stable storage before returning, so
+///   no separate `FlushFileBuffers` is issued.
+///
+/// On error, returns the atomic-replace step name that failed.
+pub(crate) fn write_direct_durable_platform(
+    file: &std::fs::File,
+    data: &[u8],
+    sector_size: u32,
+) -> StepResult {
+    platform::write_all_direct(file, data, sector_size).map_err(|e| ("write", e))?;
+    if needs_trim(data.len(), sector_size) {
+        file.set_len(data.len() as u64)
+            .map_err(|e| ("truncate", Error::Io(e)))?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        super::fence_data(file).map_err(|e| ("flush", e))?;
+    }
+    Ok(())
+}
+
+/// Writes `data` (sector-padded) at offset 0 through the `io_uring`
+/// ring.
+///
+/// When `fuse_fence` is `true` the durability fence is issued as part
+/// of the same submission (linked write + `fdatasync`) or right after
+/// it (NVMe passthrough flush) and the function returns `Ok(true)`.
+/// When `fuse_fence` is `false` (the caller still has to trim padding
+/// before fencing) only the write is issued and the function returns
+/// `Ok(false)`; the caller then runs [`iouring_fence`].
 #[cfg(target_os = "linux")]
 fn iouring_write_direct(
     ring: &crate::platform::linux_iouring::IoUringRing,
@@ -646,22 +709,17 @@ fn iouring_write_direct(
     data: &[u8],
     sector_size: u32,
     nvme: Option<&crate::platform::linux_iouring::NvmeAccess>,
-) -> Result<()> {
+    fuse_fence: bool,
+) -> Result<bool> {
     use std::os::fd::AsRawFd;
 
-    // Empty input — skip the buffer-pool allocation entirely. The
-    // file is already created at size 0 by the caller's `open()`;
-    // we only need the durability fence below.
+    // Empty input: nothing to write. The file was created at size 0
+    // by the caller's `open()`; only the fence remains.
     if data.is_empty() {
-        if let Some(access) = nvme {
-            crate::platform::linux_iouring::nvme_flush_ioctl(
-                access.char_dev.as_raw_fd(),
-                access.nsid,
-            )?;
-        } else {
-            ring.fdatasync(file.as_raw_fd())?;
+        if fuse_fence {
+            iouring_fence(ring, file, nvme)?;
         }
-        return Ok(());
+        return Ok(fuse_fence);
     }
 
     let ss = sector_size as usize;
@@ -671,47 +729,59 @@ fn iouring_write_direct(
 
     // O_DIRECT minimises cache effects but does not imply durability.
     // The atomic-replace contract requires the bytes to be on stable
-    // storage before the rename. Three paths:
+    // storage before the rename. Fence options:
     //
     // 1. NVMe passthrough flush (locked decision D-2). Sends NVMe
     //    FLUSH (opcode 0x00) directly to the controller via the
-    //    legacy `NVME_IOCTL_IO_CMD` ioctl. Bypasses the kernel's
-    //    fsync path entirely — the controller flushes its volatile
-    //    write cache and acknowledges. Requires NVMe hardware +
-    //    `CAP_SYS_ADMIN`-level access. Write and flush are
-    //    submitted as separate calls because the NVMe FLUSH is an
-    //    ioctl on a different fd (`/dev/nvmeX`), not an io_uring
-    //    SQE — linking is not applicable.
-    // 2. **0.9.4 linked write+fsync (`IOSQE_IO_LINK`).** When NVMe
-    //    passthrough is unavailable, submit Write + Fsync(DATASYNC)
-    //    as a linked SQE chain in one `io_uring_enter(2)` round-
-    //    trip instead of two. Halves the syscall-entry cost of the
-    //    durable-write path; kernel batches both completions in a
-    //    single submit-and-wait.
-    // 3. Standard fallback when the linked submission cannot be
-    //    used (e.g. SQ queue full at link time): write + fdatasync
-    //    as separate calls (the 0.5.1 path).
-    if let Some(access) = nvme {
-        let n = ring.write_at(file.as_raw_fd(), buf.as_slice(), 0)?;
-        if n != aligned_len {
-            return Err(Error::Io(std::io::Error::other(
-                "io_uring short write on Direct path",
-            )));
-        }
-        crate::platform::linux_iouring::nvme_flush_ioctl(access.char_dev.as_raw_fd(), access.nsid)?;
-    } else {
-        // 0.9.4: linked write + fsync. The owner thread pushes
-        // both SQEs with IOSQE_IO_LINK and waits for both CQEs;
-        // halves the durability syscall round-trip vs the
-        // pre-0.9.4 two-submit path.
+    //    legacy `NVME_IOCTL_IO_CMD` ioctl. The flush is an ioctl on a
+    //    different fd (`/dev/nvmeX`), so it cannot be linked to the
+    //    write SQE. It flushes the device cache only; filesystem
+    //    metadata for the new file (extents, length) is committed by
+    //    the parent-directory fsync that follows the rename.
+    // 2. Linked write + Fsync(DATASYNC) (`IOSQE_IO_LINK`, 0.9.4) in
+    //    one `io_uring_enter(2)` round-trip.
+    // 3. Unfused: write now, fence after the caller trims padding.
+    if fuse_fence && nvme.is_none() {
         let n = ring.write_at_linked_fsync(file.as_raw_fd(), buf.as_slice(), 0)?;
         if n != aligned_len {
             return Err(Error::Io(std::io::Error::other(
                 "io_uring short write on Direct path (linked write+fsync)",
             )));
         }
+        #[cfg(test)]
+        super::fence_probe::record_fence();
+        return Ok(true);
     }
-    Ok(())
+    let n = ring.write_at(file.as_raw_fd(), buf.as_slice(), 0)?;
+    if n != aligned_len {
+        return Err(Error::Io(std::io::Error::other(
+            "io_uring short write on Direct path",
+        )));
+    }
+    if fuse_fence {
+        iouring_fence(ring, file, nvme)?;
+    }
+    Ok(fuse_fence)
+}
+
+/// Durability fence for the `io_uring` Direct path: NVMe passthrough
+/// flush when available, otherwise `fdatasync` through the ring.
+#[cfg(target_os = "linux")]
+fn iouring_fence(
+    ring: &crate::platform::linux_iouring::IoUringRing,
+    file: &std::fs::File,
+    nvme: Option<&crate::platform::linux_iouring::NvmeAccess>,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    #[cfg(test)]
+    super::fence_probe::record_fence();
+    match nvme {
+        Some(access) => crate::platform::linux_iouring::nvme_flush_ioctl(
+            access.char_dev.as_raw_fd(),
+            access.nsid,
+        ),
+        None => ring.fdatasync(file.as_raw_fd()),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -742,39 +812,45 @@ fn iouring_read_direct(
     Ok(out)
 }
 
-// Convert a `crate::Error` to a `std::io::Error` for use in
-// `AtomicReplaceFailed { source: std::io::Error }`.
-fn as_io_error(e: Error) -> std::io::Error {
-    match e {
-        Error::Io(io_err) => io_err,
-        other => std::io::Error::other(other.to_string()),
-    }
-}
-
 /// Applies the metadata-preservation set defined for `write_copy`
 /// (locked decision D-8 in `.dev/DECISIONS-0.6.0.md`) to `staging`,
 /// reading source attributes from `target` (the path whose metadata
 /// we want to preserve) and `existing_meta`.
 ///
-/// All operations are best-effort — on Unix, `chown` failures
-/// (typically `EPERM` for non-root processes) are silently skipped
-/// per the locked contract. Same logic on Windows for ACL
-/// application.
-fn apply_preserved_metadata(staging: &Path, target: &Path, existing: &std::fs::Metadata) {
-    apply_preserved_metadata_inner(staging, target, existing);
+/// Each attribute is best-effort: on Unix, `chown` failures (typically
+/// `EPERM` for non-root processes) are silently skipped per the locked
+/// contract; on Windows the owner change is skipped when refused while
+/// the DACL is still applied.
+///
+/// On Unix the staging file is then fsynced so the copied metadata is
+/// durable before the rename publishes the file; that fence is the only
+/// error this function reports (step `flush`). On Windows NTFS journals
+/// the security-descriptor and timestamp changes and the rename is
+/// issued with `MOVEFILE_WRITE_THROUGH`; no separate flush is issued
+/// (`FlushFileBuffers` would need a write handle that the copied DACL
+/// may no longer grant).
+fn apply_preserved_metadata(
+    staging: &Path,
+    target: &Path,
+    existing: &std::fs::Metadata,
+) -> StepResult {
+    apply_preserved_metadata_inner(staging, target, existing)
 }
 
 #[cfg(unix)]
-fn apply_preserved_metadata_inner(staging: &Path, _target: &Path, existing: &std::fs::Metadata) {
+fn apply_preserved_metadata_inner(
+    staging: &Path,
+    _target: &Path,
+    existing: &std::fs::Metadata,
+) -> StepResult {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
-    // Mode — unconditional, identical bits as the existing file.
-    let mode = existing.permissions().mode();
-    let _ = std::fs::set_permissions(staging, std::fs::Permissions::from_mode(mode));
-
-    // Owner / group — only succeeds when the process has CAP_CHOWN
-    // or equivalent. Silently skipped on EPERM per D-8.
+    // Owner / group first: an unprivileged chown clears the setuid /
+    // setgid bits on Linux, so applying the mode before the owner
+    // would lose them. Only succeeds when the process has CAP_CHOWN or
+    // equivalent (or the ids already match); silently skipped on EPERM
+    // per D-8.
     let uid = existing.uid();
     let gid = existing.gid();
     if let Ok(c_path) = std::ffi::CString::new(staging.as_os_str().as_encoded_bytes()) {
@@ -786,8 +862,19 @@ fn apply_preserved_metadata_inner(staging: &Path, _target: &Path, existing: &std
         let _ = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
     }
 
+    // Mode, identical bits as the existing file (including setuid /
+    // setgid / sticky, which the chown above may have cleared).
+    let mode = existing.permissions().mode();
+    let _ = std::fs::set_permissions(staging, std::fs::Permissions::from_mode(mode));
+
     // Timestamps (mtime/atime). Best-effort.
     apply_timestamps_unix(staging, existing);
+
+    // Make the copied metadata durable before the rename. `fsync`
+    // works on a read-only descriptor, so the copied mode cannot lock
+    // us out.
+    let file = std::fs::File::open(staging).map_err(|e| ("flush", Error::Io(e)))?;
+    super::fence_full(&file).map_err(|e| ("flush", e))
 }
 
 #[cfg(unix)]
@@ -816,13 +903,20 @@ fn apply_timestamps_unix(staging: &Path, existing: &std::fs::Metadata) {
 }
 
 #[cfg(windows)]
-fn apply_preserved_metadata_inner(staging: &Path, target: &Path, existing: &std::fs::Metadata) {
+fn apply_preserved_metadata_inner(
+    staging: &Path,
+    target: &Path,
+    existing: &std::fs::Metadata,
+) -> StepResult {
+    // Timestamps first: they need a write handle, which the copied
+    // DACL may no longer grant.
     apply_timestamps_windows(staging, existing);
     // ACL preservation: copy the security descriptor from `target`
     // to `staging` via GetNamedSecurityInfoW / SetNamedSecurityInfoW.
     // Best-effort — failures are silent per D-8 (matching the
     // Unix chown-on-EPERM contract).
     apply_acls_windows(target, staging);
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -929,18 +1023,40 @@ fn apply_acls_windows(target: &Path, staging: &Path) {
         return;
     }
 
-    // SAFETY: `staging_w` is NUL-terminated UTF-16; owner/group/dacl
-    // were populated by GetNamedSecurityInfoW above and remain valid
-    // until we LocalFree(sd). SetNamedSecurityInfoW returns an error
-    // code on failure rather than panicking.
+    // The DACL and the owner / group are applied in two calls. Setting
+    // another owner usually needs SeRestorePrivilege; when that is
+    // refused, one combined call would also drop the DACL and leave the
+    // file with default permissions. The DACL goes first, while this
+    // process still owns the new file (an owner can always change the
+    // DACL); the owner / group change is then best-effort.
+    //
+    // SAFETY: `staging_w` is NUL-terminated UTF-16; `dacl` was
+    // populated by GetNamedSecurityInfoW above and stays valid until we
+    // LocalFree(sd). The owner / group arguments are null and ignored
+    // for DACL_SECURITY_INFORMATION. SetNamedSecurityInfoW reports
+    // failure through its return code.
     let _ = unsafe {
         SetNamedSecurityInfoW(
             staging_w.as_ptr() as *mut u16,
             SE_FILE_OBJECT,
-            info_flags,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: as above; `owner` / `group` were populated by
+    // GetNamedSecurityInfoW and stay valid until LocalFree(sd). The
+    // DACL argument is null and ignored for OWNER / GROUP information.
+    let _ = unsafe {
+        SetNamedSecurityInfoW(
+            staging_w.as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION,
             owner,
             group,
-            dacl,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
     };
@@ -951,9 +1067,14 @@ fn apply_acls_windows(target: &Path, staging: &Path) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn apply_preserved_metadata_inner(_staging: &Path, _target: &Path, _existing: &std::fs::Metadata) {
+fn apply_preserved_metadata_inner(
+    _staging: &Path,
+    _target: &Path,
+    _existing: &std::fs::Metadata,
+) -> StepResult {
     // Unsupported platform — no-op. The atomic-rename contract still
     // holds; we just don't preserve metadata.
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1045,6 +1166,48 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_syncs_parent_directory() {
+        let path = tmp_path("delete_dir_sync");
+        let h = handle();
+        h.write(&path, b"x").expect("write");
+        let before = super::super::fence_probe::dir_syncs();
+        h.delete(&path).expect("delete");
+        assert_eq!(super::super::fence_probe::dir_syncs(), before + 1);
+    }
+
+    #[test]
+    fn test_sync_missing_file_errors_without_creating_it() {
+        let path = tmp_path("sync_missing");
+        let _g = TmpFile(path.clone());
+        match handle().sync(&path) {
+            Err(crate::Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        assert!(!path.exists(), "sync must not create the file");
+    }
+
+    #[test]
+    fn test_sync_flushes_existing_file() {
+        let path = tmp_path("sync_existing");
+        let _g = TmpFile(path.clone());
+        let h = handle();
+        h.append(&path, b"abc").expect("append");
+        h.sync(&path).expect("sync");
+        assert_eq!(std::fs::read(&path).expect("read"), b"abc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sync_works_on_read_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_path("sync_read_only");
+        let _g = TmpFile(path.clone());
+        std::fs::write(&path, b"ro").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+        handle().sync(&path).expect("sync of a read-only file");
+    }
+
+    #[test]
     fn test_exists_reflects_state() {
         let path = tmp_path("exists");
         let _g = TmpFile(path.clone());
@@ -1073,6 +1236,278 @@ mod tests {
         h.write(&src, b"copy content").expect("write src");
         let _bytes = h.copy(&src, &dst).expect("copy");
         assert_eq!(std::fs::read(&dst).expect("read dst"), b"copy content");
+    }
+
+    fn direct_handle() -> crate::handle::Handle {
+        Builder::new()
+            .method(Method::Direct)
+            .build()
+            .expect("build direct handle")
+    }
+
+    fn patterned(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn test_direct_write_unaligned_length_reads_back_exactly() {
+        // A payload that does not end on a sector boundary is padded
+        // for the Direct write and must be trimmed back before the
+        // rename publishes it.
+        for len in [0usize, 1, 511, 1000, 4097] {
+            let path = tmp_path("direct_unaligned");
+            let _g = TmpFile(path.clone());
+            let h = direct_handle();
+            let payload = patterned(len);
+            h.write(&path, &payload).expect("direct write");
+            assert_eq!(
+                std::fs::read(&path).expect("read back"),
+                payload,
+                "len {len}"
+            );
+        }
+    }
+
+    // Windows Direct writes use FILE_FLAG_WRITE_THROUGH, which makes
+    // each write durable on return; no separate fence is issued there.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_direct_write_fences_before_rename() {
+        let path = tmp_path("direct_fence");
+        let _g = TmpFile(path.clone());
+        let h = direct_handle();
+        let payload = patterned(1000);
+        let before = super::super::fence_probe::count();
+        h.write(&path, &payload).expect("direct write");
+        assert!(
+            super::super::fence_probe::count() > before,
+            "a Direct write must fence the temp file before the rename"
+        );
+        assert_eq!(std::fs::read(&path).expect("read back"), payload);
+    }
+
+    // Exercises the platform `pwrite` path that runs when the kernel
+    // has no usable `io_uring` (old kernels, seccomp, containers).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_direct_write_without_io_uring_fences_before_rename() {
+        let path = tmp_path("direct_fence_no_ring");
+        let _g = TmpFile(path.clone());
+        let h = direct_handle();
+        h.disable_io_uring_for_test();
+        for len in [4096usize, 1000] {
+            let payload = patterned(len);
+            let before = super::super::fence_probe::count();
+            h.write(&path, &payload).expect("direct write");
+            assert!(
+                super::super::fence_probe::count() > before,
+                "pwrite-path Direct write of {len} bytes must fence"
+            );
+            assert_eq!(std::fs::read(&path).expect("read back"), payload);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_write_copy_direct_fences_before_rename() {
+        let path = tmp_path("direct_copy_fence");
+        let _g = TmpFile(path.clone());
+        std::fs::write(&path, b"old").expect("seed");
+        let h = direct_handle();
+        let payload = patterned(700);
+        let before = super::super::fence_probe::count();
+        h.write_copy(&path, &payload).expect("write_copy");
+        assert!(super::super::fence_probe::count() > before);
+        assert_eq!(std::fs::read(&path).expect("read back"), payload);
+    }
+
+    #[test]
+    fn test_direct_read_returns_exact_contents() {
+        let h = direct_handle();
+        for len in [0usize, 1, 1000, 4096, 5000] {
+            let path = tmp_path("direct_read");
+            let _g = TmpFile(path.clone());
+            let payload = patterned(len);
+            std::fs::write(&path, &payload).expect("seed");
+            assert_eq!(h.read(&path).expect("direct read"), payload, "len {len}");
+        }
+    }
+
+    // Replacing a file that another handle holds open is refused on
+    // Windows (no FILE_SHARE_DELETE), so the race is Unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn test_direct_read_is_consistent_under_concurrent_replace() {
+        // Before 1.1.1 the Direct read sized its buffer from a
+        // path-based stat taken after the open; a concurrent replace
+        // could pair one file's length with the other file's bytes.
+        let path = tmp_path("direct_read_race");
+        let _g = TmpFile(path.clone());
+        let small = vec![b'a'; 1000];
+        let large = vec![b'b'; 9000];
+        std::fs::write(&path, &small).expect("seed");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            let (path, small, large) = (path.clone(), small.clone(), large.clone());
+            std::thread::spawn(move || {
+                let h = handle();
+                let mut flip = false;
+                while !stop.load(Ordering::Relaxed) {
+                    let data = if flip { &small } else { &large };
+                    let _ = h.write(&path, data);
+                    flip = !flip;
+                }
+            })
+        };
+        let h = direct_handle();
+        // Exercise the platform `pread` path; the `io_uring` path is
+        // covered by `test_direct_ops_on_one_handle_hit_the_right_files`.
+        #[cfg(target_os = "linux")]
+        h.disable_io_uring_for_test();
+        for _ in 0..400 {
+            let got = h.read(&path).expect("direct read");
+            assert!(
+                got == small || got == large,
+                "torn read of {} bytes (a={}, b={}, zero={})",
+                got.len(),
+                got.iter().filter(|&&x| x == b'a').count(),
+                got.iter().filter(|&&x| x == b'b').count(),
+                got.iter().filter(|&&x| x == 0).count()
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("writer thread");
+    }
+
+    // On Linux the io_uring ring caches fixed-file slots by raw fd
+    // number (`platform/linux_iouring.rs`, `FdRegistry`). Once a temp
+    // file's fd is closed and the number is reused by the next open,
+    // the ring keeps addressing the old file, so the second Direct
+    // write lands in the first file. The fix belongs to the io_uring
+    // track; this test documents the expected behaviour.
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "FS-C1: io_uring fixed-file slot reuse, fixed on fix/uring"
+    )]
+    #[test]
+    fn test_direct_ops_on_one_handle_hit_the_right_files() {
+        let h = direct_handle();
+        let a = tmp_path("one_handle_a");
+        let b = tmp_path("one_handle_b");
+        let _ga = TmpFile(a.clone());
+        let _gb = TmpFile(b.clone());
+        h.write(&a, &[b'A'; 4096]).expect("write a");
+        h.write(&b, &[b'B'; 4096]).expect("write b");
+        assert_eq!(std::fs::read(&a).expect("read a"), vec![b'A'; 4096]);
+        assert_eq!(std::fs::read(&b).expect("read b"), vec![b'B'; 4096]);
+        assert_eq!(h.read(&a).expect("direct read a"), vec![b'A'; 4096]);
+        assert_eq!(h.read(&b).expect("direct read b"), vec![b'B'; 4096]);
+    }
+
+    #[derive(Debug, Default)]
+    struct OpCounter {
+        writes: AtomicU64,
+        write_bytes: AtomicU64,
+        write_errors: AtomicU64,
+        reads: AtomicU64,
+        read_bytes: AtomicU64,
+        read_errors: AtomicU64,
+    }
+
+    impl crate::observer::FsysObserver for OpCounter {
+        fn on_handle_write(&self, e: crate::observer::HandleWriteEvent) {
+            let _ = self.writes.fetch_add(1, Ordering::Relaxed);
+            let _ = self
+                .write_bytes
+                .fetch_add(e.bytes_written, Ordering::Relaxed);
+            let _ = self
+                .write_errors
+                .fetch_add(u64::from(e.error), Ordering::Relaxed);
+        }
+        fn on_handle_read(&self, e: crate::observer::HandleReadEvent) {
+            let _ = self.reads.fetch_add(1, Ordering::Relaxed);
+            let _ = self.read_bytes.fetch_add(e.bytes_read, Ordering::Relaxed);
+            let _ = self
+                .read_errors
+                .fetch_add(u64::from(e.error), Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn test_observer_receives_handle_write_and_read_events() {
+        let counter = std::sync::Arc::new(OpCounter::default());
+        let h = Builder::new()
+            .method(Method::Sync)
+            .observer(counter.clone())
+            .build()
+            .expect("build");
+        let path = tmp_path("observer");
+        let _g = TmpFile(path.clone());
+        h.write(&path, b"12345").expect("write");
+        assert_eq!(h.read(&path).expect("read"), b"12345");
+        let missing = tmp_path("observer_missing");
+        assert!(h.read(&missing).is_err());
+        let dir = tmp_path("observer_dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        assert!(h.write(&dir, b"x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(counter.writes.load(Ordering::Relaxed), 2);
+        assert_eq!(counter.write_bytes.load(Ordering::Relaxed), 6);
+        assert_eq!(counter.write_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(counter.reads.load(Ordering::Relaxed), 2);
+        assert_eq!(counter.read_bytes.load(Ordering::Relaxed), 5);
+        assert_eq!(counter.read_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_read_at_huge_len_is_clamped_to_file_size() {
+        // Before 1.1.1 the platform layer allocated `len` bytes up
+        // front, so `usize::MAX` aborted the process on allocation.
+        let path = tmp_path("read_at_huge");
+        let _g = TmpFile(path.clone());
+        let h = handle();
+        h.write(&path, b"0123456789").expect("write");
+        assert_eq!(
+            h.read_at(&path, 0, usize::MAX).expect("read_at"),
+            b"0123456789"
+        );
+        assert_eq!(h.read_at(&path, 7, usize::MAX).expect("read_at"), b"789");
+        assert!(h.read_at(&path, 10, usize::MAX).expect("at EOF").is_empty());
+        assert!(h
+            .read_at(&path, u64::MAX, usize::MAX)
+            .expect("past EOF")
+            .is_empty());
+        assert!(h.read_at(&path, 3, 0).expect("zero len").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_copy_preserves_setuid_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_path("write_copy_suid");
+        let _g = TmpFile(path.clone());
+        std::fs::write(&path, b"old").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4750)).expect("chmod");
+        let h = handle();
+        let before = super::super::fence_probe::count();
+        h.write_copy(&path, b"new").expect("write_copy");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o4750, "setuid lost: {mode:o}");
+        assert_eq!(std::fs::read(&path).expect("read"), b"new");
+        assert!(
+            super::super::fence_probe::count() > before,
+            "copied metadata must be fenced before the rename"
+        );
+    }
+
+    #[test]
+    fn test_write_copy_to_new_path_behaves_like_write() {
+        let path = tmp_path("write_copy_new");
+        let _g = TmpFile(path.clone());
+        handle().write_copy(&path, b"fresh").expect("write_copy");
+        assert_eq!(std::fs::read(&path).expect("read"), b"fresh");
     }
 
     #[test]

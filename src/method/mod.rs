@@ -98,12 +98,14 @@ pub enum Method {
     /// # Platform-specific behavior
     ///
     /// - **Linux:** `fdatasync(2)`.
-    /// - **macOS:** Falls back to [`Sync`](Method::Sync) (`F_FULLFSYNC`).
-    ///   macOS has no `fdatasync` equivalent. `active_method()` will
-    ///   reflect `Sync` after this fallback.
-    /// - **Windows:** Falls back to [`Sync`](Method::Sync)
-    ///   (`FlushFileBuffers`). Windows has no `fdatasync` equivalent.
-    ///   `active_method()` will reflect `Sync` after this fallback.
+    /// - **macOS:** uses `F_FULLFSYNC`, the same primitive as
+    ///   [`Sync`](Method::Sync); macOS has no `fdatasync` equivalent.
+    ///   `active_method()` keeps reporting `Data`; the primitive is
+    ///   visible through
+    ///   [`Handle::active_durability_primitive`](crate::Handle::active_durability_primitive).
+    /// - **Windows:** uses `FlushFileBuffers`, the same primitive as
+    ///   [`Sync`](Method::Sync); Windows has no `fdatasync` equivalent.
+    ///   `active_method()` keeps reporting `Data`.
     Data = 1,
 
     /// Direct IO — bypasses the OS page cache entirely.
@@ -124,8 +126,9 @@ pub enum Method {
     ///   via `io_uring` when the kernel supports it (5.1+); fallback to
     ///   `pwrite(2)` + `fdatasync(2)` when `io_uring_setup` fails.
     ///   Buffer + offset + length alignment to `logical_sector` (typically
-    ///   512 or 4096 bytes) is handled by the per-handle aligned buffer
-    ///   pool.
+    ///   512 or 4096 bytes) is handled internally: the payload is copied
+    ///   into a sector-aligned buffer, zero-padded, and the file is
+    ///   trimmed back to the real length before the fence.
     /// - **macOS:** `fcntl(fd, F_NOCACHE, 1)` after open. Durability via
     ///   `fcntl(fd, F_FULLFSYNC, 0)`. If `F_NOCACHE` fails (rare on some
     ///   HFS+ configurations), falls back to `Sync`.
@@ -149,6 +152,18 @@ pub enum Method {
     /// LSM-tree level files, mmap'd indexes). Not a fit for sequential
     /// streaming writes — use [`Method::Sync`] / [`Method::Data`] /
     /// [`Method::Direct`] for that.
+    ///
+    /// **Concurrent modification during reads.** [`Handle::read`](crate::Handle::read)
+    /// copies the file out of a shared mapping. It is safe alongside
+    /// fsys's atomic-replace writes (which publish a new file instead
+    /// of changing the mapped one), but not alongside in-place
+    /// modification of the same file: `write_at`, `append`,
+    /// `truncate`, `punch_hole`, journals, or another process writing
+    /// it. Concurrent in-place writes can show up in the returned
+    /// bytes, and a concurrent truncation makes the read fault with
+    /// `SIGBUS` (Unix) or an in-page exception (Windows), terminating
+    /// the process. Use another method for files that are modified in
+    /// place while being read.
     Mmap = 3,
 
     /// Intent-log (journal) durability mode.
@@ -194,13 +209,17 @@ pub enum Method {
     /// | Linux + NVMe without io_uring | `Data` |
     /// | Linux + SSD | `Data` |
     /// | Linux + HDD or Unknown | `Sync` |
-    /// | macOS + NVMe | `Direct` |
-    /// | macOS + non-NVMe SSD or Unknown | `Sync` |
-    /// | macOS + HDD | `Sync` |
-    /// | Windows + NVMe | `Direct` |
-    /// | Windows + SSD | `Direct` |
-    /// | Windows + HDD or Unknown | `Sync` |
+    /// | macOS (any drive) | `Sync` |
+    /// | Windows (any drive) | `Sync` |
     /// | Hardware probe failed entirely | `Sync` (universal safety) |
+    ///
+    /// The macOS and Windows hardware probes do not detect the drive
+    /// kind yet (they always report it as unknown), so `Auto` resolves
+    /// to `Sync` there. The ladder already maps a detected NVMe drive
+    /// to `Direct` on both (and a detected SATA SSD to `Direct` on
+    /// Windows) for when those probes land; select [`Method::Direct`]
+    /// explicitly to use it today. `Auto` never selects
+    /// [`Method::Mmap`], [`Method::Journal`] or [`Method::Spdk`].
     ///
     /// PLP detection (0.9.2,
     /// [`Handle::is_plp_protected`](crate::Handle::is_plp_protected))
@@ -248,8 +267,8 @@ pub enum Method {
     /// device binding, IOMMU enablement) are documented in
     /// [`docs/SPDK.md`](https://github.com/jamesgober/fsys-rs/blob/main/docs/SPDK.md).
     ///
-    /// See [`Method::Auto`] for how SPDK enters the auto-resolution
-    /// ladder when the feature is enabled and the system is eligible.
+    /// [`Method::Auto`] never resolves to `Spdk`; it must be selected
+    /// explicitly.
     Spdk = 6,
 }
 

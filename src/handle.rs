@@ -12,18 +12,6 @@
 //! spawned lazily on the first batch submission and shut down cleanly
 //! when the `Handle` is dropped — idle handles cost zero threads.
 
-// rustc 1.95 ICE workaround (extension of the 0.5.1 + 0.7.0
-// `linux_iouring.rs` / `completion_driver.rs` pattern). The
-// `async_iouring_slot: Mutex<AsyncIoUringState>` field references
-// `AsyncIoUring`, which transitively touches `io_uring::IoUring`;
-// the dead-code analysis pass on this module then ICEs with
-// `slice index starts at N but ends at M`. Module-level allow
-// skips the buggy lint without affecting correctness — every
-// public item here is live by definition (it's the public Handle
-// API). Filed as part of the io_uring blocker record in
-// `.dev/DECISIONS-0.5.0.md`.
-#![allow(dead_code)]
-
 use crate::batch::Batch;
 use crate::buffer::AlignedBufferPool;
 use crate::error::BatchError;
@@ -33,9 +21,9 @@ use crate::pipeline::{BatchOp, HandleSnapshot, Pipeline};
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicU8, Ordering};
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU16, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 use crate::platform::linux_iouring::{IoUringRing, NvmeAccess};
@@ -50,63 +38,55 @@ use crate::platform::windows_nvme::NvmeAccess as WinNvmeAccess;
 #[cfg(target_os = "windows")]
 use std::sync::Arc as WinArc;
 
-/// Per-handle io_uring ring slot (Linux only).
+/// A capability probed once per handle, for the first storage device a
+/// Direct op touches.
 ///
-/// Three states:
-/// - `Untried`: no Direct op has run yet; the ring has not been
-///   probed.
-/// - `Active(ring)`: ring construction succeeded; subsequent Direct
-///   ops route through it.
-/// - `Disabled`: ring construction failed (kernel < 5.1, SECCOMP,
-///   container restriction, etc.). Cached so we don't retry on every
-///   op; the Direct path falls through to the existing
-///   `pwrite`+`fdatasync` fallback.
-#[cfg(target_os = "linux")]
-enum IoUringState {
-    Untried,
-    Active(Arc<IoUringRing>),
-    Disabled,
+/// NVMe passthrough flushes a specific controller / volume. Before
+/// 1.1.1 the handle cached the probe result from the first file's
+/// device and then used it for every later file, so writes to another
+/// device were "flushed" on the wrong one. The cache now remembers the
+/// device key (`st_dev` on Linux, the volume serial number on Windows)
+/// it was probed for; ops on any other device get `None` and use the
+/// standard fence for their own file instead.
+///
+/// After the first probe, lookups are a single atomic load (no lock).
+/// Only Linux and Windows have NVMe passthrough paths.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+pub(crate) struct DeviceKeyed<T> {
+    slot: std::sync::OnceLock<(u64, Option<std::sync::Arc<T>>)>,
 }
 
-/// Per-handle NVMe-passthrough capability slot (Linux only).
-///
-/// Same three-state pattern as [`IoUringState`]. The first Direct
-/// op probes via [`crate::platform::linux_iouring::nvme_flush_capable`]
-/// and caches the result. `Active(access)` holds an open
-/// `/dev/nvmeX` handle plus the namespace ID, ready for
-/// `nvme_flush_ioctl` calls. `Disabled` means probing failed; the
-/// Direct path uses `fdatasync` instead.
-#[cfg(target_os = "linux")]
-enum NvmeState {
-    Untried,
-    Active(Arc<NvmeAccess>),
-    Disabled,
-}
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+impl<T> DeviceKeyed<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slot: std::sync::OnceLock::new(),
+        }
+    }
 
-/// Per-handle native async io_uring substrate slot (Linux + async
-/// feature only). Same three-state pattern. Constructed on the
-/// first async Direct op. Once `Disabled`, the substrate caches
-/// the failure and async ops fall through to `spawn_blocking`.
-///
-/// New in `0.7.0`.
-#[cfg(all(target_os = "linux", feature = "async"))]
-enum AsyncIoUringState {
-    Untried,
-    Active(Arc<AsyncIoUring>),
-    Disabled,
-}
+    /// Returns the capability for the device identified by `key`,
+    /// running `probe` the first time any device is seen. `None` when
+    /// the probe failed or `key` is not the probed device.
+    pub(crate) fn get(
+        &self,
+        key: u64,
+        probe: impl FnOnce() -> Option<T>,
+    ) -> Option<std::sync::Arc<T>> {
+        let (probed_key, value) = self
+            .slot
+            .get_or_init(|| (key, probe().map(std::sync::Arc::new)));
+        if *probed_key == key {
+            value.clone()
+        } else {
+            None
+        }
+    }
 
-/// Per-handle NVMe-passthrough capability slot (Windows only).
-///
-/// Mirror of [`NvmeState`] for the Windows IOCTL path. `Active`
-/// holds the resolved volume root (e.g. `\\\\.\\C:`); volume
-/// handles are reopened per-op (matches the Windows convention of
-/// not holding long-lived shared volume handles).
-#[cfg(target_os = "windows")]
-enum NvmeStateWin {
-    Untried,
-    Active(WinArc<WinNvmeAccess>),
-    Disabled,
+    /// `true` once a probe has succeeded for some device. Does not
+    /// probe.
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(self.slot.get(), Some((_, Some(_))))
+    }
 }
 
 /// Pool configuration captured by [`Builder`] and consumed at
@@ -114,6 +94,7 @@ enum NvmeStateWin {
 /// first Direct-method op triggers lazy pool allocation (locked
 /// decision #6 in `.dev/DECISIONS-0.5.0.md`).
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // reserved buffer pool: configured but not yet used by an IO path (see crate::buffer)
 pub(crate) struct HandleBufferPoolConfig {
     pub capacity: usize,
     pub block_size: usize,
@@ -121,14 +102,22 @@ pub(crate) struct HandleBufferPoolConfig {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Write-counter for unique temp-file names
+// Temp-file naming
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Process-global monotonic counter for generating unique temp-file names.
-///
-/// Using a global counter (rather than per-handle) ensures uniqueness even
-/// when multiple handles share the same root directory.
+/// Process-global counter mixed into every temp-file nonce so two
+/// writes from the same process never derive the same name, even when
+/// the clock does not advance between them.
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Longest single path component accepted by the common filesystems
+/// (ext4, XFS, btrfs, APFS and NTFS all cap a name at 255 bytes or
+/// UTF-16 units).
+const MAX_NAME_LEN: usize = 255;
+
+/// Prefix shared by every temp file fsys creates. Stable so recovery
+/// tooling can find orphans left behind by a crash.
+const TEMP_PREFIX: &str = ".fsys-tmp-";
 
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -159,22 +148,22 @@ static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// # }
 /// ```
 pub struct Handle {
-    /// The method explicitly requested by the caller (possibly `Auto`).
-    configured_method: AtomicU8,
-    /// The method currently in effect after runtime fallbacks.
+    /// The configured method (high byte; possibly `Auto`) and the
+    /// method currently in effect (low byte), packed into one atomic
+    /// so [`Handle::set_method`] publishes both at once and a reader
+    /// never sees a configured method paired with a stale active one.
     ///
-    /// Set to the resolved form of `configured_method` at build time.
-    /// May be updated to a less-capable method if the OS rejects a
-    /// privileged open (e.g. `O_DIRECT` rejected on tmpfs → falls back
-    /// to `Data`).
+    /// The active method starts as the resolved form of the configured
+    /// method and may be downgraded by runtime fallbacks (e.g.
+    /// `O_DIRECT` rejected on tmpfs falls back to `Data`).
     ///
-    /// **0.4.0 limitation.** This field is updated by solo-lane runtime
-    /// fallbacks but **not** by group-lane (batch) per-op fallbacks —
-    /// the dispatcher runs without a [`Handle`] reference. Group-lane
-    /// fallback information surfaces in [`BatchError::source`] for the
-    /// failing op. See decision D-5 in `.dev/DECISIONS-0.4.0.md`; full
-    /// cross-lane consistency arrives in `0.5.0`.
-    active_method: AtomicU8,
+    /// **0.4.0 limitation.** The active method is updated by solo-lane
+    /// runtime fallbacks but **not** by group-lane (batch) per-op
+    /// fallbacks, because the dispatcher runs without a [`Handle`] reference.
+    /// Group-lane fallback information surfaces in
+    /// [`BatchError::source`] for the failing op. See decision D-5 in
+    /// `.dev/DECISIONS-0.4.0.md`.
+    methods: AtomicU16,
     /// Optional root directory. When set, all relative paths are resolved
     /// against this root and path-escape checks are enforced.
     root: Option<PathBuf>,
@@ -182,28 +171,18 @@ pub struct Handle {
     mode: Mode,
     /// Probed logical sector size for aligned Direct IO buffers (bytes).
     sector_size: u32,
-    /// Per-handle pipeline. Owns the lazy group-lane dispatcher thread.
-    /// Declared last so its `Drop` runs after the rest of the state has
-    /// already been read into snapshots — although correctness does not
-    /// depend on field-drop order (the dispatcher consumes only its
-    /// `BatchJob`-supplied [`HandleSnapshot`]s, never the live state).
+    /// Per-handle pipeline. Owns the lazy group-lane dispatcher
+    /// thread(s). Field order does not matter for correctness: the
+    /// dispatcher works only from the [`HandleSnapshot`] carried by each
+    /// job, never from live handle state.
     pipeline: Pipeline,
-    /// Buffer pool config (capacity, block size, alignment). Captured
-    /// at construction and used by [`Handle::buffer_pool`] for lazy
-    /// allocation.
+    /// Reserved buffer-pool configuration (capacity, block size,
+    /// alignment) captured from the Builder for [`Handle::buffer_pool`].
+    #[allow(dead_code)] // reserved buffer pool (see crate::buffer)
     pool_config: HandleBufferPoolConfig,
-    /// Lazy aligned buffer pool. `None` until the first Direct-method
-    /// op leases a buffer; `Some(...)` for the rest of this Handle's
-    /// lifetime. The Mutex is held only briefly during lazy init —
-    /// once the pool is constructed, leasing is lock-free on the
-    /// fast path.
-    /// Lock-free slot — `OnceLock::get()` is a single atomic load
-    /// after first init, so the buffer-pool fast path on every
-    /// Direct write costs zero mutex acquires. The slot is set
-    /// exactly once (lazy init); after that, all reads are
-    /// uncontended atomic loads. (0.8.0 I round-3 perf fix —
-    /// previously `Mutex<Option<AlignedBufferPool>>` cost a mutex
-    /// acquire per Direct op even after init.)
+    /// Reserved aligned buffer pool, built on the first
+    /// [`Handle::buffer_pool`] call. No IO path leases from it in 1.1.x.
+    #[allow(dead_code)] // reserved buffer pool (see crate::buffer)
     pool_slot: std::sync::OnceLock<AlignedBufferPool>,
     /// Linux-only: requested `io_uring` SQ depth (from
     /// [`crate::Builder::io_uring_queue_depth`]). Captured at
@@ -218,30 +197,31 @@ pub struct Handle {
     /// timeout. On kernels / environments that reject the setup
     /// (EPERM on < 5.13 without CAP_SYS_NICE, restricted
     /// sandboxes), `IoUringRing::new` returns the setup error
-    /// and `iouring_slot` flips to `Disabled` — the Direct path
-    /// then falls back to non-SQPOLL pwrite cleanly.
+    /// and `iouring_slot` caches `None`; the Direct path then
+    /// falls back to the `pwrite` path cleanly.
     #[cfg(target_os = "linux")]
     iouring_sqpoll_idle_ms: Option<u32>,
-    /// Linux-only: lazy `io_uring` ring slot. `Untried` until the
-    /// first Direct op probes; `Active(...)` or `Disabled` for the
-    /// rest of this Handle's lifetime.
+    /// Linux-only: lazy `io_uring` ring. Empty until the first Direct
+    /// op; then `Some(ring)`, or `None` when construction failed (kernel
+    /// < 5.1, seccomp, container restriction), for the rest of this
+    /// Handle's lifetime. After initialisation every lookup is a single
+    /// atomic load; earlier versions took a mutex on every Direct op.
     #[cfg(target_os = "linux")]
-    iouring_slot: Mutex<IoUringState>,
-    /// Linux-only: lazy NVMe-passthrough capability slot.
-    /// `Untried` until the first Direct op probes; `Active(...)`
-    /// (with an owned `/dev/nvmeX` handle) or `Disabled` for the
-    /// rest of this Handle's lifetime.
+    iouring_slot: OnceLock<Option<Arc<IoUringRing>>>,
+    /// Linux-only: NVMe-passthrough capability (an owned `/dev/nvmeX`
+    /// handle plus namespace id), probed on the first Direct op and
+    /// keyed by the `st_dev` it was probed for.
     #[cfg(target_os = "linux")]
-    nvme_slot: Mutex<NvmeState>,
-    /// Windows-only: lazy NVMe-passthrough capability slot.
-    /// Same three-state pattern as [`NvmeState`] but caches the
-    /// resolved volume root (handles are reopened per-op).
+    nvme_slot: DeviceKeyed<NvmeAccess>,
+    /// Windows-only: NVMe-passthrough capability (the resolved volume
+    /// root; volume handles are reopened per op), keyed by the volume
+    /// serial number it was probed for.
     #[cfg(target_os = "windows")]
-    nvme_slot_win: Mutex<NvmeStateWin>,
+    nvme_slot_win: DeviceKeyed<WinNvmeAccess>,
     /// Linux + `async` feature only: lazy native io_uring async
-    /// substrate slot. New in `0.7.0`.
+    /// substrate. Same states as `iouring_slot`. New in `0.7.0`.
     #[cfg(all(target_os = "linux", feature = "async"))]
-    async_iouring_slot: Mutex<AsyncIoUringState>,
+    async_iouring_slot: OnceLock<Option<Arc<AsyncIoUring>>>,
     /// 0.9.2: optional structured-telemetry observer. Registered
     /// once at handle-construction time via
     /// [`crate::Builder::observer`]; cloned (cheap `Arc::clone`)
@@ -257,6 +237,7 @@ impl Handle {
     /// Creates a `Handle` from raw components.
     ///
     /// This is `pub(crate)` — external callers use [`crate::Builder`].
+    // The io_uring depth / SQPOLL arguments are stored only on Linux.
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     #[allow(clippy::too_many_arguments)] // every arg is load-bearing handle state — splitting would obscure the struct shape
     pub(crate) fn new_raw(
@@ -272,8 +253,7 @@ impl Handle {
         observer: Option<std::sync::Arc<dyn crate::observer::FsysObserver>>,
     ) -> Self {
         Self {
-            configured_method: AtomicU8::new(configured_method.to_u8()),
-            active_method: AtomicU8::new(active_method.to_u8()),
+            methods: AtomicU16::new(pack_methods(configured_method, active_method)),
             root,
             mode,
             sector_size,
@@ -285,13 +265,13 @@ impl Handle {
             #[cfg(target_os = "linux")]
             iouring_sqpoll_idle_ms,
             #[cfg(target_os = "linux")]
-            iouring_slot: Mutex::new(IoUringState::Untried),
+            iouring_slot: OnceLock::new(),
             #[cfg(target_os = "linux")]
-            nvme_slot: Mutex::new(NvmeState::Untried),
+            nvme_slot: DeviceKeyed::new(),
             #[cfg(target_os = "windows")]
-            nvme_slot_win: Mutex::new(NvmeStateWin::Untried),
+            nvme_slot_win: DeviceKeyed::new(),
             #[cfg(all(target_os = "linux", feature = "async"))]
-            async_iouring_slot: Mutex::new(AsyncIoUringState::Untried),
+            async_iouring_slot: OnceLock::new(),
             observer,
         }
     }
@@ -316,84 +296,44 @@ impl Handle {
     /// completion-driver task on the current runtime).
     #[cfg(all(target_os = "linux", feature = "async"))]
     pub(crate) fn async_io_uring(&self) -> Option<Arc<AsyncIoUring>> {
-        let mut guard = match self.async_iouring_slot.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        match &*guard {
-            AsyncIoUringState::Active(a) => return Some(a.clone()),
-            AsyncIoUringState::Disabled => return None,
-            AsyncIoUringState::Untried => {}
-        }
-        match AsyncIoUring::new(self.iouring_queue_depth) {
-            Ok(ring) => {
-                let arc = Arc::new(ring);
-                *guard = AsyncIoUringState::Active(arc.clone());
-                Some(arc)
-            }
-            Err(_) => {
-                *guard = AsyncIoUringState::Disabled;
-                None
-            }
-        }
+        self.async_iouring_slot
+            .get_or_init(|| {
+                AsyncIoUring::new(self.iouring_queue_depth)
+                    .ok()
+                    .map(Arc::new)
+            })
+            .clone()
     }
 
-    /// Returns the per-handle Windows NVMe-passthrough access for
-    /// the volume containing `path`, probing on the first call.
-    /// Cached `None` after probe failure.
+    /// Returns the Windows NVMe-passthrough access for the volume that
+    /// holds `file` (whose path is `path`), probing on the first call.
+    /// `None` when the probe failed or `file` lives on a different
+    /// volume than the one probed.
     #[cfg(target_os = "windows")]
-    pub(crate) fn nvme_access_win(&self, path: &Path) -> Option<WinArc<WinNvmeAccess>> {
-        let mut guard = match self.nvme_slot_win.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        match &*guard {
-            NvmeStateWin::Active(a) => return Some(a.clone()),
-            NvmeStateWin::Disabled => return None,
-            NvmeStateWin::Untried => {}
-        }
-        match crate::platform::windows_nvme::nvme_flush_capable(path) {
-            Some(access) => {
-                let arc = WinArc::new(access);
-                *guard = NvmeStateWin::Active(arc.clone());
-                Some(arc)
-            }
-            None => {
-                *guard = NvmeStateWin::Disabled;
-                None
-            }
-        }
+    pub(crate) fn nvme_access_win(
+        &self,
+        file: &std::fs::File,
+        path: &Path,
+    ) -> Option<WinArc<WinNvmeAccess>> {
+        let serial = volume_serial(file)?;
+        self.nvme_slot_win.get(serial, || {
+            crate::platform::windows_nvme::nvme_flush_capable(path)
+        })
     }
 
-    /// Returns the per-handle NVMe passthrough access, probing on
-    /// the first call given an arbitrary file `fd` whose underlying
-    /// block device we want to flush. The probe resolves the fd to
-    /// `/dev/nvmeX` and verifies privilege.
-    ///
-    /// Cached `None` after probe failure so subsequent ops don't
-    /// retry the resolution + open.
+    /// Returns the NVMe passthrough access for the block device that
+    /// holds `file`, probing on the first call. The probe resolves the
+    /// fd to `/dev/nvmeX` and verifies privilege. `None` when the probe
+    /// failed or `file` lives on a different device than the one
+    /// probed.
     #[cfg(target_os = "linux")]
-    pub(crate) fn nvme_access(&self, fd: std::os::fd::RawFd) -> Option<Arc<NvmeAccess>> {
-        let mut guard = match self.nvme_slot.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        match &*guard {
-            NvmeState::Active(a) => return Some(a.clone()),
-            NvmeState::Disabled => return None,
-            NvmeState::Untried => {}
-        }
-        match crate::platform::linux_iouring::nvme_flush_capable(fd) {
-            Some(access) => {
-                let arc = Arc::new(access);
-                *guard = NvmeState::Active(arc.clone());
-                Some(arc)
-            }
-            None => {
-                *guard = NvmeState::Disabled;
-                None
-            }
-        }
+    pub(crate) fn nvme_access(&self, file: &std::fs::File) -> Option<Arc<NvmeAccess>> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let dev = file.metadata().ok()?.dev();
+        self.nvme_slot.get(dev, || {
+            crate::platform::linux_iouring::nvme_flush_capable(file.as_raw_fd())
+        })
     }
 
     /// Returns the canonical name of the durability primitive this
@@ -488,18 +428,10 @@ impl Handle {
     /// in `crud/file.rs`).
     #[cfg(target_os = "linux")]
     fn linux_direct_primitive(&self) -> &'static str {
-        let nvme_active = matches!(
-            *self.nvme_slot.lock().unwrap_or_else(|p| p.into_inner()),
-            NvmeState::Active(_)
-        );
-        if nvme_active {
+        if self.nvme_slot.is_active() {
             return crate::primitive::IO_URING_NVME_FLUSH;
         }
-        let ring_active = matches!(
-            *self.iouring_slot.lock().unwrap_or_else(|p| p.into_inner()),
-            IoUringState::Active(_)
-        );
-        if ring_active {
+        if matches!(self.iouring_slot.get(), Some(Some(_))) {
             crate::primitive::IO_URING_FDATASYNC
         } else {
             crate::primitive::O_DIRECT_PWRITE_FDATASYNC
@@ -511,11 +443,7 @@ impl Handle {
     /// NOT trigger probing.
     #[cfg(target_os = "windows")]
     fn windows_direct_primitive(&self) -> &'static str {
-        let nvme_active = matches!(
-            *self.nvme_slot_win.lock().unwrap_or_else(|p| p.into_inner()),
-            NvmeStateWin::Active(_)
-        );
-        if nvme_active {
+        if self.nvme_slot_win.is_active() {
             crate::primitive::FILE_FLAG_WRITE_THROUGH_NVME_IOCTL
         } else {
             crate::primitive::FILE_FLAG_WRITE_THROUGH
@@ -579,14 +507,9 @@ impl Handle {
         // its driver isn't poisoned. The first async Direct op finds
         // SpawnBlocking (async ring not yet constructed), routes
         // through spawn_blocking; the next op finds the cached
-        // result. We also check the poisoned flag — a panicked
-        // driver is functionally fallback even if the slot says
-        // Active.
-        let guard = match self.async_iouring_slot.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        matches!(&*guard, AsyncIoUringState::Active(ring) if !ring.is_poisoned())
+        // result. A panicked driver is functionally fallback even if
+        // the ring exists.
+        matches!(self.async_iouring_slot.get(), Some(Some(ring)) if !ring.is_poisoned())
     }
 
     /// Linux without async feature: native substrate is gated by
@@ -611,26 +534,22 @@ impl Handle {
     /// method.
     #[cfg(target_os = "linux")]
     pub(crate) fn io_uring_ring(&self) -> Option<Arc<IoUringRing>> {
-        let mut guard = match self.iouring_slot.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        match &*guard {
-            IoUringState::Active(r) => return Some(r.clone()),
-            IoUringState::Disabled => return None,
-            IoUringState::Untried => {}
-        }
-        match IoUringRing::new(self.iouring_queue_depth, self.iouring_sqpoll_idle_ms) {
-            Ok(ring) => {
-                let arc = Arc::new(ring);
-                *guard = IoUringState::Active(arc.clone());
-                Some(arc)
-            }
-            Err(_) => {
-                *guard = IoUringState::Disabled;
-                None
-            }
-        }
+        self.iouring_slot
+            .get_or_init(|| {
+                IoUringRing::new(self.iouring_queue_depth, self.iouring_sqpoll_idle_ms)
+                    .ok()
+                    .map(Arc::new)
+            })
+            .clone()
+    }
+
+    /// Test-only: marks the `io_uring` ring as unavailable so Direct
+    /// ops take the platform `pwrite` path, the same path a kernel
+    /// without `io_uring` (or a restricted container) would take. Must
+    /// run before the handle's first Direct op.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn disable_io_uring_for_test(&self) {
+        let _ = self.iouring_slot.set(None);
     }
 
     /// Returns a clone of the per-handle aligned buffer pool,
@@ -645,7 +564,7 @@ impl Handle {
     /// ([`Error::AlignmentRequired`]) when the configured
     /// `buffer_pool_count`/`buffer_pool_block_size` is invalid against the
     /// probed sector size.
-    #[allow(dead_code)] // wired into Direct path in 0.5.x patch alongside io_uring lift
+    #[allow(dead_code)] // reserved buffer pool: only the Builder tests lease from it (see crate::buffer)
     pub(crate) fn buffer_pool(&self) -> Result<AlignedBufferPool> {
         // Fast path: post-init read is a single atomic load + Arc clone.
         if let Some(pool) = self.pool_slot.get() {
@@ -686,7 +605,7 @@ impl Handle {
     #[must_use]
     #[inline]
     pub fn method(&self) -> Method {
-        Method::from_u8(self.configured_method.load(Ordering::Relaxed))
+        Method::from_u8((self.methods.load(Ordering::Relaxed) >> 8) as u8)
     }
 
     /// Returns the method currently in effect after any runtime fallbacks.
@@ -697,33 +616,34 @@ impl Handle {
     #[must_use]
     #[inline]
     pub fn active_method(&self) -> Method {
-        Method::from_u8(self.active_method.load(Ordering::Relaxed))
+        Method::from_u8((self.methods.load(Ordering::Relaxed) & 0xFF) as u8)
     }
 
     /// Updates the configured method for future IO operations.
     ///
     /// Resolves [`Method::Auto`] through the hardware-probe ladder
     /// (same logic as [`Builder::build`](crate::Builder::build)) and
-    /// publishes both the configured + resolved values atomically.
-    /// Existing in-flight IO is unaffected; only subsequent calls
-    /// pick up the new method.
+    /// publishes the configured and resolved values in one atomic
+    /// store. Existing in-flight IO is unaffected; only subsequent
+    /// calls pick up the new method.
+    ///
+    /// Applies the same selectability checks as `Builder::build`, and
+    /// returns the same error for the same method.
     ///
     /// # Errors
     ///
     /// - [`Error::UnsupportedMethod`] if `method` is a reserved
     ///   variant ([`Method::Journal`] — see its docs for why it's
     ///   reserved).
+    /// - [`Error::FeatureNotEnabled`] if `method` is [`Method::Spdk`]
+    ///   and the `spdk` Cargo feature is off.
+    /// - [`Error::SpdkUnavailable`] if `method` is [`Method::Spdk`] and
+    ///   the SPDK backend cannot be used on this host.
     pub fn set_method(&self, method: Method) -> Result<()> {
-        if method.is_reserved() {
-            return Err(Error::UnsupportedMethod {
-                method: method.as_str(),
-            });
-        }
+        crate::builder::check_method_selectable(method)?;
         let resolved = method.resolve();
-        self.configured_method
-            .store(method.to_u8(), Ordering::Relaxed);
-        self.active_method
-            .store(resolved.to_u8(), Ordering::Relaxed);
+        self.methods
+            .store(pack_methods(method, resolved), Ordering::Relaxed);
         Ok(())
     }
 
@@ -1084,7 +1004,14 @@ impl Handle {
     /// `O_DIRECT` on tmpfs). Takes effect for all subsequent operations on
     /// this handle.
     pub(crate) fn update_active_method(&self, method: Method) {
-        self.active_method.store(method.to_u8(), Ordering::Relaxed);
+        let active = u16::from(method.to_u8());
+        // `fetch_update` with a closure that always returns `Some`
+        // cannot fail; the result carries no information.
+        let _ = self
+            .methods
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some((cur & 0xFF00) | active)
+            });
     }
 
     /// Returns `true` if the active method requires Direct IO.
@@ -1106,8 +1033,12 @@ impl Handle {
     /// For paths whose target does not yet exist (e.g. `write` to a
     /// new file), only the existing prefix is canonicalised; the
     /// not-yet-existing tail components are joined back lexically.
-    /// This is sound because `open(O_CREAT|O_EXCL)` and
-    /// `atomic_rename` operate within the just-canonicalised parent.
+    /// A component is treated as "not yet existing" only when
+    /// `lstat` reports it missing. A symlink that cannot be resolved
+    /// (dangling or looping) is rejected with [`Error::InvalidPath`]:
+    /// creating opens such as [`Handle::append`] follow the link, so
+    /// accepting it would let a link inside the root create files
+    /// wherever it points.
     ///
     /// If the handle has no root, the path is returned as-is.
     ///
@@ -1163,7 +1094,7 @@ impl Handle {
         // Pass 2 — lexical `starts_with(root)` check on the
         // normalised path. Cheap; rejects obvious escapes before
         // we touch the filesystem.
-        if !resolved.starts_with(root) {
+        if !rootpath::starts_with(&resolved, root) {
             return Err(Error::InvalidPath {
                 path: path.to_owned(),
                 reason: "path escapes the handle root (lexical)".into(),
@@ -1241,6 +1172,32 @@ impl Handle {
                     return Ok(out);
                 }
                 Err(_) => {
+                    // `canonicalize` failed at this depth. Only a
+                    // component that genuinely does not exist may be
+                    // popped and re-attached lexically. A symlink here
+                    // (dangling, looping, or otherwise unresolvable)
+                    // must be rejected: popping it would hand the
+                    // caller `root/link/...`, and a creating open
+                    // (`append`, `write_at`, `sync`, `journal`) would
+                    // then follow the link and create its target
+                    // wherever it points, including outside the root.
+                    match std::fs::symlink_metadata(&existing_prefix) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Ok(meta) if meta.file_type().is_symlink() => {
+                            return Err(Error::InvalidPath {
+                                path: path.to_owned(),
+                                reason: "path contains a symlink that cannot be resolved inside the handle root (dangling or looping link)"
+                                    .into(),
+                            });
+                        }
+                        _ => {
+                            return Err(Error::InvalidPath {
+                                path: path.to_owned(),
+                                reason: "path component exists but cannot be canonicalised for the root check"
+                                    .into(),
+                            });
+                        }
+                    }
                     // The path doesn't exist at this depth; pop one
                     // component and retry. If we've popped past the
                     // root, the path is unreachable.
@@ -1262,7 +1219,7 @@ impl Handle {
                     }
                     // Defensive: if we've popped past the canonical
                     // root, the path can't be inside.
-                    if !existing_prefix.starts_with(root) && existing_prefix != *root {
+                    if !rootpath::starts_with(&existing_prefix, root) {
                         return Err(Error::InvalidPath {
                             path: path.to_owned(),
                             reason: "no canonical ancestor lies within the handle root".into(),
@@ -1273,35 +1230,53 @@ impl Handle {
         }
     }
 
-    /// Generates a unique temp-file path adjacent to `path`.
+    /// Generates a temp-file path adjacent to `path`.
     ///
-    /// The temp name is `.fsys-tmp-<counter>.<filename>` so it sorts near
-    /// the target and is identifiable in crash recovery. If the target has
-    /// no file name the counter alone is used.
+    /// The name is `.fsys-tmp-<pid>-<nonce>.<filename>` (pid and nonce
+    /// in hex). The pid keeps concurrent processes writing into the
+    /// same directory apart; the nonce mixes a per-process counter,
+    /// the wall clock and per-thread random keys, so a fresh process
+    /// does not regenerate the names of temp files orphaned by an
+    /// earlier crash. The prefix keeps temp files identifiable for
+    /// crash recovery and sorts them next to each other.
+    ///
+    /// When the target's file name is so long that the temp name would
+    /// exceed the 255-byte component limit, the file name part is
+    /// replaced by a 64-bit hash of it.
+    ///
+    /// Collisions remain theoretically possible, so callers create the
+    /// file with an exclusive open and retry with a fresh name on
+    /// `AlreadyExists` (see `crud::atomic::with_unique_temp`).
     pub(crate) fn gen_temp_path(path: &Path) -> PathBuf {
-        let n = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        use std::ffi::OsString;
+        use std::hash::{BuildHasher, Hash, Hasher};
+
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
 
-        // Build the temp name as an `OsString` directly, without
-        // routing through `String`/`format!`. This stays in
-        // `OsStr`-land for non-UTF-8 filenames (Linux can have
-        // those) and avoids the `to_string_lossy` -> `into_owned`
-        // -> `format!` -> `parent.join` chain that allocated 3
-        // strings + 1 PathBuf per call. Now: 1 OsString + 1
-        // PathBuf (from `parent.join`).
-        //
-        // The format `.fsys-tmp-<n>.<original_filename>` is
-        // preserved exactly so crash-recovery scripts that match
-        // on the prefix continue to work.
-        use std::ffi::OsString;
-        let mut temp_name = OsString::with_capacity(32);
-        temp_name.push(".fsys-tmp-");
-        // `n.to_string()` allocates a small String — itoa would
-        // avoid it but adding a dep for one site isn't justified.
-        temp_name.push(n.to_string());
-        temp_name.push(".");
-        if let Some(stem) = path.file_name() {
-            temp_name.push(stem);
+        let counter = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(counter);
+        hasher.write_u128(nanos);
+        let nonce = hasher.finish();
+
+        let mut temp_name = OsString::with_capacity(64);
+        temp_name.push(TEMP_PREFIX);
+        temp_name.push(format!("{:x}-{nonce:016x}.", std::process::id()));
+        if let Some(name) = path.file_name() {
+            // `as_encoded_bytes().len()` is an upper bound on the
+            // UTF-16 length on Windows, so the check is conservative
+            // on every platform.
+            if temp_name.len() + name.as_encoded_bytes().len() <= MAX_NAME_LEN {
+                temp_name.push(name);
+            } else {
+                let mut name_hasher = std::collections::hash_map::DefaultHasher::new();
+                name.hash(&mut name_hasher);
+                temp_name.push(format!("{:016x}", name_hasher.finish()));
+            }
         }
         parent.join(temp_name)
     }
@@ -1330,6 +1305,11 @@ impl Handle {
     /// processed by the dispatcher and a per-batch result is reported back.
     /// First call to any batch method on this handle spawns the dispatcher
     /// thread (~one-time ~50–200 µs cost).
+    ///
+    /// With the default single dispatcher
+    /// ([`crate::Builder::dispatcher_shards`]), batches submitted to this
+    /// handle from any thread execute one after another, so a batch can
+    /// wait behind batches submitted earlier by other threads.
     ///
     /// # Errors
     ///
@@ -1389,9 +1369,17 @@ impl Handle {
 
     /// Copies every `(src, dst)` pair in `batch` through the group lane.
     ///
-    /// Each copy is implemented as `read(src)` followed by an
-    /// atomic-replace `write(dst)`, identical to solo-lane
-    /// [`Handle::copy`] under the atomic-replace pattern.
+    /// Each copy reads the whole of `src` into memory and then
+    /// publishes it at `dst` through the same atomic-replace sequence
+    /// as [`Handle::write`]: `dst` is either entirely its old contents
+    /// or entirely the copy, and is durable when the batch returns.
+    ///
+    /// This differs from solo-lane [`Handle::copy`], which copies in
+    /// place with the platform's fast copy primitive (reflink /
+    /// `copy_file_range` / `clonefile`), is neither atomic nor flushed,
+    /// and does not hold the file in memory. Size a `copy_batch` source
+    /// to what fits in RAM; use [`Handle::copy`] plus [`Handle::sync`]
+    /// for large files.
     ///
     /// # Latency characteristics
     ///
@@ -1489,6 +1477,118 @@ impl Handle {
     }
 }
 
+/// Volume serial number of the volume holding `file`, used to key the
+/// Windows NVMe-passthrough cache. `None` if the query fails.
+#[cfg(target_os = "windows")]
+fn volume_serial(file: &std::fs::File) -> Option<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    // SAFETY: `BY_HANDLE_FILE_INFORMATION` is a plain C struct of
+    // integers and `FILETIME`s (also integers); the all-zero bit
+    // pattern is a valid value for it.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` is an open file, so its raw handle is valid for
+    // the duration of the call; `info` is a live, writable struct the
+    // function fills and does not retain. Failure is reported through
+    // the return value.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    (ok != 0).then(|| u64::from(info.dwVolumeSerialNumber))
+}
+
+/// Lexical "is inside the root" pre-filter for the root jail.
+///
+/// `Builder::build` stores the root in canonical form. On Windows that
+/// form carries the verbatim prefix (`\\?\C:\...`) and the on-disk case
+/// of every component, while callers usually pass `C:\...` in whatever
+/// case they like. Plain [`Path::starts_with`] compares prefix kinds and
+/// component bytes exactly, so every absolute in-root path was rejected
+/// on Windows before reaching the canonical check.
+///
+/// On Windows this comparison treats `C:` and `\\?\C:` (and
+/// `\\server\share` and `\\?\UNC\server\share`) as the same prefix and
+/// compares components case-insensitively. It is only a pre-filter:
+/// such paths never take `resolve_path`'s fast path (which needs the
+/// parent to equal the root exactly) and are decided by the
+/// `canonicalize` comparison, which sees on-disk names. A
+/// case-sensitive NTFS directory therefore cannot be confused with a
+/// sibling whose name differs only in case. On other platforms this is
+/// [`Path::starts_with`].
+mod rootpath {
+    use std::path::Path;
+
+    /// `true` when `path` is `base` or lies below it.
+    #[cfg(not(windows))]
+    pub(super) fn starts_with(path: &Path, base: &Path) -> bool {
+        path.starts_with(base)
+    }
+
+    /// `true` when `path` is `base` or lies below it, ignoring the
+    /// verbatim prefix and component case.
+    #[cfg(windows)]
+    pub(super) fn starts_with(path: &Path, base: &Path) -> bool {
+        let mut rest = path.components();
+        base.components()
+            .all(|b| rest.next().is_some_and(|p| win::component_eq(p, b)))
+    }
+
+    #[cfg(windows)]
+    mod win {
+        use std::ffi::OsStr;
+        use std::path::{Component, Prefix};
+
+        enum Norm<'a> {
+            Drive(u8),
+            Unc(&'a OsStr, &'a OsStr),
+            Other(&'a OsStr),
+        }
+
+        fn norm(p: Prefix<'_>) -> Norm<'_> {
+            match p {
+                Prefix::Disk(d) | Prefix::VerbatimDisk(d) => Norm::Drive(d.to_ascii_uppercase()),
+                Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                    Norm::Unc(server, share)
+                }
+                Prefix::Verbatim(x) | Prefix::DeviceNS(x) => Norm::Other(x),
+            }
+        }
+
+        fn name_eq(a: &OsStr, b: &OsStr) -> bool {
+            if a == b || a.eq_ignore_ascii_case(b) {
+                return true;
+            }
+            match (a.to_str(), b.to_str()) {
+                (Some(a), Some(b)) => a.to_lowercase() == b.to_lowercase(),
+                _ => false,
+            }
+        }
+
+        pub(super) fn component_eq(a: Component<'_>, b: Component<'_>) -> bool {
+            match (a, b) {
+                (Component::Prefix(pa), Component::Prefix(pb)) => {
+                    match (norm(pa.kind()), norm(pb.kind())) {
+                        (Norm::Drive(x), Norm::Drive(y)) => x == y,
+                        (Norm::Unc(s1, h1), Norm::Unc(s2, h2)) => {
+                            name_eq(s1, s2) && name_eq(h1, h2)
+                        }
+                        (Norm::Other(x), Norm::Other(y)) => x == y,
+                        _ => false,
+                    }
+                }
+                (Component::Normal(x), Component::Normal(y)) => name_eq(x, y),
+                (x, y) => x == y,
+            }
+        }
+    }
+}
+
+/// Packs the configured and active methods into the layout of
+/// `Handle::methods`.
+const fn pack_methods(configured: Method, active: Method) -> u16 {
+    ((configured.to_u8() as u16) << 8) | active.to_u8() as u16
+}
+
 /// Builds a [`BatchError`] for a path-validation failure that happens
 /// *before* submission. `completed = 0` because no op has been
 /// dispatched yet; `failed_at` is the index of the offending op in the
@@ -1501,20 +1601,18 @@ fn pre_submit_err(index: usize, e: Error) -> BatchError {
     }
 }
 
-// Handle is Send + Sync because AtomicU8 and AtomicU64 are Send + Sync,
-// Option<PathBuf> is Send + Sync, Mode is Copy, and u32 is Copy.
-// The compiler will derive these automatically, but asserting them here
-// makes any future regression a compile error rather than a runtime surprise.
+// Handle is Send + Sync because every field is (atomics, OnceLocks of
+// Send + Sync values, the pipeline, plain Copy data). The compiler
+// derives this automatically; asserting it here makes any future
+// regression a compile error rather than a surprise for callers.
 const _: () = {
-    #[allow(dead_code)]
     fn assert_send<T: Send>() {}
-    #[allow(dead_code)]
     fn assert_sync<T: Sync>() {}
-    #[allow(dead_code)]
     fn check() {
         assert_send::<Handle>();
         assert_sync::<Handle>();
     }
+    let _ = check;
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1581,6 +1679,49 @@ mod tests {
         } else {
             panic!("expected UnsupportedMethod");
         }
+    }
+
+    #[test]
+    fn test_set_method_spdk_is_rejected_like_build() {
+        let h = make_handle(Method::Sync);
+        let from_build = match crate::Builder::new().method(Method::Spdk).build() {
+            Ok(_) => None,
+            Err(e) => Some(e.to_string()),
+        };
+        match h.set_method(Method::Spdk) {
+            Ok(()) => assert!(
+                from_build.is_none(),
+                "set_method accepted Spdk, build refused"
+            ),
+            Err(e) => assert_eq!(Some(e.to_string()), from_build),
+        }
+        // A refused switch leaves the handle untouched.
+        if from_build.is_some() {
+            assert_eq!(h.method(), Method::Sync);
+            assert_eq!(h.active_method(), Method::Sync);
+        }
+    }
+
+    #[test]
+    fn test_method_pair_round_trips_through_packed_atomic() {
+        let h = make_handle(Method::Auto);
+        assert_eq!(h.method(), Method::Auto);
+        assert_ne!(h.active_method(), Method::Auto);
+        h.set_method(Method::Direct).expect("set direct");
+        assert_eq!(
+            (h.method(), h.active_method()),
+            (Method::Direct, Method::Direct)
+        );
+        h.update_active_method(Method::Data);
+        assert_eq!(
+            (h.method(), h.active_method()),
+            (Method::Direct, Method::Data)
+        );
+        h.set_method(Method::Mmap).expect("set mmap");
+        assert_eq!(
+            (h.method(), h.active_method()),
+            (Method::Mmap, Method::Mmap)
+        );
     }
 
     #[test]
@@ -1660,6 +1801,325 @@ mod tests {
         let tmp = Handle::gen_temp_path(&path);
         let name = tmp.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with(".fsys-tmp-"), "got: {}", name);
+        assert!(name.ends_with(".myfile.db"), "got: {}", name);
+        assert_eq!(tmp.parent(), path.parent());
+    }
+
+    #[test]
+    fn test_gen_temp_path_includes_pid_and_differs_per_call() {
+        let path = PathBuf::from("/tmp/myfile.db");
+        let a = Handle::gen_temp_path(&path);
+        let b = Handle::gen_temp_path(&path);
+        assert_ne!(a, b);
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        let pid = format!(".fsys-tmp-{:x}-", std::process::id());
+        assert!(name.starts_with(&pid), "pid missing from {name}");
+    }
+
+    #[test]
+    fn test_gen_temp_path_does_not_reuse_the_pre_1_1_1_counter_names() {
+        // Before 1.1.1 the first temp name of every process was
+        // `.fsys-tmp-0.<name>`, so a temp file orphaned by a crash
+        // blocked the first write after every restart.
+        let path = PathBuf::from("/tmp/myfile.db");
+        for _ in 0..64 {
+            let name = Handle::gen_temp_path(&path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let rest = name.trim_start_matches(".fsys-tmp-");
+            let first = rest.split('.').next().unwrap_or("");
+            assert!(first.contains('-'), "counter-only temp name: {name}");
+        }
+    }
+
+    #[test]
+    fn test_gen_temp_path_stays_within_name_limit_for_long_names() {
+        for len in [1usize, 200, 215, 216, 240, 255] {
+            let long = "n".repeat(len);
+            let path = PathBuf::from("/tmp").join(&long);
+            let tmp = Handle::gen_temp_path(&path);
+            let name = tmp.file_name().unwrap();
+            assert!(
+                name.len() <= MAX_NAME_LEN,
+                "temp name of {} bytes for a {len}-byte target",
+                name.len()
+            );
+            assert!(name.to_string_lossy().starts_with(TEMP_PREFIX));
+        }
+        // Short names are kept verbatim.
+        let tmp = Handle::gen_temp_path(Path::new("/tmp/short.db"));
+        assert!(tmp.to_string_lossy().ends_with(".short.db"));
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 1.1.1: root jail vs. dangling symlinks
+    // ─────────────────────────────────────────────────────────
+
+    struct DirCleanup(PathBuf);
+    impl Drop for DirCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn jail_dirs(tag: &str) -> (PathBuf, PathBuf, DirCleanup) {
+        let base = std::env::temp_dir().join(format!(
+            "fsys_jail_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        (root, outside, DirCleanup(base))
+    }
+
+    #[cfg(unix)]
+    fn make_link(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    // Creating symlinks on Windows needs the SeCreateSymbolicLink
+    // privilege (admin or Developer Mode). Without it the symlink
+    // tests return early; the junction test below still covers the
+    // dangling-link branch on Windows.
+    #[cfg(windows)]
+    fn make_link(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn make_dir_link(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
+    #[cfg(unix)]
+    fn make_dir_link(target: &Path, link: &Path) -> bool {
+        make_link(target, link)
+    }
+
+    #[test]
+    fn test_dangling_leaf_symlink_out_of_root_is_rejected_for_creating_ops() {
+        let (root, outside, _g) = jail_dirs("leaf");
+        let victim = outside.join("created_through_link");
+        if !make_link(&victim, &root.join("evil")) {
+            return;
+        }
+        let h = crate::Builder::new()
+            .method(Method::Sync)
+            .root(&root)
+            .build()
+            .expect("build");
+
+        assert!(matches!(
+            h.append("evil", b"x"),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            h.write_at("evil", 0, b"x"),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(matches!(h.sync("evil"), Err(Error::InvalidPath { .. })));
+        assert!(matches!(
+            h.write("evil", b"x"),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(!victim.exists(), "a file was created outside the root");
+    }
+
+    #[test]
+    fn test_dangling_dir_symlink_out_of_root_is_rejected() {
+        let (root, outside, _g) = jail_dirs("dir");
+        let missing_dir = outside.join("missing_dir");
+        if !make_dir_link(&missing_dir, &root.join("evil_dir")) {
+            return;
+        }
+        let h = crate::Builder::new()
+            .method(Method::Sync)
+            .root(&root)
+            .build()
+            .expect("build");
+        assert!(matches!(
+            h.resolve_path(Path::new("evil_dir/sub/file.bin")),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            h.append("evil_dir/file.bin", b"x"),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(!missing_dir.exists());
+    }
+
+    // Directory junctions need no privilege on Windows, so this test
+    // covers the dangling-link branch there even without symlink
+    // rights.
+    #[cfg(windows)]
+    #[test]
+    fn test_dangling_junction_out_of_root_is_rejected() {
+        let (root, outside, _g) = jail_dirs("junction");
+        let missing_dir = outside.join("missing_dir");
+        let link = root.join("evil_junction");
+        let created = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(&missing_dir)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !created || std::fs::symlink_metadata(&link).is_err() {
+            // `mklink /J` unavailable on this host; nothing to test.
+            return;
+        }
+        let h = crate::Builder::new()
+            .method(Method::Sync)
+            .root(&root)
+            .build()
+            .expect("build");
+        assert!(matches!(
+            h.resolve_path(Path::new("evil_junction/file.bin")),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(!missing_dir.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_absolute_in_root_path_without_verbatim_prefix_is_accepted() {
+        let (root, outside, _g) = jail_dirs("verbatim");
+        let h = crate::Builder::new()
+            .method(Method::Sync)
+            .root(&root)
+            .build()
+            .expect("build");
+        let canonical_root = h.root().expect("root").to_path_buf();
+        assert!(
+            canonical_root.to_string_lossy().starts_with(r"\\?\"),
+            "canonical root is expected in verbatim form: {}",
+            canonical_root.display()
+        );
+
+        // `root` is the caller's plain `C:\...` form.
+        let plain = root.join("plain.bin");
+        h.write(&plain, b"plain").expect("absolute in-root write");
+
+        // The journal entry points resolve paths the same way.
+        let wal = root.join("absolute.wal");
+        drop(
+            h.journal_with(&wal, crate::JournalOptions::new())
+                .expect("journal_with on an absolute in-root path"),
+        );
+        drop(
+            h.journal(&wal)
+                .expect("journal on an absolute in-root path"),
+        );
+        assert_eq!(std::fs::read(&plain).expect("read"), b"plain");
+
+        // Different case of the same (case-insensitive) directory.
+        let upper = PathBuf::from(root.to_string_lossy().to_uppercase()).join("upper.bin");
+        h.write(&upper, b"upper")
+            .expect("case-insensitive in-root write");
+        assert_eq!(
+            std::fs::read(root.join("upper.bin")).expect("read"),
+            b"upper"
+        );
+
+        // Nested, not-yet-existing directories under the root.
+        let nested = root.join("a").join("b").join("c.bin");
+        let resolved = h.resolve_path(&nested).expect("nested in-root path");
+        assert!(resolved.starts_with(&canonical_root));
+
+        // A sibling directory is still outside the root.
+        assert!(matches!(
+            h.write(outside.join("x.bin"), b"x"),
+            Err(Error::InvalidPath { .. })
+        ));
+        let sibling = PathBuf::from(format!("{}2", root.display())).join("x.bin");
+        assert!(matches!(
+            h.resolve_path(&sibling),
+            Err(Error::InvalidPath { .. })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_rootpath_prefix_normalisation() {
+        use rootpath::starts_with;
+        let verbatim = Path::new(r"\\?\C:\Data\Root");
+        assert!(starts_with(Path::new(r"C:\Data\Root\f"), verbatim));
+        assert!(starts_with(Path::new(r"c:\Data\Root"), verbatim));
+        assert!(starts_with(Path::new(r"C:\data\root\f"), verbatim));
+        assert!(!starts_with(Path::new(r"D:\Data\Root\f"), verbatim));
+        assert!(!starts_with(Path::new(r"C:\Data\Root2\f"), verbatim));
+        assert!(!starts_with(Path::new(r"C:\Data"), verbatim));
+        let unc = Path::new(r"\\?\UNC\Server\Share\dir");
+        assert!(starts_with(Path::new(r"\\server\share\dir\f"), unc));
+        assert!(!starts_with(Path::new(r"\\server\other\dir\f"), unc));
+    }
+
+    #[test]
+    fn test_missing_components_inside_root_still_resolve() {
+        let (root, _outside, _g) = jail_dirs("missing_ok");
+        let h = crate::Builder::new()
+            .method(Method::Sync)
+            .root(&root)
+            .build()
+            .expect("build");
+        let resolved = h
+            .resolve_path(Path::new("not/yet/created.bin"))
+            .expect("non-existent tail is allowed");
+        assert!(resolved.starts_with(h.root().expect("root")));
+        assert!(resolved.ends_with("not/yet/created.bin"));
+    }
+
+    #[test]
+    fn test_device_keyed_probes_once_and_only_serves_the_probed_device() {
+        let slot: DeviceKeyed<u32> = DeviceKeyed::new();
+        assert!(!slot.is_active());
+        let mut probes = 0;
+        assert_eq!(
+            slot.get(7, || {
+                probes += 1;
+                Some(42)
+            })
+            .as_deref(),
+            Some(&42)
+        );
+        assert!(slot.is_active());
+        // Same device: cached value, no second probe.
+        assert_eq!(slot.get(7, || panic!("re-probed")).as_deref(), Some(&42));
+        // Another device: never handed the first device's capability.
+        assert_eq!(slot.get(8, || panic!("re-probed")), None);
+        assert_eq!(probes, 1);
+
+        let failed: DeviceKeyed<u32> = DeviceKeyed::new();
+        assert_eq!(failed.get(1, || None), None);
+        assert!(!failed.is_active());
+        assert_eq!(failed.get(1, || Some(5)), None, "failure is cached");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_volume_serial_is_stable_for_one_volume() {
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("fsys_volserial_a_{}", std::process::id()));
+        let b = dir.join(format!("fsys_volserial_b_{}", std::process::id()));
+        let fa = std::fs::File::create(&a).expect("create a");
+        let fb = std::fs::File::create(&b).expect("create b");
+        let sa = volume_serial(&fa);
+        let sb = volume_serial(&fb);
+        drop((fa, fb));
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+        assert!(sa.is_some());
+        assert_eq!(sa, sb);
     }
 
     #[test]

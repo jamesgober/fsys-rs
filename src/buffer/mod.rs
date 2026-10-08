@@ -1,11 +1,3 @@
-// `AlignedBufferPool` is wired into `Handle` and the Direct method's
-// io_uring submission path in checkpoint F+G. The `dead_code` and
-// `unused_imports` allowances below cover the gap between checkpoints
-// C and F+G for items exercised only by tests until the integration
-// lands.
-#![allow(dead_code)]
-#![allow(unused_imports)]
-
 //! Per-handle aligned buffer pool for Direct IO.
 //!
 //! Direct IO requires that buffer pointer, file offset, and length all
@@ -41,8 +33,13 @@
 //! 6. In-flight `AlignedBuffer`s outlive the pool — they hold an
 //!    `Arc<PoolInner>` keeping the allocator metadata alive.
 
+// Reserved: the pool is configured from `Builder::buffer_pool_count` /
+// `buffer_pool_block_size` and covered by this module's unit tests, but
+// no IO path leases from it in 1.1.x (see the Builder docs). Remove this
+// allow when a Direct path is wired to `Handle::buffer_pool`.
+#![allow(dead_code)]
+
 mod aligned;
 mod pool;
 
-pub(crate) use aligned::AlignedBuffer;
 pub(crate) use pool::AlignedBufferPool;

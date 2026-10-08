@@ -94,12 +94,20 @@ Soak success criteria:
   depth only sizes that ring. The native async substrate keeps up
   to one completion queue's worth of ops (twice the depth) in
   flight. Lower depths reduce kernel memory.
-- `buffer_pool_count(usize)` — number of aligned buffers in the
-  per-handle pool. Default 64.
-- `buffer_pool_block_size(usize)` — size of each buffer (in bytes,
-  rounded up to the probed sector size). Default 4096.
-- `batch_window_ms(u64)`, `batch_size_max(usize)`,
-  `batch_queue_max(usize)` — group-lane dispatcher knobs from 0.4.0.
+- `buffer_pool_count(usize)`, `buffer_pool_block_size(usize)`:
+  **reserved**. Accepted and stored, but no IO path uses the buffer
+  pool in 1.1.x: each Direct op allocates its own sector-aligned
+  buffer, a cost that is small next to the per-write fence. Setting
+  them changes neither memory use nor throughput.
+- `batch_size_max(usize)`, `batch_queue_max(usize)`: group-lane
+  dispatcher knobs from 0.4.0: ops taken from the queue per
+  dispatcher pass, and queue capacity before submitters block.
+  `batch_window_ms(u64)` is still accepted but unused since 1.1.1:
+  each op carries its own fence, so holding jobs back to group them
+  shared no fsync and only added latency.
+- With the default single dispatcher, every batch submitted to one
+  handle runs after the previous one finishes, whichever thread
+  submitted it.
 - `dispatcher_shards(usize)` (0.9.3) — number of dispatcher threads
   per handle. Default 1 (preserves pre-0.9.3 behavior exactly).
   Values > 1 spawn N independent dispatcher threads; batches are
@@ -127,9 +135,9 @@ over hand-setting individual knobs:
 
 `Workload::Database` is tuned for storage-engine workloads
 (HiveDB, embedded KV stores, LSM trees) on NVMe with sustained
-bulk writes. The 8 MiB pool footprint, 2× ring depth, and 4×
-batch queue all coordinate to keep the dispatcher fed without
-needing per-knob tweaks.
+bulk writes. The effective changes are the 2× ring depth and the
+4× batch queue; the two buffer-pool columns are reserved knobs with
+no effect in 1.1.x.
 
 Apply presets **first**, then override individual knobs:
 

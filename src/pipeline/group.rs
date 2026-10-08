@@ -1,5 +1,5 @@
 //! Group-lane dispatcher: bounded MPMC queue + per-handle thread that
-//! accumulates [`BatchJob`]s under a hybrid time-or-count window and
+//! takes the [`BatchJob`]s already queued (up to a count limit) and
 //! executes their ops in strict submission order.
 //!
 //! ## Op-execution model (decision D-4(c))
@@ -10,16 +10,14 @@
 //! the Handle before being placed in [`BatchOp`]s; the dispatcher does
 //! not perform path resolution or root-jail enforcement.
 //!
-//! [`execute_write`] is a leaner extraction of
-//! [`crate::crud::file`]'s atomic-replace flow. It mirrors solo-lane
-//! semantics — temp file → write → flush → atomic rename → best-effort
-//! parent-dir sync — except for the one piece that requires Handle
-//! state: when `O_DIRECT` is rejected at open time on a per-op basis,
-//! the dispatcher falls back locally for that op but does **not**
-//! propagate the fallback back to [`crate::Handle::active_method`].
-//! Per-op failure is still observable via [`BatchError::source`]. This
-//! is decision D-5 in `.dev/DECISIONS-0.4.0.md`; full cross-lane
-//! consistency arrives in `0.5.0`.
+//! [`execute_write`] runs the same atomic-replace sequence as the solo
+//! lane ([`crate::crud::atomic`]): temp file, write, fence, rename,
+//! parent-directory sync. The one piece that requires Handle state is
+//! not available here: when Direct IO is rejected at open time for a
+//! particular op, the dispatcher falls back locally for that op but
+//! does **not** propagate the fallback back to
+//! [`crate::Handle::active_method`] (decision D-5 in
+//! `.dev/DECISIONS-0.4.0.md`).
 //!
 //! ## Panic safety
 //!
@@ -32,14 +30,12 @@
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 use crossbeam_channel::{select, Receiver, Sender};
 
+use crate::crud::atomic::{atomic_replace, BufferedFlush, PlatformHooks, ReplacePlan};
 use crate::error::BatchError;
-use crate::handle::Handle;
 use crate::method::Method;
-use crate::platform;
 use crate::{Error, Result};
 
 use super::PipelineConfig;
@@ -176,80 +172,25 @@ pub(super) fn run_dispatcher(
             }
         };
 
-        // Step 2 — accumulate within the time/count window.
+        // Step 2: scoop jobs that are already queued (non-blocking),
+        // up to `batch_size_max` ops, and execute them in order.
         //
-        // 0.8.0 I round-2: scoop any already-queued jobs via
-        // `try_recv` first. Two cases benefit:
-        //
-        //   (a) Multiple submitters racing — their jobs are already
-        //       queued by the time we wake up; we batch them
-        //       without waiting for the window.
-        //   (b) Single-submitter "big batch" — the first job alone
-        //       already has many ops; if no other jobs are queued,
-        //       skip the window entirely and flush.
-        //
-        // This eliminates the ~window/2 fixed latency penalty that
-        // the bench surfaced (batch-of-8 was 0.42–0.65× of solo×8
-        // on Windows because of the 1 ms accumulation wait).
+        // The dispatcher does not wait for more jobs to arrive. Every
+        // op carries its own fence (the temp file of each write must
+        // be durable before its own rename), so holding a job back to
+        // accumulate others shares no fsync; it only adds latency.
+        // 1.1.1 removed the former `batch_window_ms` wait for that
+        // reason.
         let mut total_ops: usize = first.ops.len();
         let mut accumulated: Vec<BatchJob> = Vec::with_capacity(8);
         accumulated.push(first);
-        // Drain any jobs already in the queue (non-blocking).
         while total_ops < config.batch_size_max {
             match job_rx.try_recv() {
                 Ok(job) => {
-                    total_ops += job.ops.len();
+                    total_ops = total_ops.saturating_add(job.ops.len());
                     accumulated.push(job);
                 }
                 Err(_) => break,
-            }
-        }
-        // Fast-flush rule: if we already have enough work or the
-        // queue is empty (no concurrent submitters trickling jobs
-        // in), don't wait for more.
-        let already_full = total_ops >= config.batch_size_max;
-        let already_busy = accumulated.len() >= 2;
-        if already_full || (config.batch_window_ms == 0) {
-            // No window — go straight to execute.
-            process_jobs(accumulated);
-            continue 'outer;
-        }
-        // Only enter the time-window if our first scoop found more
-        // jobs (indicating concurrent submitters worth waiting
-        // for). Otherwise flush eagerly — the bench's
-        // single-batch-and-wait pattern hits this branch.
-        if !already_busy {
-            process_jobs(accumulated);
-            continue 'outer;
-        }
-
-        let deadline = Instant::now() + Duration::from_millis(config.batch_window_ms);
-
-        while total_ops < config.batch_size_max {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            select! {
-                recv(job_rx) -> r => match r {
-                    Ok(job) => {
-                        total_ops += job.ops.len();
-                        accumulated.push(job);
-                    }
-                    // Senders gone — process what we have, then exit at
-                    // the top of the outer loop (which will see the
-                    // disconnect on the next first-job wait).
-                    Err(_) => break,
-                },
-                recv(shutdown_rx) -> _ => {
-                    while let Ok(j) = job_rx.try_recv() {
-                        accumulated.push(j);
-                    }
-                    process_jobs(accumulated);
-                    break 'outer;
-                },
-                default(remaining) => break, // window expired
             }
         }
 
@@ -315,12 +256,12 @@ where
         let mut completed: usize = 0;
         let mut failure: Option<(usize, Error)> = None;
         // 0.9.3: accumulate one representative file path per
-        // unique parent directory in grouped mode. After all
-        // ops succeed, we issue one `sync_parent_dir` per
-        // unique parent rather than the N-per-op cost the
-        // regular path incurs. The map's key is the parent
-        // directory; the value is some file path inside it that
-        // `sync_parent_dir` (which takes a file path and
+        // unique parent directory in grouped mode. After the job
+        // finishes, one parent-directory sync is issued per unique
+        // parent of the ops that completed, rather than the
+        // N-per-op cost the regular path incurs. The map's key is
+        // the parent directory; the value is some file path inside
+        // it that `sync_parent` (which takes a file path and
         // internally `.parent()`s it) can consume directly.
         // Only populated when `grouped == true`.
         let mut grouped_parents: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
@@ -337,7 +278,9 @@ where
                     BatchOp::Copy { dst, .. } => {
                         dst.parent().map(|p| (PathBuf::from(p), dst.clone()))
                     }
-                    BatchOp::Delete { .. } => None,
+                    BatchOp::Delete { path } => {
+                        path.parent().map(|p| (PathBuf::from(p), path.clone()))
+                    }
                 }
             } else {
                 None
@@ -364,18 +307,22 @@ where
             }
         }
 
-        // 0.9.3 grouped commit: if every op succeeded, issue
-        // exactly one `sync_parent_dir` per unique parent
-        // directory. This collapses the N-per-op cost of the
+        // 0.9.3 grouped commit: issue exactly one parent-directory
+        // sync per unique parent directory of the ops that
+        // completed. This collapses the N-per-op cost of the
         // regular path into one-per-unique-dir, which for the
         // typical "all ops in the batch live under the same
         // directory" workload is just one syscall total.
-        // Best-effort, matching pre-0.9.3 semantics where
-        // `sync_parent_dir` errors were swallowed by
-        // `execute_write`.
-        if grouped && failure.is_none() {
+        //
+        // The syncs run even when a later op failed: the batch
+        // contract is that ops completed before the failure are
+        // durable, and their renames / unlinks are only durable
+        // once their directories are synced. Best-effort, matching
+        // the per-op path where a directory-sync error does not
+        // undo an already-published rename.
+        if grouped {
             for repr in grouped_parents.values() {
-                let _ = platform::sync_parent_dir(repr);
+                let _ = crate::crud::sync_parent(repr);
             }
         }
 
@@ -401,98 +348,50 @@ where
 fn execute_op(op: BatchOp, snapshot: &HandleSnapshot, grouped: bool) -> Result<()> {
     match op {
         BatchOp::Write { path, data } => execute_write(&path, &data, snapshot, grouped),
-        BatchOp::Delete { path } => execute_delete(&path),
+        BatchOp::Delete { path } => execute_delete(&path, grouped),
         BatchOp::Copy { src, dst } => execute_copy(&src, &dst, snapshot, grouped),
     }
 }
 
-/// Atomic-replace write. Mirrors [`crate::crud::file`]'s `Handle::write`
-/// minus the `update_active_method` callback. See decisions D-1 and
-/// D-4(c) in `.dev/DECISIONS-0.4.0.md` for why this duplication exists
-/// and where it folds back together in `0.5.0`.
+/// Atomic-replace write through the shared sequence in
+/// [`crate::crud::atomic`]. Direct writes use the platform path (the
+/// dispatcher has no handle, so no `io_uring` ring); a Direct request
+/// that the filesystem refuses falls back to a buffered write for this
+/// op only, without changing [`crate::Handle::active_method`]
+/// (decision D-5 in `.dev/DECISIONS-0.4.0.md`).
+///
+/// In grouped mode the parent-directory sync is skipped here and
+/// issued once per unique directory by [`process_jobs_with`].
 fn execute_write(path: &Path, data: &[u8], snapshot: &HandleSnapshot, grouped: bool) -> Result<()> {
-    let temp = Handle::gen_temp_path(path);
-
-    // Step 1: open the temp file (Direct IO if requested).
-    let (file, direct_ok) = platform::open_write_new(&temp, snapshot.use_direct).map_err(|e| {
-        Error::AtomicReplaceFailed {
-            step: "open_temp",
-            source: as_io_error(e),
-        }
-    })?;
-
-    // Step 2: write data. Direct IO uses sector-aligned write; buffered
-    // path is the fallback.
-    let write_result = if direct_ok {
-        platform::write_all_direct(&file, data, snapshot.sector_size)
-    } else {
-        platform::write_all(&file, data)
+    let plan = ReplacePlan {
+        use_direct: snapshot.use_direct,
+        flush: BufferedFlush::for_method(snapshot.method),
+        sync_parent: !grouped,
     };
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&temp);
-        return Err(Error::AtomicReplaceFailed {
-            step: "write",
-            source: as_io_error(e),
-        });
-    }
-
-    if direct_ok {
-        // Step 3 (Direct IO): NO_BUFFERING writes are sector-padded.
-        // Drop the NO_BUFFERING handle (WRITE_THROUGH already flushed
-        // bytes to disk on Windows; on Linux/macOS the file was just
-        // written) and reopen buffered to truncate to the actual data
-        // length. Mirrors crud/file.rs:71-84.
-        drop(file);
-        if let Err(e) = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&temp)
-            .and_then(|f| f.set_len(data.len() as u64))
-        {
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "truncate",
-                source: e,
-            });
-        }
-    } else {
-        // Step 3 (Buffered path): explicit flush per snapshot.method.
-        let flush_result = flush_for_method(&file, snapshot.method);
-        if let Err(e) = flush_result {
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::AtomicReplaceFailed {
-                step: "flush",
-                source: as_io_error(e),
-            });
-        }
-        drop(file);
-    }
-
-    // Step 5: atomic rename.
-    if let Err(e) = platform::atomic_rename(&temp, path) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(Error::AtomicReplaceFailed {
-            step: "rename",
-            source: as_io_error(e),
-        });
-    }
-
-    // Step 6: best-effort parent-dir sync (no-op on Windows).
-    // 0.9.3: in grouped mode, the dispatcher amortises this
-    // call across the whole batch — it accumulates unique
-    // parent directories and issues one `sync_parent_dir` per
-    // unique parent after the entire batch succeeds, instead
-    // of paying per-op.
-    if !grouped {
-        let _ = platform::sync_parent_dir(path);
-    }
-
-    Ok(())
+    atomic_replace(
+        path,
+        data,
+        &plan,
+        &PlatformHooks {
+            sector_size: snapshot.sector_size,
+        },
+    )
 }
 
 /// Idempotent delete: missing-file is `Ok(())`.
-fn execute_delete(path: &Path) -> Result<()> {
+///
+/// A successful unlink is made durable by syncing the parent directory
+/// (per op, or once per directory in grouped mode). Best-effort, like
+/// the write path: the unlink has already happened when the directory
+/// sync runs.
+fn execute_delete(path: &Path, grouped: bool) -> Result<()> {
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if !grouped {
+                let _ = crate::crud::sync_parent(path);
+            }
+            Ok(())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Error::Io(e)),
     }
@@ -506,40 +405,6 @@ fn execute_copy(src: &Path, dst: &Path, snapshot: &HandleSnapshot, grouped: bool
     // chooses the atomic-replace path for consistency with `Handle::write`.
     let data = std::fs::read(src).map_err(Error::Io)?;
     execute_write(dst, &data, snapshot, grouped)
-}
-
-/// Selects the flush primitive based on method. Mirrors the
-/// `Handle::flush_file` decision tree in `crud/file.rs`.
-fn flush_for_method(file: &std::fs::File, method: Method) -> Result<()> {
-    match method {
-        Method::Direct => {
-            // On Windows, FILE_FLAG_WRITE_THROUGH already flushed each
-            // write. On Linux/macOS, we still need a fence — fdatasync
-            // (Linux) or F_FULLFSYNC (macOS, via sync_data).
-            #[cfg(target_os = "windows")]
-            {
-                Ok(())
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                platform::sync_data(file)
-            }
-        }
-        Method::Data => platform::sync_data(file),
-        // Sync, Auto (resolved), Mmap (reserved), Journal (reserved):
-        // full fsync.
-        _ => platform::sync_full(file),
-    }
-}
-
-/// Converts a `crate::Error` into a `std::io::Error` for embedding in
-/// `Error::AtomicReplaceFailed { source: std::io::Error }`. Mirrors the
-/// helper of the same name in `crud/file.rs`.
-fn as_io_error(e: Error) -> std::io::Error {
-    match e {
-        Error::Io(io_err) => io_err,
-        other => std::io::Error::other(other.to_string()),
-    }
 }
 
 #[cfg(test)]
@@ -603,14 +468,14 @@ mod tests {
     fn test_execute_delete_idempotent_on_missing_file() {
         let path = tmp_path("delete_missing");
         // No file created.
-        execute_delete(&path).expect("delete missing should succeed");
+        execute_delete(&path, false).expect("delete missing should succeed");
     }
 
     #[test]
     fn test_execute_delete_removes_existing_file() {
         let path = tmp_path("delete_existing");
         std::fs::write(&path, b"x").unwrap();
-        execute_delete(&path).expect("delete");
+        execute_delete(&path, false).expect("delete");
         assert!(!path.exists());
     }
 
@@ -683,39 +548,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_as_io_error_passes_through_io_variant() {
-        let inner = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        let err = Error::Io(inner);
-        let io = as_io_error(err);
-        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+    fn direct_snapshot() -> HandleSnapshot {
+        HandleSnapshot {
+            method: Method::Direct,
+            sector_size: crate::platform::probe_sector_size(&std::env::temp_dir()),
+            use_direct: true,
+        }
     }
 
     #[test]
-    fn test_as_io_error_wraps_non_io_variant() {
-        let err = Error::HardwareProbeFailed {
-            detail: "stub".into(),
-        };
-        let io = as_io_error(err);
-        // The display string of the original error is embedded.
-        assert!(io.to_string().contains("FS-00003"));
+    fn test_execute_write_direct_unaligned_reads_back_exactly() {
+        for len in [0usize, 1, 1000, 4096, 5000] {
+            let path = tmp_path("direct_unaligned");
+            let _g = TmpFile(path.clone());
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            execute_write(&path, &payload, &direct_snapshot(), false).expect("direct write");
+            assert_eq!(std::fs::read(&path).unwrap(), payload, "len {len}");
+        }
     }
 
+    // Windows Direct writes use FILE_FLAG_WRITE_THROUGH; no separate
+    // fence is issued there.
+    #[cfg(not(target_os = "windows"))]
     #[test]
-    fn test_flush_for_method_sync_calls_full_sync() {
-        // Smoke test: open a file, flush with Method::Sync.
-        let path = tmp_path("flush_sync");
+    fn test_execute_write_direct_fences_before_rename() {
+        let path = tmp_path("direct_fence");
         let _g = TmpFile(path.clone());
-        let f = std::fs::File::create(&path).unwrap();
-        flush_for_method(&f, Method::Sync).expect("sync flush");
-    }
-
-    #[test]
-    fn test_flush_for_method_data_calls_data_sync() {
-        let path = tmp_path("flush_data");
-        let _g = TmpFile(path.clone());
-        let f = std::fs::File::create(&path).unwrap();
-        flush_for_method(&f, Method::Data).expect("data flush");
+        let before = crate::crud::fence_probe::count();
+        execute_write(&path, &[7u8; 1000], &direct_snapshot(), false).expect("direct write");
+        assert!(
+            crate::crud::fence_probe::count() > before,
+            "group-lane Direct write must fence the temp file before the rename"
+        );
     }
 
     // ── Panic safety (decision D-6) ──────────────────────────────────────
@@ -817,6 +681,89 @@ mod tests {
             r_ok.is_ok(),
             "second job should succeed despite first job's panic"
         );
+    }
+
+    #[test]
+    fn test_execute_delete_syncs_parent_directory() {
+        let path = tmp_path("delete_dir_sync");
+        std::fs::write(&path, b"x").unwrap();
+        let before = crate::crud::fence_probe::dir_syncs();
+        execute_delete(&path, false).expect("delete");
+        assert_eq!(crate::crud::fence_probe::dir_syncs(), before + 1);
+        // Missing file: nothing changed, nothing to sync.
+        execute_delete(&path, false).expect("delete missing");
+        assert_eq!(crate::crud::fence_probe::dir_syncs(), before + 1);
+    }
+
+    #[test]
+    fn test_grouped_job_syncs_completed_dirs_even_when_a_later_op_fails() {
+        // Ops that complete before a failure are documented as
+        // durable; in grouped mode that requires the per-directory
+        // sync to run for them even though the job failed.
+        let ok = tmp_path("grouped_partial_ok");
+        let _g = TmpFile(ok.clone());
+        let bad_dir = tmp_path("grouped_partial_bad");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let job = BatchJob {
+            ops: vec![
+                BatchOp::Write {
+                    path: ok.clone(),
+                    data: b"ok".to_vec(),
+                },
+                BatchOp::Write {
+                    path: bad_dir.clone(),
+                    data: b"fails: target is a directory".to_vec(),
+                },
+            ],
+            snapshot: snapshot(),
+            response: BatchResponse::Sync(tx),
+            grouped: true,
+        };
+        let before = crate::crud::fence_probe::dir_syncs();
+        process_jobs_with(vec![job], execute_op);
+        let _ = std::fs::remove_dir_all(&bad_dir);
+        let err = rx.recv().unwrap().expect_err("op 1 fails");
+        assert_eq!((err.failed_at, err.completed), (1, 1));
+        assert_eq!(
+            crate::crud::fence_probe::dir_syncs(),
+            before + 1,
+            "the completed op's directory must be synced"
+        );
+        assert_eq!(std::fs::read(&ok).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn test_grouped_job_syncs_each_directory_once() {
+        let a = tmp_path("grouped_once_a");
+        let b = tmp_path("grouped_once_b");
+        let d = tmp_path("grouped_once_del");
+        let _ga = TmpFile(a.clone());
+        let _gb = TmpFile(b.clone());
+        std::fs::write(&d, b"x").unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let job = BatchJob {
+            ops: vec![
+                BatchOp::Write {
+                    path: a.clone(),
+                    data: b"a".to_vec(),
+                },
+                BatchOp::Write {
+                    path: b.clone(),
+                    data: b"b".to_vec(),
+                },
+                BatchOp::Delete { path: d.clone() },
+            ],
+            snapshot: snapshot(),
+            response: BatchResponse::Sync(tx),
+            grouped: true,
+        };
+        let before = crate::crud::fence_probe::dir_syncs();
+        process_jobs_with(vec![job], execute_op);
+        rx.recv().unwrap().expect("job succeeds");
+        // All three paths share the temp directory.
+        assert_eq!(crate::crud::fence_probe::dir_syncs(), before + 1);
+        assert!(!d.exists());
     }
 
     #[test]

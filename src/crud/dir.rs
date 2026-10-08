@@ -287,7 +287,14 @@ impl Handle {
     /// If you want "every entry under this tree" without filtering,
     /// use [`Handle::scan_all`] instead of `find("**")`.
     ///
-    /// Symlinks are not followed in `0.6.0`.
+    /// Symlinks are **not** followed: a symlink is reported if its own
+    /// path matches, but `find` never descends through a symlinked
+    /// directory, so `**` cannot leave the tree under `path` through
+    /// a link. `path` itself is taken literally; glob metacharacters
+    /// or braces in its name are not interpreted. Entries whose names
+    /// are not valid UTF-8 cannot match a pattern and are skipped
+    /// (including their subtrees). Results are produced in a
+    /// depth-first walk with each directory's entries sorted by name.
     ///
     /// # Errors
     ///
@@ -321,37 +328,22 @@ impl Handle {
             });
         }
 
-        let combined = root.join(pattern);
-        let combined_str = combined.to_str().ok_or_else(|| Error::InvalidPath {
-            path: combined.clone(),
-            reason: "non-UTF-8 path component".into(),
-        })?;
-
-        // Brace alternation `{a,b}` is part of the 0.6.0 `find`
-        // API contract (D-4) but is not supported natively by the
-        // `glob` crate. Expand braces here so each expanded
-        // pattern is a single `glob`-supported string, then union
-        // the match sets.
-        let expanded = expand_braces(combined_str);
+        // The pattern is matched against paths relative to `root`;
+        // `root` itself never becomes part of a glob, so glob
+        // metacharacters or braces in the base directory's name are
+        // taken literally.
+        let matchers = FindMatchers::compile(pattern)?;
 
         let mut out: Vec<std::path::PathBuf> = Vec::new();
-        let mut seen: std::collections::HashSet<std::path::PathBuf> =
-            std::collections::HashSet::new();
-        for sub in &expanded {
-            let paths = glob::glob(sub).map_err(|e| Error::GlobPatternInvalid {
-                reason: e.to_string(),
-            })?;
-            for entry in paths {
-                match entry {
-                    Ok(p) => {
-                        if seen.insert(p.clone()) {
-                            out.push(p);
-                        }
-                    }
-                    Err(e) => return Err(Error::Io(e.into_error())),
-                }
-            }
+        // Mirrors the previous `glob::glob` behaviour: a base that is
+        // missing or not a directory has no matches.
+        if !root.is_dir() {
+            return Ok(out);
         }
+        if matchers.match_root {
+            out.push(root.clone());
+        }
+        find_walk(&root, "", 0, &matchers, &mut out)?;
         Ok(out)
     }
 
@@ -470,6 +462,127 @@ fn expand_braces_into(pattern: &str, out: &mut Vec<String>) {
         let with_alt = format!("{prefix}{alt}{suffix}");
         expand_braces_into(&with_alt, out);
     }
+}
+
+/// Match options used by [`Handle::find`]. Same semantics as
+/// `glob::glob`'s defaults (case-sensitive, `*` matches a leading dot)
+/// with `*` and `?` confined to one path component, which is how
+/// `glob::glob` behaves when it walks a pattern component by component.
+const FIND_MATCH_OPTIONS: glob::MatchOptions = glob::MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+/// One brace-expanded alternative of a `find` pattern.
+struct FindPattern {
+    pattern: glob::Pattern,
+    /// Number of path components a match must have; `None` when the
+    /// pattern contains `**` and can match at any depth.
+    depth: Option<usize>,
+    /// A pattern ending in `**` matches directories only (as with
+    /// `glob::glob`).
+    dirs_only: bool,
+}
+
+/// Compiled form of a `find` pattern: the union of its brace
+/// alternatives.
+struct FindMatchers {
+    patterns: Vec<FindPattern>,
+    /// Deepest level any alternative can match; `None` = unbounded.
+    max_depth: Option<usize>,
+    /// The base directory itself matches (empty pattern or all-`**`).
+    match_root: bool,
+}
+
+impl FindMatchers {
+    fn compile(pattern: &str) -> Result<Self> {
+        let mut patterns = Vec::new();
+        let mut max_depth = Some(0usize);
+        let mut match_root = false;
+        for alt in expand_braces(pattern) {
+            let comps: Vec<&str> = alt
+                .split(std::path::is_separator)
+                .filter(|c| !c.is_empty() && *c != ".")
+                .collect();
+            if comps.iter().all(|c| *c == "**") {
+                match_root = true;
+            }
+            if comps.is_empty() {
+                continue;
+            }
+            let recursive = comps.contains(&"**");
+            let depth = if recursive { None } else { Some(comps.len()) };
+            let compiled =
+                glob::Pattern::new(&comps.join("/")).map_err(|e| Error::GlobPatternInvalid {
+                    reason: e.to_string(),
+                })?;
+            max_depth = match (max_depth, depth) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                _ => None,
+            };
+            patterns.push(FindPattern {
+                pattern: compiled,
+                depth,
+                dirs_only: comps.last() == Some(&"**"),
+            });
+        }
+        Ok(Self {
+            patterns,
+            max_depth,
+            match_root,
+        })
+    }
+
+    fn matches(&self, rel: &str, depth: usize, is_dir: bool) -> bool {
+        self.patterns.iter().any(|p| {
+            p.depth.map_or(true, |d| d == depth)
+                && (is_dir || !p.dirs_only)
+                && p.pattern.matches_with(rel, FIND_MATCH_OPTIONS)
+        })
+    }
+}
+
+/// Walks `dir` (at `depth` components below the `find` base, with
+/// relative path `rel`) without following symlinks, collecting every
+/// entry that matches `m`.
+fn find_walk(
+    dir: &Path,
+    rel: &str,
+    depth: usize,
+    m: &FindMatchers,
+    out: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
+    if m.max_depth.is_some_and(|max| depth >= max) {
+        return Ok(());
+    }
+    let mut entries: Vec<(std::ffi::OsString, std::fs::FileType)> = Vec::new();
+    for item in std::fs::read_dir(dir).map_err(Error::Io)? {
+        let entry = item.map_err(Error::Io)?;
+        // `DirEntry::file_type` does not follow symlinks.
+        let ft = entry.file_type().map_err(Error::Io)?;
+        entries.push((entry.file_name(), ft));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, ft) in entries {
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let child_rel = if rel.is_empty() {
+            name_str.to_owned()
+        } else {
+            format!("{rel}/{name_str}")
+        };
+        let child = dir.join(&name);
+        let is_dir = ft.is_dir();
+        if m.matches(&child_rel, depth + 1, is_dir) {
+            out.push(child.clone());
+        }
+        if is_dir {
+            find_walk(&child, &child_rel, depth + 1, m, out)?;
+        }
+    }
+    Ok(())
 }
 
 /// Recursive walk helper. Best-effort: when a subdirectory cannot be
@@ -641,6 +754,135 @@ mod tests {
                 "b-2".to_string(),
             ]
         );
+    }
+
+    fn names(hits: &[std::path::PathBuf], base: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = hits
+            .iter()
+            .map(|p| {
+                p.strip_prefix(base)
+                    .expect("hit under base")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn seed_tree(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("sub").join("deep")).expect("mkdir");
+        std::fs::write(root.join("top.log"), b"x").expect("write");
+        std::fs::write(root.join(".hidden.log"), b"x").expect("write");
+        std::fs::write(root.join("notes.txt"), b"x").expect("write");
+        std::fs::write(root.join("sub").join("inner.log"), b"x").expect("write");
+        std::fs::write(root.join("sub").join("deep").join("leaf.log"), b"x").expect("write");
+    }
+
+    #[test]
+    fn test_find_matches_glob_semantics() {
+        let root = tmp_path("find_semantics");
+        let _g = TmpDir(root.clone());
+        seed_tree(&root);
+        let h = handle();
+        assert_eq!(
+            names(&h.find(&root, "*.log").expect("find"), &root),
+            vec![".hidden.log", "top.log"]
+        );
+        assert_eq!(
+            names(&h.find(&root, "**/*.log").expect("find"), &root),
+            vec![
+                ".hidden.log",
+                "sub/deep/leaf.log",
+                "sub/inner.log",
+                "top.log"
+            ]
+        );
+        assert_eq!(
+            names(&h.find(&root, "sub/*.log").expect("find"), &root),
+            vec!["sub/inner.log"]
+        );
+        assert_eq!(
+            names(&h.find(&root, "./sub/**/*.log").expect("find"), &root),
+            vec!["sub/deep/leaf.log", "sub/inner.log"]
+        );
+        assert_eq!(
+            names(&h.find(&root, "{top,notes}.*").expect("find"), &root),
+            vec!["notes.txt", "top.log"]
+        );
+        // `**` alone yields the base and every directory under it.
+        assert_eq!(
+            names(&h.find(&root, "**").expect("find"), &root),
+            vec!["", "sub", "sub/deep"]
+        );
+        assert!(h.find(&root, "*.none").expect("find").is_empty());
+        assert!(matches!(
+            h.find(&root, "a**b"),
+            Err(crate::Error::GlobPatternInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn test_find_missing_base_has_no_matches() {
+        let root = tmp_path("find_missing_base");
+        assert!(handle().find(&root, "*").expect("find").is_empty());
+    }
+
+    #[test]
+    fn test_find_treats_base_directory_name_literally() {
+        // Before 1.1.1 the base path was spliced into the glob, so
+        // `[`, `]`, `{` and `}` in its name were interpreted.
+        let parent = tmp_path("find_literal");
+        let _g = TmpDir(parent.clone());
+        let base = parent.join("data[1]{a,b}");
+        std::fs::create_dir_all(&base).expect("mkdir");
+        std::fs::write(base.join("x.log"), b"x").expect("write");
+        let hits = handle().find(&base, "*.log").expect("find");
+        assert_eq!(names(&hits, &base), vec!["x.log"]);
+    }
+
+    #[cfg(unix)]
+    fn dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    // Junctions need no privilege on Windows (symlinks do).
+    #[cfg(windows)]
+    fn dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn test_find_does_not_descend_through_symlinked_directories() {
+        let base = tmp_path("find_symlink");
+        let _g = TmpDir(base.clone());
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        std::fs::write(outside.join("secret.log"), b"x").expect("write");
+        std::fs::write(root.join("own.log"), b"x").expect("write");
+        if !dir_link(&outside, &root.join("link")) {
+            return; // link creation unavailable on this host
+        }
+        let h = handle();
+        let hits = names(&h.find(&root, "**/*.log").expect("find"), &root);
+        assert_eq!(hits, vec!["own.log"], "find followed a directory link");
+        // The link itself is still reported when its own path matches.
+        let hits = names(&h.find(&root, "li*").expect("find"), &root);
+        assert_eq!(hits, vec!["link"]);
+        // Cleanup must not recurse into the link target.
+        let _ = std::fs::remove_dir(root.join("link"));
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(root.join("link"));
     }
 
     #[test]

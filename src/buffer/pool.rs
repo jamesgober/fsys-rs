@@ -101,19 +101,16 @@ impl AlignedBufferPool {
     }
 
     /// Returns the configured block size in bytes.
-    #[allow(dead_code)] // surfaced via Handle integration in F+G
     pub(crate) fn block_size(&self) -> usize {
         self.inner.block_layout.size()
     }
 
     /// Returns the configured block alignment in bytes.
-    #[allow(dead_code)] // surfaced via Handle integration in F+G
     pub(crate) fn block_align(&self) -> usize {
         self.inner.block_layout.align()
     }
 
     /// Returns the configured pool capacity (max outstanding buffers).
-    #[allow(dead_code)] // surfaced via Handle integration in F+G
     pub(crate) fn capacity(&self) -> usize {
         self.inner.capacity
     }

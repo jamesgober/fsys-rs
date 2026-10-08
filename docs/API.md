@@ -73,8 +73,6 @@ fs.write("/tmp/note.txt", b"hello")?;
 let fs = builder()
     .method(Method::Direct)
     .root("/data")
-    .buffer_pool_count(128)
-    .buffer_pool_block_size(65_536)
     .build()?;
 # Ok::<(), fsys::Error>(())
 ```
@@ -124,11 +122,11 @@ passthrough slot (Linux + Windows). It is `Send + Sync` and
 |---|---|
 | `write(path, data)` | Atomic-replace write; durable on return. |
 | `write_copy(path, data)` | Atomic-replace write **preserving the existing target's metadata** (mode/ACLs/timestamps). *Not* a file-to-file copy — see [`std::fs::copy`] for that. |
-| `write_at(path, offset, data)` | Positioned write at `offset` without atomic-replace. |
+| `write_at(path, offset, data)` | Positioned write at `offset` without atomic-replace. Not flushed; call `sync(path)` when the writes must be durable. Creates the file if missing. |
 | `append(path, data)` | Append to an existing file (creates if missing). Not individually flushed; call `Handle::sync` for batched durability. |
 | `read(path)` | Read full file contents into a `Vec<u8>`. |
 | `read_at(path, offset, len)` | Read `len` bytes from `offset`. *(Renamed from `read_range` in 0.7.0.)* |
-| `copy(src, dst)` | File-to-file copy. On APFS uses `clonefile(2)` for instant reflink; on ReFS uses `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. Falls back to `std::fs::copy` on unsupported filesystems. *(0.9.6 reflink fast-path.)* |
+| `copy(src, dst)` | File-to-file copy. On APFS uses `clonefile(2)` for instant reflink; on ReFS uses `FSCTL_DUPLICATE_EXTENTS_TO_FILE`; on Linux `copy_file_range(2)`. Falls back to `std::fs::copy` on unsupported filesystems. Not atomic and not flushed: call `sync(dst)` for durability, or use `copy_batch` for an atomic, durable copy (which reads the source into memory). *(0.9.6 reflink fast-path.)* |
 | `delete(path)` | Unlink a file. |
 | `truncate(path, len)` | Truncate file to `len` bytes. |
 | `rename(from, to)` | Rename a file or directory. |
@@ -262,11 +260,8 @@ let fs = fsys::builder()
     .method(Method::Direct)
     .root("/data")
     .mode(Mode::Prod)
-    .batch_window_ms(2)
     .batch_size_max(256)
     .batch_queue_max(2048)
-    .buffer_pool_count(128)
-    .buffer_pool_block_size(65_536)
     .io_uring_queue_depth(256)
     .build()?;
 ```
@@ -276,15 +271,15 @@ let fs = fsys::builder()
 | `method(Method)` | `Auto` | Durability strategy. |
 | `root(P)` | `None` | Path-scope enforcement. Paths that escape the root are rejected with `Error::InvalidPath`. |
 | `mode(Mode)` | `Auto` | Dev/Prod profile. |
-| `batch_window_ms(u64)` | `1` | Group-lane time threshold. |
-| `batch_size_max(usize)` | `128` | Group-lane count threshold. |
-| `batch_queue_max(usize)` | `1024` | Group-lane queue capacity. |
-| `buffer_pool_count(usize)` | `64` | Number of aligned buffers in the per-handle pool. *(Renamed from `buffer_pool_size` in 0.7.0.)* |
-| `buffer_pool_block_size(usize)` | `4096` | Per-buffer size in bytes. *(Renamed from `buffer_pool_block` in 0.7.0.)* |
+| `batch_window_ms(u64)` | n/a | Accepted, unused since 1.1.1: the dispatcher no longer waits for more jobs (each op has its own fence, so waiting only added latency). |
+| `batch_size_max(usize)` | `128` | Ops the dispatcher takes from the queue per pass. `0` = one job per pass. |
+| `batch_queue_max(usize)` | `1024` | Group-lane queue capacity; submitters block when full. `0` = rendezvous queue. |
+| `buffer_pool_count(usize)` | `64` | Reserved: stored but not used by any IO path in 1.1.x. *(Renamed from `buffer_pool_size` in 0.7.0.)* |
+| `buffer_pool_block_size(usize)` | `4096` | Reserved: stored but not used by any IO path in 1.1.x. *(Renamed from `buffer_pool_block` in 0.7.0.)* |
 | `io_uring_queue_depth(u32)` | `128` | Linux io_uring SQ depth. |
 | `dispatcher_shards(usize)` | `1` | Number of group-lane dispatcher threads per handle. Values > 1 spawn N independent dispatchers; batches hash-route by first op's path. Lifts the pre-0.9.3 one-core ceiling. Clamped to `1..=64`. *(0.9.3.)* |
 | `observer(Arc<dyn FsysObserver>)` | `None` | Register a structured-telemetry hook. Per-op events (journal append / sync / handle write / read) fire on the originating thread. *(0.9.2.)* |
-| `tune_for(Workload)` | — | One-line preset for coordinated knobs. `Workload::Database` sets `buffer_pool_count=1024`, `buffer_pool_block_size=8192`, `io_uring_queue_depth=256`, `batch_queue_max=4096`. *(0.9.2.)* |
+| `tune_for(Workload)` | n/a | One-line preset for coordinated knobs. `Workload::Database` sets `io_uring_queue_depth=256`, `batch_queue_max=4096` and the reserved `buffer_pool_count=1024`, `buffer_pool_block_size=8192`. *(0.9.2.)* |
 | `sqpoll(u32)` | `None` | Opt-in `IORING_SETUP_SQPOLL` with the given idle timeout (ms). Kernel-side polling thread drains the SQ without `io_uring_enter` syscalls. Linux-only consumption; ignored elsewhere. Falls back to non-SQPOLL on EPERM. *(0.9.7.)* |
 
 ---
@@ -293,19 +288,23 @@ let fs = fsys::builder()
 
 `Batch` is the type returned by `Handle::batch()` for the
 fluent batch-builder ergonomics. Operations accumulate via
-`.write(path, data)` / `.delete(path)` / `.sync(path)` /
-`.copy(src, dst)` and flush on `.commit()` (best-effort) or
-`.commit_grouped()` (atomic).
+`.write(path, data)` / `.delete(path)` / `.copy(src, dst)` and
+are submitted by `.commit()` or `.commit_grouped()`.
 
-For programmatic batch construction, prefer
-`Handle::write_batch(Vec<BatchOp>)` directly.
+For batches already collected in a slice, `Handle::write_batch(&[(path, data)])`,
+`Handle::delete_batch(&[path])` and `Handle::copy_batch(&[(src, dst)])`
+skip the builder.
+
+Ops run in submission order; the first failure stops the batch and
+the ops completed before it stay applied and durable (they are not
+rolled back). Neither variant makes the batch atomic as a whole.
 
 ### `commit` vs `commit_grouped` (0.9.3)
 
 | Method | Semantics |
 |---|---|
-| `commit()` | Best-effort. Each op runs through the dispatcher individually; failures surface a `BatchError` but successful ops are preserved. |
-| `commit_grouped()` | **Atomic-batch fsync.** Amortises parent-directory `fsync` across the entire batch — one syscall per unique parent directory instead of one per op. Right choice for bulk-load / SST-flush / checkpoint workloads where the batch is the durability unit. *(0.9.3.)* |
+| `commit()` | Each op syncs its parent directory as soon as it completes, so every op is durable before the next one starts. |
+| `commit_grouped()` | Amortises the parent-directory `fsync`: one per unique parent directory, issued after the last op (also when a later op failed, for the ops that completed). Until the call returns, a crash can leave any subset of the batch visible, each file entirely old or entirely new. Right choice for bulk-load / SST-flush / checkpoint workloads where the batch is the durability unit. *(0.9.3.)* |
 
 `BatchError` is the error type returned by partial-failure
 batches. Per the 0.9.6 H-4 audit, its fields are private; use
