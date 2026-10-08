@@ -238,64 +238,90 @@ impl JournalHandle {
     /// callers naturally arrive on a different timescale than
     /// sync callers, and the io_uring fsync is itself zero-
     /// syscall-cost on the submitter side.
-    // 0.9.6 audit fix: takes `&self` rather than `self: Arc<Self>`
-    // (same E0505 borrow conflict as `append_native` — see its doc
-    // comment for the explanation).
+    ///
+    /// 1.1.1: the state lock is taken only inside the synchronous
+    /// [`Self::try_lead_group_commit`] / [`Self::finish_group_commit`]
+    /// helpers, so no `parking_lot` guard is ever alive across an
+    /// `.await` and the future stays `Send` (it was `!Send` on Linux
+    /// in 1.1.0 because the guard binding spanned the yields).
     async fn sync_through_native(self: &Arc<Self>, ring: &AsyncIoUring, lsn: Lsn) -> Result<()> {
         use std::os::fd::AsRawFd;
 
         let lsn_off = lsn.as_u64();
         loop {
-            // Atomic-load fast path — cheaper than a lock
-            // acquire when the durable frontier already covers
-            // our target.
+            // Atomic-load fast path: cheaper than a lock acquire
+            // when the durable frontier already covers our target.
             if self.synced_lsn.load(Ordering::Acquire) >= lsn_off {
                 return Ok(());
             }
-            // Non-blocking try_lock so the tokio worker isn't
-            // parked on a contended mutex.
-            let mut state = match self.group_commit.state.try_lock() {
-                Some(g) => g,
-                None => {
+            match self.try_lead_group_commit(lsn_off) {
+                LeaderAttempt::Covered => return Ok(()),
+                // Lock contended, or another caller (sync or async)
+                // is running the fsync. Yield; on resume the
+                // synced_lsn fast path or committed_lsn re-check
+                // will likely cover us.
+                LeaderAttempt::Busy => {
                     tokio::task::yield_now().await;
                     continue;
                 }
-            };
-            if state.committed_lsn >= lsn_off {
-                return Ok(());
+                LeaderAttempt::Leader => {}
             }
-            if state.in_flight {
-                // Another caller (sync or async) is running
-                // fsync. Drop the lock and yield; on resume,
-                // the synced_lsn fast path or committed_lsn
-                // re-check will likely cover us.
-                drop(state);
-                tokio::task::yield_now().await;
-                continue;
-            }
-            // Become leader. Mark in_flight, release the lock
-            // before submitting the io_uring SQE so concurrent
-            // followers can observe the in-flight state.
-            state.in_flight = true;
-            drop(state);
 
             let frontier = self.next_lsn.load(Ordering::Acquire);
             let file = FileRef::new(Arc::clone(self), |j| j.file.as_raw_fd());
             let result = crate::async_io::iouring_substrate::fdatasync_native(ring, file).await;
-
-            // Re-acquire to publish committed_lsn and clear
-            // in_flight; notify any parked sync-path
-            // followers via cv_followers.
-            let mut state = self.group_commit.state.lock();
-            if result.is_ok() && frontier > state.committed_lsn {
-                state.committed_lsn = frontier;
-                self.synced_lsn.store(frontier, Ordering::Release);
-            }
-            state.in_flight = false;
-            let _ = self.group_commit.cv_followers.notify_all();
+            self.finish_group_commit(result.is_ok().then_some(frontier));
             return result;
         }
     }
+
+    /// Tries to become the group-commit leader for `lsn_off` without
+    /// blocking. On [`LeaderAttempt::Leader`] this caller has set
+    /// `in_flight` and must call [`Self::finish_group_commit`].
+    fn try_lead_group_commit(&self, lsn_off: u64) -> LeaderAttempt {
+        // Non-blocking try_lock so the tokio worker isn't parked on a
+        // contended mutex.
+        let Some(mut state) = self.group_commit.state.try_lock() else {
+            return LeaderAttempt::Busy;
+        };
+        if state.committed_lsn >= lsn_off {
+            return LeaderAttempt::Covered;
+        }
+        if state.in_flight {
+            return LeaderAttempt::Busy;
+        }
+        // Become leader. The lock is released on return, before the
+        // SQE is submitted, so concurrent followers observe the
+        // in-flight state.
+        state.in_flight = true;
+        LeaderAttempt::Leader
+    }
+
+    /// Ends a leader's turn: publishes `durable_frontier` (the LSN the
+    /// fsync covered, `None` if it failed), clears `in_flight` and
+    /// wakes parked sync-path followers.
+    fn finish_group_commit(&self, durable_frontier: Option<u64>) {
+        let mut state = self.group_commit.state.lock();
+        if let Some(frontier) = durable_frontier {
+            if frontier > state.committed_lsn {
+                state.committed_lsn = frontier;
+                self.synced_lsn.store(frontier, Ordering::Release);
+            }
+        }
+        state.in_flight = false;
+        let _woken = self.group_commit.cv_followers.notify_all();
+    }
+}
+
+/// Outcome of [`JournalHandle::try_lead_group_commit`].
+#[cfg(all(target_os = "linux", feature = "async"))]
+enum LeaderAttempt {
+    /// A completed fsync already covers the target LSN.
+    Covered,
+    /// The state lock is contended or another fsync is in flight.
+    Busy,
+    /// This caller set `in_flight` and runs the fsync.
+    Leader,
 }
 
 fn join_error_to_io(e: tokio::task::JoinError) -> Error {
@@ -451,6 +477,32 @@ mod tests {
             // On non-direct journals this would be `true`; here it
             // must be `false` because we never construct the ring.
             assert!(!log.native_iouring_active());
+        })
+        .await;
+    }
+
+    /// FS-H5: both async journal futures must be `Send` so callers
+    /// can hand them to `tokio::spawn`. In 1.1.0 the Linux native
+    /// path kept a `parking_lot` guard binding alive across `.await`,
+    /// which made `sync_through_async` `!Send` there; this test then
+    /// failed to compile on Linux.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_async_journal_futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        with_timeout(async {
+            let path = tmp_path("send");
+            let _g = Cleanup(path.clone());
+            let fs = builder().build().expect("handle");
+            let log = Arc::new(fs.journal(&path).expect("journal"));
+
+            let append = log.clone().append_async(b"spawned".to_vec());
+            assert_send(&append);
+            let lsn = tokio::spawn(append).await.expect("join").expect("append");
+
+            let sync = log.clone().sync_through_async(lsn);
+            assert_send(&sync);
+            tokio::spawn(sync).await.expect("join").expect("sync");
+            assert!(log.synced_lsn() >= lsn);
         })
         .await;
     }
