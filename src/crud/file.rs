@@ -1219,7 +1219,7 @@ mod tests {
     // track; this test documents the expected behaviour.
     #[cfg_attr(
         target_os = "linux",
-        ignore = "io_uring FdRegistry reuses fixed-file slots across closed fds (io_uring track)"
+        ignore = "FS-C1: io_uring fixed-file slot reuse, fixed on fix/uring"
     )]
     #[test]
     fn test_direct_ops_on_one_handle_hit_the_right_files() {
