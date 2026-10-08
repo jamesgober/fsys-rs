@@ -253,7 +253,11 @@ impl Handle {
         }
 
         if direct_ok {
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            // Size of the file that was opened, not of whatever the
+            // path names now: a concurrent atomic replace must not mix
+            // one file's length with another file's bytes, and a stat
+            // failure must not turn into an empty read.
+            let size = file.metadata().map_err(Error::Io)?.len();
             self.direct_read(&file, size)
         } else {
             platform::read_all(&file)
@@ -1146,6 +1150,90 @@ mod tests {
         h.write_copy(&path, &payload).expect("write_copy");
         assert!(super::super::fence_probe::count() > before);
         assert_eq!(std::fs::read(&path).expect("read back"), payload);
+    }
+
+    #[test]
+    fn test_direct_read_returns_exact_contents() {
+        let h = direct_handle();
+        for len in [0usize, 1, 1000, 4096, 5000] {
+            let path = tmp_path("direct_read");
+            let _g = TmpFile(path.clone());
+            let payload = patterned(len);
+            std::fs::write(&path, &payload).expect("seed");
+            assert_eq!(h.read(&path).expect("direct read"), payload, "len {len}");
+        }
+    }
+
+    // Replacing a file that another handle holds open is refused on
+    // Windows (no FILE_SHARE_DELETE), so the race is Unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn test_direct_read_is_consistent_under_concurrent_replace() {
+        // Before 1.1.1 the Direct read sized its buffer from a
+        // path-based stat taken after the open; a concurrent replace
+        // could pair one file's length with the other file's bytes.
+        let path = tmp_path("direct_read_race");
+        let _g = TmpFile(path.clone());
+        let small = vec![b'a'; 1000];
+        let large = vec![b'b'; 9000];
+        std::fs::write(&path, &small).expect("seed");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            let (path, small, large) = (path.clone(), small.clone(), large.clone());
+            std::thread::spawn(move || {
+                let h = handle();
+                let mut flip = false;
+                while !stop.load(Ordering::Relaxed) {
+                    let data = if flip { &small } else { &large };
+                    let _ = h.write(&path, data);
+                    flip = !flip;
+                }
+            })
+        };
+        let h = direct_handle();
+        // Exercise the platform `pread` path; the `io_uring` path is
+        // covered by `test_direct_ops_on_one_handle_hit_the_right_files`.
+        #[cfg(target_os = "linux")]
+        h.disable_io_uring_for_test();
+        for _ in 0..400 {
+            let got = h.read(&path).expect("direct read");
+            assert!(
+                got == small || got == large,
+                "torn read of {} bytes (a={}, b={}, zero={})",
+                got.len(),
+                got.iter().filter(|&&x| x == b'a').count(),
+                got.iter().filter(|&&x| x == b'b').count(),
+                got.iter().filter(|&&x| x == 0).count()
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("writer thread");
+    }
+
+    // On Linux the io_uring ring caches fixed-file slots by raw fd
+    // number (`platform/linux_iouring.rs`, `FdRegistry`). Once a temp
+    // file's fd is closed and the number is reused by the next open,
+    // the ring keeps addressing the old file, so the second Direct
+    // write lands in the first file. The fix belongs to the io_uring
+    // track; this test documents the expected behaviour.
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "io_uring FdRegistry reuses fixed-file slots across closed fds (io_uring track)"
+    )]
+    #[test]
+    fn test_direct_ops_on_one_handle_hit_the_right_files() {
+        let h = direct_handle();
+        let a = tmp_path("one_handle_a");
+        let b = tmp_path("one_handle_b");
+        let _ga = TmpFile(a.clone());
+        let _gb = TmpFile(b.clone());
+        h.write(&a, &[b'A'; 4096]).expect("write a");
+        h.write(&b, &[b'B'; 4096]).expect("write b");
+        assert_eq!(std::fs::read(&a).expect("read a"), vec![b'A'; 4096]);
+        assert_eq!(std::fs::read(&b).expect("read b"), vec![b'B'; 4096]);
+        assert_eq!(h.read(&a).expect("direct read a"), vec![b'A'; 4096]);
+        assert_eq!(h.read(&b).expect("direct read b"), vec![b'B'; 4096]);
     }
 
     #[test]
