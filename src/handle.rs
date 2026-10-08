@@ -1187,7 +1187,7 @@ impl Handle {
         // Pass 2 — lexical `starts_with(root)` check on the
         // normalised path. Cheap; rejects obvious escapes before
         // we touch the filesystem.
-        if !resolved.starts_with(root) {
+        if !rootpath::starts_with(&resolved, root) {
             return Err(Error::InvalidPath {
                 path: path.to_owned(),
                 reason: "path escapes the handle root (lexical)".into(),
@@ -1312,7 +1312,7 @@ impl Handle {
                     }
                     // Defensive: if we've popped past the canonical
                     // root, the path can't be inside.
-                    if !existing_prefix.starts_with(root) && existing_prefix != *root {
+                    if !rootpath::starts_with(&existing_prefix, root) {
                         return Err(Error::InvalidPath {
                             path: path.to_owned(),
                             reason: "no canonical ancestor lies within the handle root".into(),
@@ -1554,6 +1554,92 @@ impl Handle {
         self.pipeline
             .submit_async(ops, self.snapshot(), false)
             .await
+    }
+}
+
+/// Lexical "is inside the root" pre-filter for the root jail.
+///
+/// `Builder::build` stores the root in canonical form. On Windows that
+/// form carries the verbatim prefix (`\\?\C:\...`) and the on-disk case
+/// of every component, while callers usually pass `C:\...` in whatever
+/// case they like. Plain [`Path::starts_with`] compares prefix kinds and
+/// component bytes exactly, so every absolute in-root path was rejected
+/// on Windows before reaching the canonical check.
+///
+/// On Windows this comparison treats `C:` and `\\?\C:` (and
+/// `\\server\share` and `\\?\UNC\server\share`) as the same prefix and
+/// compares components case-insensitively. It is only a pre-filter:
+/// such paths never take `resolve_path`'s fast path (which needs the
+/// parent to equal the root exactly) and are decided by the
+/// `canonicalize` comparison, which sees on-disk names. A
+/// case-sensitive NTFS directory therefore cannot be confused with a
+/// sibling whose name differs only in case. On other platforms this is
+/// [`Path::starts_with`].
+mod rootpath {
+    use std::path::Path;
+
+    /// `true` when `path` is `base` or lies below it.
+    #[cfg(not(windows))]
+    pub(super) fn starts_with(path: &Path, base: &Path) -> bool {
+        path.starts_with(base)
+    }
+
+    /// `true` when `path` is `base` or lies below it, ignoring the
+    /// verbatim prefix and component case.
+    #[cfg(windows)]
+    pub(super) fn starts_with(path: &Path, base: &Path) -> bool {
+        let mut rest = path.components();
+        base.components()
+            .all(|b| rest.next().is_some_and(|p| win::component_eq(p, b)))
+    }
+
+    #[cfg(windows)]
+    mod win {
+        use std::ffi::OsStr;
+        use std::path::{Component, Prefix};
+
+        enum Norm<'a> {
+            Drive(u8),
+            Unc(&'a OsStr, &'a OsStr),
+            Other(&'a OsStr),
+        }
+
+        fn norm(p: Prefix<'_>) -> Norm<'_> {
+            match p {
+                Prefix::Disk(d) | Prefix::VerbatimDisk(d) => Norm::Drive(d.to_ascii_uppercase()),
+                Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                    Norm::Unc(server, share)
+                }
+                Prefix::Verbatim(x) | Prefix::DeviceNS(x) => Norm::Other(x),
+            }
+        }
+
+        fn name_eq(a: &OsStr, b: &OsStr) -> bool {
+            if a == b || a.eq_ignore_ascii_case(b) {
+                return true;
+            }
+            match (a.to_str(), b.to_str()) {
+                (Some(a), Some(b)) => a.to_lowercase() == b.to_lowercase(),
+                _ => false,
+            }
+        }
+
+        pub(super) fn component_eq(a: Component<'_>, b: Component<'_>) -> bool {
+            match (a, b) {
+                (Component::Prefix(pa), Component::Prefix(pb)) => {
+                    match (norm(pa.kind()), norm(pb.kind())) {
+                        (Norm::Drive(x), Norm::Drive(y)) => x == y,
+                        (Norm::Unc(s1, h1), Norm::Unc(s2, h2)) => {
+                            name_eq(s1, s2) && name_eq(h1, h2)
+                        }
+                        (Norm::Other(x), Norm::Other(y)) => x == y,
+                        _ => false,
+                    }
+                }
+                (Component::Normal(x), Component::Normal(y)) => name_eq(x, y),
+                (x, y) => x == y,
+            }
+        }
     }
 }
 
@@ -1915,6 +2001,69 @@ mod tests {
             Err(Error::InvalidPath { .. })
         ));
         assert!(!missing_dir.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_absolute_in_root_path_without_verbatim_prefix_is_accepted() {
+        let (root, outside, _g) = jail_dirs("verbatim");
+        let h = crate::Builder::new()
+            .method(Method::Sync)
+            .root(&root)
+            .build()
+            .expect("build");
+        let canonical_root = h.root().expect("root").to_path_buf();
+        assert!(
+            canonical_root.to_string_lossy().starts_with(r"\\?\"),
+            "canonical root is expected in verbatim form: {}",
+            canonical_root.display()
+        );
+
+        // `root` is the caller's plain `C:\...` form.
+        let plain = root.join("plain.bin");
+        h.write(&plain, b"plain").expect("absolute in-root write");
+        assert_eq!(std::fs::read(&plain).expect("read"), b"plain");
+
+        // Different case of the same (case-insensitive) directory.
+        let upper = PathBuf::from(root.to_string_lossy().to_uppercase()).join("upper.bin");
+        h.write(&upper, b"upper")
+            .expect("case-insensitive in-root write");
+        assert_eq!(
+            std::fs::read(root.join("upper.bin")).expect("read"),
+            b"upper"
+        );
+
+        // Nested, not-yet-existing directories under the root.
+        let nested = root.join("a").join("b").join("c.bin");
+        let resolved = h.resolve_path(&nested).expect("nested in-root path");
+        assert!(resolved.starts_with(&canonical_root));
+
+        // A sibling directory is still outside the root.
+        assert!(matches!(
+            h.write(outside.join("x.bin"), b"x"),
+            Err(Error::InvalidPath { .. })
+        ));
+        let sibling = PathBuf::from(format!("{}2", root.display())).join("x.bin");
+        assert!(matches!(
+            h.resolve_path(&sibling),
+            Err(Error::InvalidPath { .. })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_rootpath_prefix_normalisation() {
+        use rootpath::starts_with;
+        let verbatim = Path::new(r"\\?\C:\Data\Root");
+        assert!(starts_with(Path::new(r"C:\Data\Root\f"), verbatim));
+        assert!(starts_with(Path::new(r"c:\Data\Root"), verbatim));
+        assert!(starts_with(Path::new(r"C:\data\root\f"), verbatim));
+        assert!(!starts_with(Path::new(r"D:\Data\Root\f"), verbatim));
+        assert!(!starts_with(Path::new(r"C:\Data\Root2\f"), verbatim));
+        assert!(!starts_with(Path::new(r"C:\Data"), verbatim));
+        let unc = Path::new(r"\\?\UNC\Server\Share\dir");
+        assert!(starts_with(Path::new(r"\\server\share\dir\f"), unc));
+        assert!(!starts_with(Path::new(r"\\server\other\dir\f"), unc));
     }
 
     #[test]
