@@ -64,6 +64,22 @@ impl Handle {
     /// # }
     /// ```
     pub fn write(&self, path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
+        // Observer hook: when no observer is registered this is one
+        // branch, with no clock read.
+        let Some(observer) = self.observer.as_deref() else {
+            return self.write_unobserved(path.as_ref(), data);
+        };
+        let start = std::time::Instant::now();
+        let result = self.write_unobserved(path.as_ref(), data);
+        observer.on_handle_write(crate::observer::HandleWriteEvent {
+            bytes_written: data.len() as u64,
+            duration: start.elapsed(),
+            error: result.is_err(),
+        });
+        result
+    }
+
+    fn write_unobserved(&self, path: &Path, data: &[u8]) -> Result<()> {
         #[cfg(feature = "tracing")]
         let _span = tracing::trace_span!(
             "fsys::Handle::write",
@@ -72,7 +88,7 @@ impl Handle {
         )
         .entered();
 
-        let path = self.resolve_path(path.as_ref())?;
+        let path = self.resolve_path(path)?;
 
         // 0.5.0: route Method::Mmap through the mmap atomic-replace
         // path when the payload is suitable. Sub-page payloads (and
@@ -235,7 +251,21 @@ impl Handle {
     /// - [`Error::InvalidPath`] if `path` escapes the handle root.
     /// - [`Error::Io`] on any IO error.
     pub fn read(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
-        let path = self.resolve_path(path.as_ref())?;
+        let Some(observer) = self.observer.as_deref() else {
+            return self.read_unobserved(path.as_ref());
+        };
+        let start = std::time::Instant::now();
+        let result = self.read_unobserved(path.as_ref());
+        observer.on_handle_read(crate::observer::HandleReadEvent {
+            bytes_read: result.as_ref().map_or(0, |v| v.len() as u64),
+            duration: start.elapsed(),
+            error: result.is_err(),
+        });
+        result
+    }
+
+    fn read_unobserved(&self, path: &Path) -> Result<Vec<u8>> {
+        let path = self.resolve_path(path)?;
 
         // 0.5.0: Method::Mmap reads consult metadata first to check
         // suitability. Files smaller than the page size, zero-byte
@@ -1240,6 +1270,62 @@ mod tests {
         assert_eq!(std::fs::read(&b).expect("read b"), vec![b'B'; 4096]);
         assert_eq!(h.read(&a).expect("direct read a"), vec![b'A'; 4096]);
         assert_eq!(h.read(&b).expect("direct read b"), vec![b'B'; 4096]);
+    }
+
+    #[derive(Debug, Default)]
+    struct OpCounter {
+        writes: AtomicU64,
+        write_bytes: AtomicU64,
+        write_errors: AtomicU64,
+        reads: AtomicU64,
+        read_bytes: AtomicU64,
+        read_errors: AtomicU64,
+    }
+
+    impl crate::observer::FsysObserver for OpCounter {
+        fn on_handle_write(&self, e: crate::observer::HandleWriteEvent) {
+            let _ = self.writes.fetch_add(1, Ordering::Relaxed);
+            let _ = self
+                .write_bytes
+                .fetch_add(e.bytes_written, Ordering::Relaxed);
+            let _ = self
+                .write_errors
+                .fetch_add(u64::from(e.error), Ordering::Relaxed);
+        }
+        fn on_handle_read(&self, e: crate::observer::HandleReadEvent) {
+            let _ = self.reads.fetch_add(1, Ordering::Relaxed);
+            let _ = self.read_bytes.fetch_add(e.bytes_read, Ordering::Relaxed);
+            let _ = self
+                .read_errors
+                .fetch_add(u64::from(e.error), Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn test_observer_receives_handle_write_and_read_events() {
+        let counter = std::sync::Arc::new(OpCounter::default());
+        let h = Builder::new()
+            .method(Method::Sync)
+            .observer(counter.clone())
+            .build()
+            .expect("build");
+        let path = tmp_path("observer");
+        let _g = TmpFile(path.clone());
+        h.write(&path, b"12345").expect("write");
+        assert_eq!(h.read(&path).expect("read"), b"12345");
+        let missing = tmp_path("observer_missing");
+        assert!(h.read(&missing).is_err());
+        let dir = tmp_path("observer_dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        assert!(h.write(&dir, b"x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(counter.writes.load(Ordering::Relaxed), 2);
+        assert_eq!(counter.write_bytes.load(Ordering::Relaxed), 6);
+        assert_eq!(counter.write_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(counter.reads.load(Ordering::Relaxed), 2);
+        assert_eq!(counter.read_bytes.load(Ordering::Relaxed), 5);
+        assert_eq!(counter.read_errors.load(Ordering::Relaxed), 1);
     }
 
     #[test]

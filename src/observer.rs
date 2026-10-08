@@ -124,10 +124,14 @@ pub trait FsysObserver: std::fmt::Debug + Send + Sync {
     /// [`HandleWriteEvent::bytes_written`] field is the caller's
     /// payload size, not including framing or temp-file overhead.
     ///
-    /// Batch writes (`write_batch`, `Batch::commit`, etc.) are not
-    /// currently instrumented — each op inside a batch will not fire
-    /// this event individually. Subscribe to your own per-batch
-    /// telemetry if needed.
+    /// Fired on the calling thread once per `Handle::write` call,
+    /// including calls rejected before any IO (for example an
+    /// invalid path); `error` is then `true`.
+    ///
+    /// `write_copy`, `write_at`, `append`, the async native write path
+    /// and batch writes (`write_batch`, `Batch::commit`, etc.) are not
+    /// instrumented. Subscribe to your own per-batch telemetry if
+    /// needed.
     fn on_handle_write(&self, _event: HandleWriteEvent) {}
 
     /// Fired after a [`crate::Handle::read`] completes (success or
@@ -135,8 +139,11 @@ pub trait FsysObserver: std::fmt::Debug + Send + Sync {
     /// actual count returned; may be less than the requested size if
     /// the file is shorter, and is `0` on error.
     ///
-    /// `read_at`, batch reads, and directory operations (`scan`,
-    /// `find`, `count`) are not currently instrumented.
+    /// Fired on the calling thread once per `Handle::read` call,
+    /// including failed calls.
+    ///
+    /// `read_at` and directory operations (`scan`, `find`, `count`)
+    /// are not instrumented.
     fn on_handle_read(&self, _event: HandleReadEvent) {}
 }
 
