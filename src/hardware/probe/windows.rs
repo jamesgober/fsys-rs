@@ -120,13 +120,18 @@ pub(crate) fn probe_drive() -> DriveInfo {
     info
 }
 
-/// Issues `IOCTL_STORAGE_QUERY_PROPERTY` with
-/// `StorageDeviceProperty` against the volume root and reads the
-/// returned `STORAGE_DEVICE_DESCRIPTOR` for vendor + product
-/// strings. Returns [`PlpStatus::Unknown`] on any error or table
-/// miss.
+/// Reads the volume's `STORAGE_DEVICE_DESCRIPTOR` for vendor + product
+/// strings and consults the PLP lookup table. Returns
+/// [`PlpStatus::Unknown`] on any error or table miss.
 fn probe_plp_windows(volume: &OsString) -> PlpStatus {
-    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
+    query_device_descriptor(volume).map_or(PlpStatus::Unknown, |buf| parse_device_descriptor(&buf))
+}
+
+/// Issues `IOCTL_STORAGE_QUERY_PROPERTY` with `StorageDeviceProperty`
+/// against the volume root (`C:\` becomes `\.\C:`) and returns the
+/// bytes the driver filled in, or `None` on any failure.
+fn query_device_descriptor(volume: &OsString) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
@@ -143,7 +148,7 @@ fn probe_plp_windows(volume: &OsString) -> PlpStatus {
     let trimmed = s.trim_end_matches('\\');
     let drive = trimmed.split('\\').next().unwrap_or("");
     if drive.len() != 2 || !drive.ends_with(':') {
-        return PlpStatus::Unknown;
+        return None;
     }
     let device_path = format!(r"\\.\{drive}");
     let wide_path: Vec<u16> = std::ffi::OsStr::new(&device_path)
@@ -151,9 +156,10 @@ fn probe_plp_windows(volume: &OsString) -> PlpStatus {
         .chain(std::iter::once(0))
         .collect();
 
-    // Open the device handle. `GENERIC_READ` is sufficient for the
-    // query; admin privilege is NOT required for
-    // `StorageDeviceProperty`.
+    // Open the device handle with no data access (`dwDesiredAccess =
+    // 0`). IOCTL_STORAGE_QUERY_PROPERTY is defined with FILE_ANY_ACCESS,
+    // so a query-only handle is enough, and unlike GENERIC_READ on a
+    // volume it does not require administrator rights.
     //
     // SAFETY: `wide_path` is a NUL-terminated UTF-16 string built
     // from the volume root we just resolved. `CreateFileW` returns
@@ -162,7 +168,7 @@ fn probe_plp_windows(volume: &OsString) -> PlpStatus {
     let handle = unsafe {
         CreateFileW(
             wide_path.as_ptr(),
-            GENERIC_READ,
+            0,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             std::ptr::null(),
             OPEN_EXISTING,
@@ -171,11 +177,13 @@ fn probe_plp_windows(volume: &OsString) -> PlpStatus {
         )
     };
     if handle == INVALID_HANDLE_VALUE {
-        return PlpStatus::Unknown;
+        return None;
     }
 
-    // Two-step IOCTL: first call returns the size; second call
-    // fills the buffer.
+    // Single IOCTL into a fixed 1 KiB buffer, which holds the
+    // descriptor and its vendor / product strings for every device
+    // seen in practice. A larger descriptor is truncated by the driver;
+    // offsets past the returned length are ignored below.
     let query = STORAGE_PROPERTY_QUERY {
         PropertyId: StorageDeviceProperty,
         QueryType: PropertyStandardQuery,
@@ -204,9 +212,11 @@ fn probe_plp_windows(volume: &OsString) -> PlpStatus {
     };
 
     let result = if ok == 0 {
-        PlpStatus::Unknown
+        None
     } else {
-        parse_device_descriptor(&buf)
+        // Only the bytes the driver reported are meaningful.
+        buf.truncate(bytes_returned as usize);
+        Some(buf)
     };
 
     // SAFETY: `handle` was opened by CreateFileW above and not
@@ -226,14 +236,13 @@ fn parse_device_descriptor(buf: &[u8]) -> PlpStatus {
         return PlpStatus::Unknown;
     }
 
-    // SAFETY: we verified the buffer is at least
-    // `size_of::<STORAGE_DEVICE_DESCRIPTOR>()` bytes long; the
-    // pointer cast yields a properly-aligned `*const
-    // STORAGE_DEVICE_DESCRIPTOR` because `Vec<u8>::as_ptr()` is
-    // 8-byte-aligned by the system allocator and the C struct's
-    // alignment is satisfied by 8-byte alignment.
-    let descriptor: &STORAGE_DEVICE_DESCRIPTOR =
-        unsafe { &*(buf.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR) };
+    // SAFETY: the check above guarantees `buf` holds at least
+    // `size_of::<STORAGE_DEVICE_DESCRIPTOR>()` readable bytes.
+    // `read_unaligned` copies them out without requiring the byte
+    // buffer (alignment 1) to meet the struct's alignment, and every
+    // field of the plain-old-data descriptor accepts any bit pattern.
+    let descriptor: STORAGE_DEVICE_DESCRIPTOR =
+        unsafe { std::ptr::read_unaligned(buf.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>()) };
 
     let vendor = c_string_at_offset(buf, descriptor.VendorIdOffset as usize);
     let model = c_string_at_offset(buf, descriptor.ProductIdOffset as usize);
@@ -325,61 +334,15 @@ pub(crate) fn probe_cpu() -> CpuInfo {
 }
 
 fn probe_physical_cores() -> Option<u32> {
-    use windows_sys::Win32::System::SystemInformation::{
-        GetLogicalProcessorInformationEx, RelationProcessorCore,
-        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
-    };
+    use windows_sys::Win32::System::SystemInformation::RelationProcessorCore;
 
-    // Two-pass: first call with NULL buffer to get the required size.
-    let mut needed: u32 = 0;
-    // SAFETY: passing `null_mut()` and `&mut needed` is the documented
-    // size-query pattern for this API; the call writes the required
-    // byte count into `needed` and returns 0 on the expected
-    // ERROR_INSUFFICIENT_BUFFER path.
-    unsafe {
-        let _ = GetLogicalProcessorInformationEx(
-            RelationProcessorCore,
-            std::ptr::null_mut(),
-            &mut needed,
-        );
-    }
-    if needed == 0 {
-        return None;
-    }
-    let mut buf: Vec<u8> = vec![0u8; needed as usize];
-    // SAFETY: `buf` has at least `needed` bytes; the cast is valid for
-    // a buffer that the kernel will populate with packed
-    // SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX records.
-    let ok = unsafe {
-        GetLogicalProcessorInformationEx(
-            RelationProcessorCore,
-            buf.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
-            &mut needed,
-        )
-    };
-    if ok == 0 {
-        return None;
-    }
-
-    // Walk the variable-length array of records. Each record's `Size`
-    // field is its own length in bytes.
+    let buf = logical_processor_info(RelationProcessorCore)?;
     let mut count = 0u32;
-    let mut offset = 0usize;
-    while offset < needed as usize {
-        // SAFETY: We bounds-check `offset + size_of<header>` before
-        // reading; the kernel guarantees the buffer is well-formed
-        // when `ok != 0`.
-        let header = unsafe {
-            &*(buf.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
-        };
-        if header.Relationship == RelationProcessorCore {
-            count += 1;
+    for_each_processor_record(&buf, |relationship, _record| {
+        if relationship == RelationProcessorCore {
+            count = count.saturating_add(1);
         }
-        if header.Size == 0 {
-            break; // defensive against corrupt buffers
-        }
-        offset += header.Size as usize;
-    }
+    });
     if count == 0 {
         None
     } else {
@@ -388,59 +351,119 @@ fn probe_physical_cores() -> Option<u32> {
 }
 
 fn probe_cache_sizes() -> Option<(usize, usize, usize)> {
+    use windows_sys::Win32::System::SystemInformation::RelationCache;
+
+    let buf = logical_processor_info(RelationCache)?;
+    let mut l1 = 0usize;
+    let mut l2 = 0usize;
+    let mut l3 = 0usize;
+    for_each_processor_record(&buf, |relationship, record| {
+        if relationship != RelationCache {
+            return;
+        }
+        let (Some(&level), Some(size)) = (
+            record.get(CACHE_LEVEL_OFFSET),
+            read_u32(record, CACHE_SIZE_OFFSET),
+        ) else {
+            return;
+        };
+        let size = size as usize;
+        match level {
+            1 => l1 = l1.max(size),
+            2 => l2 = l2.max(size),
+            3 => l3 = l3.max(size),
+            _ => {}
+        }
+    });
+    Some((l1, l2, l3))
+}
+
+/// Byte offset of `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX::Relationship`.
+const RECORD_RELATIONSHIP_OFFSET: usize = 0;
+/// Byte offset of `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX::Size`.
+const RECORD_SIZE_OFFSET: usize = 4;
+/// Bytes every record has before its relationship-specific union.
+const RECORD_HEADER_LEN: usize = 8;
+/// Byte offset of `CACHE_RELATIONSHIP::Level` within a record.
+const CACHE_LEVEL_OFFSET: usize = 8;
+/// Byte offset of `CACHE_RELATIONSHIP::CacheSize` within a record.
+const CACHE_SIZE_OFFSET: usize = 12;
+
+/// Calls `GetLogicalProcessorInformationEx` for `relationship` and
+/// returns the filled prefix of the buffer.
+fn logical_processor_info(
+    relationship: windows_sys::Win32::System::SystemInformation::LOGICAL_PROCESSOR_RELATIONSHIP,
+) -> Option<Vec<u8>> {
     use windows_sys::Win32::System::SystemInformation::{
-        GetLogicalProcessorInformationEx, RelationCache, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        GetLogicalProcessorInformationEx, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
 
+    // Two-pass: first call with NULL buffer to get the required size.
     let mut needed: u32 = 0;
-    // SAFETY: same pattern as `probe_physical_cores` — null query for size.
-    unsafe {
-        let _ = GetLogicalProcessorInformationEx(RelationCache, std::ptr::null_mut(), &mut needed);
-    }
+    // SAFETY: passing `null_mut()` and `&mut needed` is the documented
+    // size-query pattern for this API; the call writes the required
+    // byte count into `needed` and returns 0 on the expected
+    // ERROR_INSUFFICIENT_BUFFER path.
+    let _size_query = unsafe {
+        GetLogicalProcessorInformationEx(relationship, std::ptr::null_mut(), &mut needed)
+    };
     if needed == 0 {
         return None;
     }
     let mut buf: Vec<u8> = vec![0u8; needed as usize];
-    // SAFETY: `buf` has at least `needed` bytes; cast as documented.
+    // SAFETY: `buf` has `needed` writable bytes and `needed` tells the
+    // kernel that length. The kernel writes packed variable-length
+    // records as bytes; this code never forms a typed reference into the
+    // buffer, so its alignment of 1 does not matter (records are parsed
+    // with bounds-checked byte reads in `for_each_processor_record`).
     let ok = unsafe {
         GetLogicalProcessorInformationEx(
-            RelationCache,
-            buf.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+            relationship,
+            buf.as_mut_ptr()
+                .cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
             &mut needed,
         )
     };
     if ok == 0 {
         return None;
     }
+    buf.truncate(needed as usize);
+    Some(buf)
+}
 
-    let mut l1 = 0usize;
-    let mut l2 = 0usize;
-    let mut l3 = 0usize;
+/// Walks the packed `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` records in
+/// `buf`, calling `f(relationship, record_bytes)` for each.
+///
+/// Every read is bounds-checked: the walk stops at a truncated header, a
+/// `Size` smaller than the header, or a record that would run past the
+/// end of the buffer. The record slice handed to `f` is exactly `Size`
+/// bytes, so a short final record cannot be read past its end.
+fn for_each_processor_record(buf: &[u8], mut f: impl FnMut(i32, &[u8])) {
     let mut offset = 0usize;
-    while offset < needed as usize {
-        // SAFETY: bounds-checked iteration as in `probe_physical_cores`.
-        let header = unsafe {
-            &*(buf.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
+    while let Some(rest) = buf.get(offset..) {
+        let (Some(relationship), Some(size)) = (
+            read_u32(rest, RECORD_RELATIONSHIP_OFFSET),
+            read_u32(rest, RECORD_SIZE_OFFSET),
+        ) else {
+            break;
         };
-        if header.Relationship == RelationCache {
-            // SAFETY: when Relationship == RelationCache, the union's
-            // `Cache` arm is the active variant per the Win32
-            // contract.
-            let cache = unsafe { &header.Anonymous.Cache };
-            let size = cache.CacheSize as usize;
-            match cache.Level {
-                1 => l1 = l1.max(size),
-                2 => l2 = l2.max(size),
-                3 => l3 = l3.max(size),
-                _ => {}
-            }
-        }
-        if header.Size == 0 {
+        let size = size as usize;
+        if size < RECORD_HEADER_LEN {
             break;
         }
-        offset += header.Size as usize;
+        let Some(record) = rest.get(..size) else {
+            break;
+        };
+        f(relationship as i32, record);
+        offset += size;
     }
-    Some((l1, l2, l3))
+}
+
+/// Reads a native-endian `u32` at `offset` of `bytes`, if in bounds.
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let raw: [u8; 4] = bytes.get(offset..end)?.try_into().ok()?;
+    Some(u32::from_ne_bytes(raw))
 }
 
 // 0.9.2: `detect_compile_time_features` removed; CPU feature
@@ -493,6 +516,94 @@ mod tests {
         let c = probe_cpu();
         assert!(c.cores_logical >= 1);
         assert!(c.cores_physical >= 1);
+    }
+
+    /// Builds one synthetic processor record of `size` bytes.
+    fn record(relationship: i32, size: u32, level: u8, cache_size: u32) -> Vec<u8> {
+        let mut r = vec![0u8; size as usize];
+        r[0..4].copy_from_slice(&relationship.to_ne_bytes());
+        r[4..8].copy_from_slice(&size.to_ne_bytes());
+        if size as usize >= 16 {
+            r[CACHE_LEVEL_OFFSET] = level;
+            r[CACHE_SIZE_OFFSET..CACHE_SIZE_OFFSET + 4].copy_from_slice(&cache_size.to_ne_bytes());
+        }
+        r
+    }
+
+    #[test]
+    fn test_record_offsets_match_windows_layout() {
+        use std::mem::MaybeUninit;
+        use windows_sys::Win32::System::SystemInformation::SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX;
+        let slot = MaybeUninit::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>::uninit();
+        let base = slot.as_ptr();
+        // SAFETY: addr_of! computes field addresses inside `slot`
+        // without reading uninitialised memory or creating references.
+        let (rel, size, level, cache_size) = unsafe {
+            (
+                std::ptr::addr_of!((*base).Relationship) as usize,
+                std::ptr::addr_of!((*base).Size) as usize,
+                std::ptr::addr_of!((*base).Anonymous.Cache.Level) as usize,
+                std::ptr::addr_of!((*base).Anonymous.Cache.CacheSize) as usize,
+            )
+        };
+        let b = base as usize;
+        assert_eq!(rel - b, RECORD_RELATIONSHIP_OFFSET);
+        assert_eq!(size - b, RECORD_SIZE_OFFSET);
+        assert_eq!(level - b, CACHE_LEVEL_OFFSET);
+        assert_eq!(cache_size - b, CACHE_SIZE_OFFSET);
+    }
+
+    #[test]
+    fn test_for_each_processor_record_walks_all_records() {
+        let mut buf = record(2, 48, 1, 32 * 1024);
+        buf.extend(record(2, 48, 2, 1024 * 1024));
+        buf.extend(record(0, 24, 0, 0));
+        let mut seen = Vec::new();
+        for_each_processor_record(&buf, |rel, r| seen.push((rel, r.len())));
+        assert_eq!(seen, vec![(2, 48), (2, 48), (0, 24)]);
+    }
+
+    #[test]
+    fn test_for_each_processor_record_stops_at_truncated_record() {
+        let mut buf = record(2, 48, 3, 8 * 1024 * 1024);
+        // Second record claims 48 bytes but only 20 are present.
+        let mut short = record(2, 48, 1, 1);
+        short.truncate(20);
+        buf.extend(short);
+        let mut count = 0;
+        for_each_processor_record(&buf, |_, _| count += 1);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_for_each_processor_record_rejects_tiny_size_and_partial_header() {
+        let mut count = 0;
+        // A full header whose Size (4) is smaller than the header itself.
+        let mut tiny = 2i32.to_ne_bytes().to_vec();
+        tiny.extend_from_slice(&4u32.to_ne_bytes());
+        for_each_processor_record(&tiny, |_, _| count += 1);
+        for_each_processor_record(&[1, 2, 3], |_, _| count += 1);
+        for_each_processor_record(&[], |_, _| count += 1);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_query_device_descriptor_works_without_admin() {
+        // The test suite runs non-elevated; with GENERIC_READ the volume
+        // open failed with ERROR_ACCESS_DENIED and PLP was always Unknown.
+        let tmp = std::env::temp_dir();
+        let volume = volume_path(&tmp).expect("volume of temp dir");
+        let buf = query_device_descriptor(&volume).expect("descriptor query");
+        assert!(buf.len() >= std::mem::size_of::<u32>() * 2);
+    }
+
+    #[test]
+    fn test_parse_device_descriptor_handles_short_and_unaligned_buffers() {
+        assert_eq!(parse_device_descriptor(&[0u8; 8]), PlpStatus::Unknown);
+        // Offset-1 slice of a larger buffer: unaligned start must not
+        // be a problem for read_unaligned.
+        let backing = vec![0u8; 1025];
+        assert_eq!(parse_device_descriptor(&backing[1..]), PlpStatus::Unknown);
     }
 
     #[test]
