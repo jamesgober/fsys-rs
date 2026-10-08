@@ -608,7 +608,11 @@ pub(crate) fn parent_or_current_dir(path: &std::path::Path) -> &std::path::Path 
 /// - Linux: `copy_file_range(2)` for same-filesystem copies; `std::fs::copy`
 ///   fallback.
 /// - macOS: `clonefile(2)` when available; `std::fs::copy` fallback.
-/// - Windows/Unknown: `std::fs::copy`.
+/// - Windows: ReFS block clone (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`) when
+///   the source volume supports it; `std::fs::copy` otherwise or on any
+///   clone failure (a destination the clone attempt created is removed
+///   first).
+/// - Unknown: `std::fs::copy`.
 #[inline]
 pub(crate) fn copy_file(src: &std::path::Path, dst: &std::path::Path) -> crate::Result<u64> {
     imp::copy_file(src, dst)

@@ -19,8 +19,9 @@
 //!   per-fd cursor is not consulted for the write position.
 //!   (0.8.0 R-1 tier-2 fix; earlier versions used SetFilePointerEx +
 //!   WriteFile which raced on the cursor under multi-thread append.)
-//! - **Copy:** `std::fs::copy` (wraps `CopyFileExW` internally in std).
-//!   `FSCTL_DUPLICATE_EXTENTS_TO_FILE` (ReFS reflink) is deferred to `0.5.0`.
+//! - **Copy:** `FSCTL_DUPLICATE_EXTENTS_TO_FILE` (ReFS block clone) when
+//!   the source volume supports block cloning, otherwise (or on any clone
+//!   failure) `std::fs::copy`, which wraps `CopyFileExW`.
 
 #![cfg(target_os = "windows")]
 
@@ -729,118 +730,127 @@ pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
     // metadata-only — a multi-GiB checkpoint clone drops from
     // seconds to microseconds.
     //
-    // Hard requirements (kernel enforces; failure paths fall back):
-    // - Both files MUST be on the same ReFS volume. NTFS / FAT /
-    //   exFAT / network shares all return ERROR_INVALID_FUNCTION.
-    // - Destination must already exist and be at least as large as
-    //   the source range — we extend it via SetEndOfFile before
-    //   issuing the ioctl.
-    // - Both handles must be opened with `FILE_SHARE_DELETE`
-    //   (omission causes ERROR_INVALID_PARAMETER).
+    // Requirements (kernel enforces; failure paths fall back):
+    // - Both files on the same volume, and that volume supports block
+    //   cloning (`FILE_SUPPORTS_BLOCK_REFCOUNTING`, ReFS). The source
+    //   volume is checked before anything is created, so NTFS / FAT /
+    //   network copies go straight to the byte copy.
+    // - Clone ranges begin and end on cluster boundaries; the last
+    //   partial cluster may be cloned whole because it ends at EOF.
+    // - The destination is extended to the source size before the
+    //   ioctl and a sparse source needs a sparse destination.
+    // - Each ioctl clones less than 4 GiB.
     //
     // On any failure we fall back to `std::fs::copy` (which wraps
-    // `CopyFileExW`) for full-byte-copy semantics. Correctness is
-    // guaranteed regardless of which path runs.
+    // `CopyFileExW`) for full-byte-copy semantics. A destination that
+    // the reflink attempt created is removed first, so a failed fallback
+    // never leaves an extended but empty file behind.
     if let Ok(bytes) = try_reflink_refs(src, dst) {
         return Ok(bytes);
     }
     std::fs::copy(src, dst).map_err(Error::Io)
 }
 
+/// `FILE_SUPPORTS_BLOCK_REFCOUNTING` file-system flag (winnt.h): the
+/// volume can clone extents with `FSCTL_DUPLICATE_EXTENTS_TO_FILE`.
+const FILE_SUPPORTS_BLOCK_REFCOUNTING: u32 = 0x0800_0000;
+
 /// 0.9.6 — Attempts a ReFS `FSCTL_DUPLICATE_EXTENTS_TO_FILE` reflink
 /// of `src` to `dst`. Returns the byte count cloned on success.
 ///
-/// Returns `Err` on any of: source open failure, source-size query
-/// failure, destination create/extend failure, FSCTL rejection
-/// (non-ReFS volume, cross-volume copy, ineligible source range).
-/// The caller falls back to a byte-copy on `Err`.
+/// Returns `Err` on any of: source open failure, a source volume without
+/// block cloning, destination create failure (including `dst` already
+/// existing), or any failure while sizing or cloning into the new
+/// destination. In the last case the destination this function created
+/// is deleted before returning. The caller falls back to a byte-copy on
+/// `Err`.
 fn try_reflink_refs(src: &Path, dst: &Path) -> Result<u64> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    let src_file = open_with_share(src, GENERIC_READ, share, OPEN_EXISTING)?;
+    if !volume_supports_block_cloning(&src_file) {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "source volume does not support block cloning",
+        )));
+    }
+
+    // CREATE_NEW so an existing destination is never touched here; the
+    // byte-copy fallback keeps `std::fs::copy`'s overwrite semantics.
+    let dst_file = open_with_share(dst, GENERIC_READ | GENERIC_WRITE, share, CREATE_NEW)?;
+    let result = clone_into_new_file(&src_file, &dst_file);
+    if result.is_err() {
+        drop(dst_file);
+        // `dst` did not exist before CREATE_NEW above, so it holds nothing
+        // of the caller's. Removing it lets the fallback start clean. If
+        // the removal itself fails, the fallback `std::fs::copy` still
+        // truncates and overwrites the file, so the error is not useful.
+        let _removed = std::fs::remove_file(dst);
+    }
+    result
+}
+
+/// Clones all of `src` into the freshly created, empty `dst`.
+fn clone_into_new_file(src: &File, dst: &File) -> Result<u64> {
+    use std::os::windows::fs::MetadataExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FileEndOfFileInfo, GetFileSizeEx, SetFileInformationByHandle, FILE_END_OF_FILE_INFO,
-        FILE_SHARE_DELETE,
+        FileEndOfFileInfo, SetFileInformationByHandle, FILE_ATTRIBUTE_SPARSE_FILE,
+        FILE_END_OF_FILE_INFO,
     };
     use windows_sys::Win32::System::Ioctl::{
-        DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+        DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE, FSCTL_SET_SPARSE,
     };
     use windows_sys::Win32::System::IO::DeviceIoControl;
 
-    let src_wide = to_wide(src);
-    let dst_wide = to_wide(dst);
-
-    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-
-    // Open source for read.
-    // SAFETY: `src_wide` is a NUL-terminated UTF-16 path; flags are
-    // valid; the returned handle either is INVALID_HANDLE_VALUE
-    // (-1, error) or owned by us until we close it via
-    // `File::from_raw_handle` Drop.
-    let src_handle = unsafe {
-        CreateFileW(
-            src_wide.as_ptr(),
-            GENERIC_READ,
-            share,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut::<core::ffi::c_void>(),
-        )
-    };
-    if src_handle.is_null() || src_handle == INVALID_HANDLE_VALUE {
-        return Err(Error::Io(std::io::Error::last_os_error()));
+    let src_meta = src.metadata().map_err(Error::Io)?;
+    let src_size = src_meta.len();
+    let src_size_i64 = i64::try_from(src_size).map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source size exceeds i64::MAX",
+        ))
+    })?;
+    if src_size == 0 {
+        return Ok(0);
     }
-    // SAFETY: src_handle is a valid open Windows file handle owned
-    // by us; wrapping in File so Drop closes it cleanly even on
-    // early return below.
-    let src_file = unsafe { File::from_raw_handle(src_handle as RawHandle) };
+    let cluster = cluster_size(src)?;
 
-    // Get source size.
-    let mut src_size: i64 = 0;
-    // SAFETY: src_handle is valid; GetFileSizeEx writes through the
-    // out-pointer and returns 0/nonzero for failure/success.
-    let ok: BOOL = unsafe { GetFileSizeEx(src_handle, &mut src_size) };
-    if ok == FALSE {
-        return Err(Error::Io(std::io::Error::last_os_error()));
+    if src_meta.file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE != 0 {
+        let mut bytes_returned: u32 = 0;
+        // SAFETY: `dst` is a valid handle opened for write; FSCTL_SET_SPARSE
+        // with no input buffer marks the file sparse; `bytes_returned` is a
+        // valid out-pointer and the call is synchronous.
+        let ok: BOOL = unsafe {
+            DeviceIoControl(
+                dst.as_raw_handle() as HANDLE,
+                FSCTL_SET_SPARSE,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == FALSE {
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
     }
 
-    // Open destination for write — CREATE_NEW so we don't overwrite
-    // an existing file silently. If dst exists, this fails and we
-    // fall back cleanly (matching `std::fs::copy`'s overwrite
-    // semantics via the fallback path).
-    // SAFETY: dst_wide is NUL-term UTF-16; flags valid; handle
-    // either error or owned by us.
-    let dst_handle = unsafe {
-        CreateFileW(
-            dst_wide.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            share,
-            std::ptr::null(),
-            CREATE_NEW,
-            0,
-            std::ptr::null_mut::<core::ffi::c_void>(),
-        )
-    };
-    if dst_handle.is_null() || dst_handle == INVALID_HANDLE_VALUE {
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-    // SAFETY: dst_handle is a valid open Windows file handle owned
-    // by us; wrap in File so Drop closes it cleanly.
-    let _dst_file = unsafe { File::from_raw_handle(dst_handle as RawHandle) };
-
-    // Extend dst to src_size so the duplicate-extents call can map
-    // into a valid dst range. FILE_END_OF_FILE_INFO uses an i64
-    // EndOfFile value.
+    // The destination region must lie inside its EOF, so size it to the
+    // source first. The last clone range is rounded up to a whole cluster,
+    // which ReFS accepts because it ends at the source's EOF.
     let eof_info = FILE_END_OF_FILE_INFO {
-        EndOfFile: src_size,
+        EndOfFile: src_size_i64,
     };
-    // SAFETY: dst_handle valid; eof_info is a stack-allocated
-    // FILE_END_OF_FILE_INFO with a single i64 field; size argument
-    // matches the struct size; SetFileInformationByHandle reads
-    // through the pointer and returns 0/nonzero.
+    // SAFETY: `dst` is a valid handle opened for write; `eof_info` is a
+    // live FILE_END_OF_FILE_INFO and the size argument matches it.
     let ok: BOOL = unsafe {
         SetFileInformationByHandle(
-            dst_handle,
+            dst.as_raw_handle() as HANDLE,
             FileEndOfFileInfo,
-            &eof_info as *const _ as *const core::ffi::c_void,
+            (&eof_info as *const FILE_END_OF_FILE_INFO).cast(),
             std::mem::size_of::<FILE_END_OF_FILE_INFO>() as u32,
         )
     };
@@ -848,52 +858,137 @@ fn try_reflink_refs(src: &Path, dst: &Path) -> Result<u64> {
         return Err(Error::Io(std::io::Error::last_os_error()));
     }
 
-    // Empty source — nothing to duplicate. Truncated dst is the
-    // correct result.
-    if src_size == 0 {
-        return Ok(0);
+    for (offset, byte_count) in clone_ranges(src_size, cluster) {
+        let mut params = DUPLICATE_EXTENTS_DATA {
+            FileHandle: src.as_raw_handle() as HANDLE,
+            SourceFileOffset: offset as i64,
+            TargetFileOffset: offset as i64,
+            ByteCount: byte_count as i64,
+        };
+        let mut bytes_returned: u32 = 0;
+        // SAFETY: `dst` is the ioctl target (valid handle opened for
+        // write); `params` is a live DUPLICATE_EXTENTS_DATA naming the
+        // valid source handle, with offsets and count below i64::MAX
+        // (bounded by `src_size_i64` rounded up to one cluster); the size
+        // argument matches the struct; the call is synchronous.
+        let ok: BOOL = unsafe {
+            DeviceIoControl(
+                dst.as_raw_handle() as HANDLE,
+                FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+                (&mut params as *mut DUPLICATE_EXTENTS_DATA).cast(),
+                std::mem::size_of::<DUPLICATE_EXTENTS_DATA>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut::<OVERLAPPED>(),
+            )
+        };
+        if ok == FALSE {
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
     }
+    Ok(src_size)
+}
 
-    // Issue FSCTL_DUPLICATE_EXTENTS_TO_FILE. The src handle is
-    // passed via the DUPLICATE_EXTENTS_DATA struct; the dst handle
-    // is the DeviceIoControl target.
-    let mut params = DUPLICATE_EXTENTS_DATA {
-        FileHandle: src_handle as HANDLE,
-        SourceFileOffset: 0,
-        TargetFileOffset: 0,
-        ByteCount: src_size,
+/// Splits `[0, size)` into `(offset, byte_count)` clone requests: each
+/// starts on a cluster boundary, covers less than 4 GiB, and is a whole
+/// number of clusters (the last one is rounded up past `size`).
+fn clone_ranges(size: u64, cluster: u64) -> Vec<(u64, u64)> {
+    // Largest whole-cluster count strictly below 4 GiB.
+    let max_chunk = ((1u64 << 32) - 1) / cluster * cluster;
+    let mut out = Vec::new();
+    let mut offset = 0u64;
+    while offset < size {
+        let remaining = size - offset;
+        let take = remaining.min(max_chunk);
+        let rounded = take.div_ceil(cluster) * cluster;
+        out.push((offset, rounded));
+        offset += take;
+    }
+    out
+}
+
+/// Opens `path` with `CreateFileW` and wraps the handle in a `File`.
+fn open_with_share(path: &Path, access: u32, share: u32, disposition: u32) -> Result<File> {
+    let wide = to_wide(path);
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the
+    // call; the access, share and disposition values are valid
+    // CreateFileW arguments; the result is checked before use.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            access,
+            share,
+            std::ptr::null(),
+            disposition,
+            0,
+            std::ptr::null_mut(),
+        )
     };
-    let mut bytes_returned: u32 = 0;
-    // SAFETY: dst_handle is the ioctl target (valid open handle);
-    // params is a stack DUPLICATE_EXTENTS_DATA pointing at the
-    // valid src_handle; sizes are accurate; the ioctl returns 0
-    // (error) or nonzero (success).
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: `handle` is a valid open handle owned by us; `File` closes
+    // it on drop.
+    Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
+}
+
+/// `true` when the volume holding `file` advertises block cloning.
+fn volume_supports_block_cloning(file: &File) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
+    let mut fs_flags: u32 = 0;
+    // SAFETY: the handle is owned by `file` for the call; every optional
+    // buffer is null with a zero length, and `fs_flags` is a valid
+    // out-pointer.
     let ok: BOOL = unsafe {
-        DeviceIoControl(
-            dst_handle,
-            FSCTL_DUPLICATE_EXTENTS_TO_FILE,
-            &mut params as *mut _ as *mut core::ffi::c_void,
-            std::mem::size_of::<DUPLICATE_EXTENTS_DATA>() as u32,
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle() as HANDLE,
             std::ptr::null_mut(),
             0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut fs_flags,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    ok != FALSE && fs_flags & FILE_SUPPORTS_BLOCK_REFCOUNTING != 0
+}
+
+/// Cluster size of the ReFS volume holding `file`, from
+/// `FSCTL_GET_INTEGRITY_INFORMATION`.
+fn cluster_size(file: &File) -> Result<u64> {
+    use windows_sys::Win32::System::Ioctl::{
+        FSCTL_GET_INTEGRITY_INFORMATION, FSCTL_GET_INTEGRITY_INFORMATION_BUFFER,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    // SAFETY: the buffer is plain old data; all-zero is a valid value.
+    let mut info: FSCTL_GET_INTEGRITY_INFORMATION_BUFFER = unsafe { std::mem::zeroed() };
+    let mut bytes_returned: u32 = 0;
+    // SAFETY: the handle is owned by `file` for the call; `info` is a live
+    // output buffer whose exact size is passed; the call is synchronous.
+    let ok: BOOL = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as HANDLE,
+            FSCTL_GET_INTEGRITY_INFORMATION,
+            std::ptr::null(),
+            0,
+            (&mut info as *mut FSCTL_GET_INTEGRITY_INFORMATION_BUFFER).cast(),
+            std::mem::size_of::<FSCTL_GET_INTEGRITY_INFORMATION_BUFFER>() as u32,
             &mut bytes_returned,
-            std::ptr::null_mut::<OVERLAPPED>(),
+            std::ptr::null_mut(),
         )
     };
     if ok == FALSE {
-        // Common failure codes the caller's fallback handles:
-        // - ERROR_INVALID_FUNCTION (1) — not ReFS, kernel doesn't
-        //   know this FSCTL.
-        // - ERROR_INVALID_PARAMETER (87) — cross-volume, unaligned
-        //   range, or other contract violation.
-        // - ERROR_ACCESS_DENIED (5) — privilege / sharing.
         return Err(Error::Io(std::io::Error::last_os_error()));
     }
-
-    // Suppress unused-variable lint on src_file — it exists only for
-    // its Drop to close the source handle.
-    let _ = &src_file;
-    Ok(src_size as u64)
+    let cluster = u64::from(info.ClusterSizeInBytes);
+    if cluster == 0 || !cluster.is_power_of_two() {
+        return Err(Error::Io(std::io::Error::other(
+            "volume reported an invalid cluster size",
+        )));
+    }
+    Ok(cluster)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1378,6 +1473,48 @@ mod tests {
         let bytes = copy_file(&src, &dst).expect("copy");
         assert_eq!(bytes, 12);
         assert_eq!(std::fs::read(&dst).expect("read"), b"windows copy");
+    }
+
+    #[test]
+    fn test_clone_ranges_cluster_aligned_and_below_4_gib() {
+        assert_eq!(clone_ranges(5000, 4096), vec![(0, 8192)]);
+        assert_eq!(clone_ranges(4096, 4096), vec![(0, 4096)]);
+        assert_eq!(clone_ranges(1, 65536), vec![(0, 65536)]);
+        let big = (5u64 << 30) + 123;
+        let ranges = clone_ranges(big, 65536);
+        assert_eq!(ranges.len(), 2);
+        for (offset, count) in &ranges {
+            assert_eq!(offset % 65536, 0);
+            assert_eq!(count % 65536, 0);
+            assert!(*count < 1u64 << 32);
+        }
+        let (last_off, last_count) = ranges[1];
+        assert!(last_off + last_count >= big);
+        assert!(last_off + last_count - big < 65536);
+        assert!(clone_ranges(0, 4096).is_empty());
+    }
+
+    #[test]
+    fn test_copy_file_unaligned_size_on_non_refs_volume() {
+        // The temp volume is NTFS here: the reflink attempt must bail out
+        // before creating `dst`, and the byte copy must be exact.
+        let src = tmp_path("cp_odd_src");
+        let dst = tmp_path("cp_odd_dst");
+        let _gs = TmpFile(src.clone());
+        let _gd = TmpFile(dst.clone());
+        let data: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+        std::fs::write(&src, &data).expect("write");
+        assert_eq!(copy_file(&src, &dst).expect("copy"), 5000);
+        assert_eq!(std::fs::read(&dst).expect("read"), data);
+    }
+
+    #[test]
+    fn test_copy_file_missing_source_leaves_no_destination() {
+        let src = tmp_path("cp_missing_src");
+        let dst = tmp_path("cp_missing_dst");
+        let _gd = TmpFile(dst.clone());
+        assert!(copy_file(&src, &dst).is_err());
+        assert!(!dst.exists());
     }
 
     #[test]
