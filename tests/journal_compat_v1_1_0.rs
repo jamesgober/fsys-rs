@@ -84,10 +84,23 @@ fn fixture_path(name: &str) -> PathBuf {
 
 static C: AtomicU64 = AtomicU64::new(0);
 
+/// Removes the journal and any `<name>.corrupt-*` sidecar a reopen
+/// of a torn journal saved next to it (1.1.3).
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        let (Some(dir), Some(name)) = (self.0.parent(), self.0.file_name()) else {
+            return;
+        };
+        let prefix = format!("{}.corrupt-", name.to_string_lossy());
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 }
 
@@ -216,6 +229,7 @@ fn test_v1_1_0_fixtures_torn_last_record_recovers() {
                 .set_len(cut)
                 .expect("tear");
 
+            let torn_image = std::fs::read(&path).expect("read torn image");
             let (torn, state) = read_all(&path);
             assert_eq!(torn.len(), expected.len() - 1, "{name}");
             assert!(
@@ -234,6 +248,15 @@ fn test_v1_1_0_fixtures_torn_last_record_recovers() {
                 log.next_lsn().as_u64(),
                 end_of(&torn),
                 "{name} direct={direct}"
+            );
+            // 1.1.3: the torn bytes are kept in a sidecar file.
+            let resume = end_of(&torn);
+            let mut side = path.as_os_str().to_os_string();
+            side.push(format!(".corrupt-{resume}"));
+            assert_eq!(
+                std::fs::read(&side).expect("sidecar"),
+                &torn_image[resume as usize..],
+                "{name} direct={direct}: sidecar holds the torn bytes"
             );
             let _ = log.append(b"after-tear").expect("append");
             log.close().expect("close");

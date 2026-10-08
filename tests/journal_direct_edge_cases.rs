@@ -26,10 +26,23 @@ fn tmp_path(tag: &str) -> PathBuf {
     ))
 }
 
+/// Removes the journal and any `<name>.corrupt-*` sidecar a reopen
+/// of a torn journal saved next to it (1.1.3).
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        let (Some(dir), Some(name)) = (self.0.parent(), self.0.file_name()) else {
+            return;
+        };
+        let prefix = format!("{}.corrupt-", name.to_string_lossy());
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 }
 

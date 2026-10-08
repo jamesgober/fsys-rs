@@ -64,6 +64,7 @@ pub(crate) mod log_buffer;
 pub mod options;
 pub(crate) mod poison;
 pub mod reader;
+mod tail;
 
 pub use backend::{JournalBackend, JournalBackendHealth, JournalBackendInfo, JournalBackendKind};
 pub use options::{JournalOptions, SyncMode, WriteLifetimeHint};
@@ -340,6 +341,18 @@ impl JournalHandle {
     /// off, and the partial trailing sector content is rehydrated
     /// into the buffer so subsequent flushes overwrite the
     /// zero-pad cleanly.
+    ///
+    /// **Corrupt tail** (1.1.3, both modes): whatever stopped the
+    /// resume scan (a torn frame, a zero run, a CRC mismatch, a bad
+    /// magic, an oversized length field), the journal opens at the
+    /// end of the last valid frame. A discarded tail that is not
+    /// all zero bytes is first copied to
+    /// `<journal file name>.corrupt-<clean end offset>` in the same
+    /// directory (`.1`, `.2`, ... appended if that name holds other
+    /// bytes), and the copy and the directory are synced before the
+    /// journal is truncated. If the copy cannot be written the open
+    /// fails with [`Error::Io`] and the journal is left unchanged.
+    /// See the `tail` module.
     pub(crate) fn open_with_options(path: &Path, options: JournalOptions) -> Result<Self> {
         if options.direct {
             Self::open_direct(path, options)
@@ -375,21 +388,27 @@ impl JournalHandle {
         Self::apply_write_lifetime_hint(&file, options.write_lifetime_hint);
 
         // Resume past the last cleanly decoded frame, not at the raw
-        // file length (1.1.1). A torn final frame, a zero hole from
-        // an unwritten reservation, or zero-filled space from a
-        // preallocation fallback is cut off so new appends land
-        // where the reader can reach them; pre-1.1.1 appends after
-        // such a tail were unreadable. Journals the reader cannot
-        // classify as a recoverable tail (bad magic, length
-        // overflow) are refused, as in Direct-IO mode.
+        // file length (1.1.1). Everything after it is cut off so new
+        // appends land where the reader can reach them; pre-1.1.1
+        // appends after such a tail were unreadable. 1.1.3: every
+        // tail state resumes this way (1.1.1 and 1.1.2 refused bad
+        // magic and length overflow), and a tail that is not all
+        // zero bytes is first saved to a sidecar file, durably, by
+        // `tail::prepare_resume`.
         let file_len = file.metadata().map_err(Error::Io)?.len();
-        let len = if file_len == 0 {
-            0
+        let resume = if file_len == 0 {
+            tail::Resume::empty()
         } else {
-            scan_clean_end(path)?
+            tail::prepare_resume(path)?
         };
+        let len = resume.clean_end;
+        #[cfg(test)]
+        tail::fault::before_truncate()?;
         if len < file_len {
             file.set_len(len).map_err(Error::Io)?;
+            // Make the cut durable so a crash cannot bring the tail
+            // back, and with it a second sidecar on the next open.
+            file.sync_all().map_err(Error::Io)?;
         }
         // Keep the cursor at the end so a stray `write()` (which
         // we don't use) would land at the right place.
@@ -448,11 +467,16 @@ impl JournalHandle {
     fn open_direct(path: &Path, options: JournalOptions) -> Result<Self> {
         // Resolve the resume cursor by scanning the existing file
         // (if any) for the last cleanly-decoded frame's end LSN.
-        let resume_lsn = if path.exists() {
-            scan_clean_end(path)?
+        // 1.1.3: every tail state resumes here, and a tail that is
+        // not all zero bytes is saved to a sidecar file before
+        // anything below truncates the journal (see the `tail`
+        // module).
+        let resume = if path.exists() {
+            tail::prepare_resume(path)?
         } else {
-            0
+            tail::Resume::empty()
         };
+        let resume_lsn = resume.clean_end;
 
         // Open the journal file with the platform's Direct-IO
         // flag. `open_direct_journal` returns
@@ -480,6 +504,8 @@ impl JournalHandle {
         // the "direct" intent: the caller can observe it via
         // [`Self::is_direct_active`].
         let file_len = file.metadata().map_err(Error::Io)?.len();
+        #[cfg(test)]
+        tail::fault::before_truncate()?;
         let log_buffer = if direct_active {
             // Allocate the log buffer. Resume puts `flush_pos` at
             // the largest sector boundary ≤ resume_lsn; the buffer
@@ -503,8 +529,26 @@ impl JournalHandle {
             } else {
                 resume_sector
             };
-            if file_len > keep {
+            let target = keep.min(file_len);
+            let mut cut = false;
+            if resume.tail_has_data() {
+                // 1.1.3: bytes in `[resume_lsn, keep)` stay on disk
+                // until a flush rewrites that sector. Non-zero ones
+                // would make the next open find the same corrupt
+                // tail again (and copy it again) if no flush ran in
+                // between, so cut them and extend back with zeros,
+                // the shape a clean Direct-IO close leaves.
+                file.set_len(resume_lsn).map_err(Error::Io)?;
+                if target > resume_lsn {
+                    file.set_len(target).map_err(Error::Io)?;
+                }
+                cut = true;
+            } else if file_len > keep {
                 file.set_len(keep).map_err(Error::Io)?;
+                cut = true;
+            }
+            if cut {
+                file.sync_all().map_err(Error::Io)?;
             }
             if resume_lsn > 0 {
                 let prefix = read_resume_prefix(path, resume_sector, resume_lsn)?;
@@ -515,6 +559,7 @@ impl JournalHandle {
             // Buffered fallback: same resume rule as `open_buffered`.
             if file_len > resume_lsn {
                 file.set_len(resume_lsn).map_err(Error::Io)?;
+                file.sync_all().map_err(Error::Io)?;
             }
             None
         };
@@ -1657,49 +1702,8 @@ impl Drop for LeaderGuard<'_> {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Internal helpers — direct-mode constructor + resume-scan
+// Internal helpers: direct-mode open and resume prefix
 // ─────────────────────────────────────────────────────────────────
-
-/// Scans `path` for the byte offset immediately past the last
-/// cleanly-decoded frame. Used by resume in both modes to set
-/// `next_lsn` past partial / corrupted / zero trailing bytes
-/// rather than at raw `file_size`.
-///
-/// Returns `0` for an empty / non-existent file. Surfaces an error
-/// for non-recoverable tail states (`BadMagic`, `LengthOverflow`)
-/// so the caller can choose to refuse the open rather than
-/// silently truncate past suspect data.
-fn scan_clean_end(path: &Path) -> Result<u64> {
-    let mut reader = JournalReader::open(path)?;
-    if reader.file_size() == 0 {
-        return Ok(0);
-    }
-    let mut iter = reader.iter();
-    while iter.next().transpose()?.is_some() {}
-    drop(iter);
-    match reader.tail_state() {
-        JournalTailState::CleanEnd
-        | JournalTailState::TruncatedHeader
-        | JournalTailState::TruncatedPayload
-        | JournalTailState::ChecksumMismatch => Ok(reader.position().0),
-        JournalTailState::BadMagic => Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "journal at {:?} has bad magic at offset {}; refusing to open it",
-                path,
-                reader.position().0
-            ),
-        ))),
-        JournalTailState::LengthOverflow => Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "journal at {:?} has frame length overflow at offset {}; refusing to open it",
-                path,
-                reader.position().0
-            ),
-        ))),
-    }
-}
 
 /// Creation mode for Direct-IO journal files on Linux: `0o666`
 /// filtered by the process umask, the same default `std` uses for
@@ -3329,6 +3333,115 @@ mod tests {
                 log_buffer.sector_size(),
                 crate::platform::probe_sector_size(&path) as usize
             );
+        }
+    }
+
+    /// A journal with three records followed by non-zero garbage, in
+    /// its own directory so sidecar files can be listed. Returns
+    /// `(dir, path, clean_end, garbage)`.
+    fn corrupt_tail_journal(
+        tag: &str,
+        direct: bool,
+    ) -> (std::path::PathBuf, std::path::PathBuf, u64, Vec<u8>) {
+        let dir = tmp_path(tag);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("j");
+        let j = JournalHandle::open_with_options(&path, JournalOptions::new().direct(direct))
+            .expect("open");
+        for r in [&b"one"[..], b"two", b"three"] {
+            let _ = j.append(r).expect("append");
+        }
+        let end = j.next_lsn().as_u64();
+        j.close().expect("close");
+        let garbage: Vec<u8> = (0..300u32).map(|i| (i % 200) as u8 + 20).collect();
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes.truncate(end as usize);
+        bytes.extend_from_slice(&garbage);
+        std::fs::write(&path, &bytes).expect("write corrupt image");
+        (dir, path, end, garbage)
+    }
+
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    struct CleanupDir(std::path::PathBuf);
+    impl Drop for CleanupDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_open_crash_between_sidecar_and_truncate_reuses_sidecar() {
+        for direct in [false, true] {
+            let (dir, path, end, garbage) = corrupt_tail_journal("crash_tail", direct);
+            let _g = CleanupDir(dir.clone());
+            let before = std::fs::read(&path).expect("read");
+            let opts = || JournalOptions::new().direct(direct);
+
+            // Stop where a crash after the sidecar sync and before the
+            // truncate would: the copy is complete, the journal intact.
+            tail::fault::stop_before_truncate(true);
+            let r = JournalHandle::open_with_options(&path, opts());
+            tail::fault::stop_before_truncate(false);
+            assert!(r.is_err(), "direct={direct}");
+            drop(r);
+            let side = format!("j.corrupt-{end}");
+            assert_eq!(dir_names(&dir), vec!["j".to_string(), side.clone()]);
+            assert_eq!(std::fs::read(dir.join(&side)).expect("sidecar"), garbage);
+            assert_eq!(std::fs::read(&path).expect("read"), before);
+
+            // The reopen reuses the identical copy and finishes the cut.
+            let j = JournalHandle::open_with_options(&path, opts()).expect("reopen");
+            assert_eq!(j.next_lsn().as_u64(), end, "direct={direct}");
+            j.close().expect("close");
+            assert_eq!(dir_names(&dir), vec!["j".to_string(), side.clone()]);
+
+            // A further reopen finds nothing to save.
+            let j = JournalHandle::open_with_options(&path, opts()).expect("reopen 2");
+            assert_eq!(j.next_lsn().as_u64(), end, "direct={direct}");
+            let _ = j.append(b"four").expect("append");
+            j.close().expect("close");
+            assert_eq!(dir_names(&dir), vec!["j".to_string(), side]);
+            let mut reader = JournalReader::open(&path).expect("reader");
+            let got: Vec<Vec<u8>> = reader.iter().map(|r| r.expect("record").payload).collect();
+            assert_eq!(
+                got,
+                vec![
+                    b"one".to_vec(),
+                    b"two".to_vec(),
+                    b"three".to_vec(),
+                    b"four".to_vec()
+                ]
+            );
+            assert_eq!(reader.tail_state(), JournalTailState::CleanEnd);
+        }
+    }
+
+    #[test]
+    fn test_open_fails_and_leaves_journal_when_sidecar_cannot_be_written() {
+        for direct in [false, true] {
+            let (dir, path, _end, _garbage) = corrupt_tail_journal("sidecar_fail", direct);
+            let _g = CleanupDir(dir.clone());
+            let before = std::fs::read(&path).expect("read");
+            tail::fault::fail_sidecar(true);
+            let r = JournalHandle::open_with_options(&path, JournalOptions::new().direct(direct));
+            tail::fault::fail_sidecar(false);
+            match r {
+                Err(Error::Io(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+                }
+                Err(other) => panic!("unexpected error {other:?}"),
+                Ok(_) => panic!("opened without saving the tail, direct={direct}"),
+            }
+            assert_eq!(dir_names(&dir), vec!["j".to_string()]);
+            assert_eq!(std::fs::read(&path).expect("read"), before);
         }
     }
 }

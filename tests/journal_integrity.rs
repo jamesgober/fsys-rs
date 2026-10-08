@@ -30,10 +30,23 @@ fn tmp_path(tag: &str) -> PathBuf {
     ))
 }
 
+/// Removes the journal and any `<name>.corrupt-*` sidecar a reopen
+/// of a torn journal saved next to it (1.1.3).
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        let (Some(dir), Some(name)) = (self.0.parent(), self.0.file_name()) else {
+            return;
+        };
+        let prefix = format!("{}.corrupt-", name.to_string_lossy());
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 }
 
@@ -443,22 +456,6 @@ fn test_reopen_after_unwritten_reservation_hole_resumes_at_hole() {
             vec![b"durable".to_vec(), b"after-recovery".to_vec()],
             "direct={direct}"
         );
-    }
-}
-
-/// A journal whose tail is not recoverable (bad magic) is refused
-/// by the buffered open too, instead of appending behind garbage
-/// where nothing is readable.
-#[test]
-fn test_buffered_open_refuses_bad_magic_journal() {
-    let path = tmp_path("bad_magic_open");
-    let _g = Cleanup(path.clone());
-    std::fs::write(&path, b"\xDE\xAD\xBE\xEF\x00\x00\x00\x00garbage").expect("write");
-    let fs = builder().build().expect("handle");
-    match fs.journal(&path) {
-        Err(fsys::Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
-        Err(other) => panic!("unexpected error {other:?}"),
-        Ok(_) => panic!("opened a journal with a bad magic"),
     }
 }
 

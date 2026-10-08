@@ -923,9 +923,19 @@ impl Handle {
     /// and exposes group-commit durability via
     /// [`crate::JournalHandle::sync_through`].
     ///
-    /// If `path` already exists, the journal resumes at the
-    /// existing file size (next LSN = existing length). If not,
-    /// the file is created.
+    /// If `path` does not exist, the file is created. If it
+    /// exists, the journal resumes at the end of the last valid
+    /// frame and cuts off anything after it (a torn frame, zero
+    /// padding, or corrupt bytes), so new records always follow
+    /// the last readable one. A cut-off tail that is not all zero
+    /// bytes is first copied to `<journal file name>.corrupt-<offset>`
+    /// in the same directory (`.1`, `.2`, ... appended if that name
+    /// holds other bytes), and the copy is synced before the
+    /// journal is truncated. Since 1.1.3 this applies to every
+    /// kind of corrupt tail; 1.1.1 and 1.1.2 refused to open a
+    /// journal whose scan stopped at a bad magic or an oversized
+    /// length field. With the `tracing` feature a saved tail is
+    /// reported as a `warn` event.
     ///
     /// `path` is resolved against the handle's
     /// [`crate::Builder::root`] scope if one is configured, with
@@ -956,7 +966,10 @@ impl Handle {
     /// # Errors
     ///
     /// - [`Error::InvalidPath`] if `path` escapes the handle root.
-    /// - [`Error::Io`] on the underlying open failure.
+    /// - [`Error::Io`] on the underlying open failure, or when a
+    ///   corrupt tail cannot be copied to its sidecar file (for
+    ///   example a read-only directory). The journal is not
+    ///   truncated in that case.
     pub fn journal(&self, path: impl AsRef<std::path::Path>) -> Result<crate::JournalHandle> {
         let resolved = self.resolve_path(path.as_ref())?;
         let mut journal = crate::journal::JournalHandle::open(&resolved)?;
@@ -974,7 +987,9 @@ impl Handle {
     ///
     /// Path resolution is identical to [`Self::journal`] — the
     /// path is canonicalised against the handle root if one is
-    /// configured, with the same security check.
+    /// configured, with the same security check. Resume and
+    /// corrupt-tail handling are the same in both modes; see
+    /// [`Self::journal`].
     ///
     /// # Example
     ///
@@ -1000,9 +1015,11 @@ impl Handle {
     /// # Errors
     ///
     /// - [`Error::InvalidPath`] if `path` escapes the handle root.
-    /// - [`Error::Io`] on the underlying open failure or — in
-    ///   direct mode — on a non-recoverable resume tail state
-    ///   (`BadMagic`, `LengthOverflow`).
+    /// - [`Error::Io`] on the underlying open failure, or when a
+    ///   corrupt tail cannot be copied to its sidecar file. The
+    ///   journal is not truncated in that case. Before 1.1.3 a
+    ///   resume scan that stopped at `BadMagic` or
+    ///   `LengthOverflow` also failed the open.
     pub fn journal_with(
         &self,
         path: impl AsRef<std::path::Path>,

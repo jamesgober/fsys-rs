@@ -94,8 +94,15 @@ const MAX_GAP_SKIP: u64 = crate::journal::options::MAX_LOG_BUFFER_BYTES as u64;
 ///
 /// Recovery code typically checks this after iteration to decide
 /// whether to truncate the file at the last-good-LSN (clean
-/// recovery from a crash) or surface an error (corruption that
-/// can't be safely truncated past).
+/// recovery from a crash) or report corruption to an operator.
+///
+/// Opening a journal for append
+/// ([`Handle::journal`](crate::Handle::journal) /
+/// [`Handle::journal_with`](crate::Handle::journal_with)) resumes
+/// at [`JournalReader::position`] for every state (1.1.3). When the
+/// bytes it cuts off are not all zero it first copies them to a
+/// sidecar file named `<journal file name>.corrupt-<offset>` next
+/// to the journal, so nothing the reader stopped at is destroyed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum JournalTailState {
@@ -131,15 +138,23 @@ pub enum JournalTailState {
     /// indicates either (a) the file is not an fsys journal
     /// (format confusion), (b) the journal was written by a
     /// future version with a different magic byte, or (c)
-    /// data corruption in the magic field. The caller should
-    /// NOT truncate-and-resume — surface this to a human
-    /// operator.
+    /// data corruption in the magic field. Report it to an
+    /// operator: unlike a torn tail it does not come from a crash.
+    ///
+    /// The reader stops here and never decodes past it. Opening
+    /// the journal for append still succeeds (1.1.3; 1.1.1 and
+    /// 1.1.2 refused it): the open copies everything from
+    /// [`JournalReader::position`] to the end of the file into a
+    /// `<journal file name>.corrupt-<offset>` sidecar, syncs it,
+    /// and only then truncates. Valid frames after the bad one
+    /// were already unreachable through the reader; they are
+    /// kept in the sidecar for forensic recovery.
     BadMagic,
     /// A frame's length field exceeds the 256 MiB cap baked
     /// into the v1 frame format. Indicates either a future
     /// format version with a different framing, or data
-    /// corruption. Same caveat as `BadMagic` — don't
-    /// auto-recover.
+    /// corruption. The reader and the journal open treat it
+    /// the same way as `BadMagic`.
     LengthOverflow,
 }
 

@@ -821,7 +821,7 @@ impl LogBuffer {
     }
 
     /// Repositions the buffer for resume-after-crash. Called by
-    /// `JournalHandle::open_direct` after `scan_clean_end` finds
+    /// `JournalHandle::open_direct` after `tail::prepare_resume` finds
     /// the last good LSN. Sets `active_flush_pos` to `flush_pos`
     /// (the last sector boundary at or before the resume LSN) and
     /// primes the active slot with `prefix`, the bytes of the
