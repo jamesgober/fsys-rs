@@ -178,4 +178,18 @@ mod tests {
         assert_eq!(resolve_auto_inner(DriveKind::Hdd, false), Method::Sync);
         assert_eq!(resolve_auto_inner(DriveKind::Unknown, false), Method::Sync);
     }
+
+    #[test]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    fn test_other_unix_always_picks_sync() {
+        for kind in [
+            DriveKind::Nvme,
+            DriveKind::SataSsd,
+            DriveKind::Hdd,
+            DriveKind::Unknown,
+        ] {
+            assert_eq!(resolve_auto_inner(kind, true), Method::Sync);
+            assert_eq!(resolve_auto_inner(kind, false), Method::Sync);
+        }
+    }
 }

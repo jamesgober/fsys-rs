@@ -205,6 +205,13 @@ fn active_durability_primitive_per_method_is_documented() {
         assert_eq!(p_sync, primitive::FSYNC);
         assert_eq!(p_data, primitive::FSYNC);
     }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        // Other Unix targets (FreeBSD, ...): `fsync` for both; the
+        // crate maps no separate data-only primitive there.
+        assert_eq!(p_sync, primitive::FSYNC);
+        assert_eq!(p_data, primitive::FSYNC);
+    }
 }
 
 /// Reads against a non-existent path return a clean

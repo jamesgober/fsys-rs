@@ -116,10 +116,9 @@ fn windows_prod() -> PathSet {
     }
 }
 
-#[cfg(any(
-    target_os = "macos",
-    all(unix, not(any(target_os = "linux", target_os = "windows")))
-))]
+/// `$HOME`, used only by the macOS layout (the generic Unix fallback
+/// in [`build_prod`] uses fixed system paths).
+#[cfg(target_os = "macos")]
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)

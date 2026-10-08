@@ -64,6 +64,9 @@ fn active_durability_primitive_for_data_method() {
     assert_eq!(p, primitive::F_FULLFSYNC);
     #[cfg(target_os = "windows")]
     assert_eq!(p, primitive::FSYNC);
+    // Other Unix targets (FreeBSD, ...) have no fdatasync mapping.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    assert_eq!(p, primitive::FSYNC);
 }
 
 #[test]
