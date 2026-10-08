@@ -284,6 +284,108 @@ mod async_tests {
         }
     }
 
+    /// End LSN of the longest prefix of cleanly decoded records in the
+    /// live journal at `path`.
+    fn clean_prefix_end(path: &std::path::Path) -> u64 {
+        let mut reader = fsys::JournalReader::open(path).expect("open reader");
+        let mut end = 0u64;
+        for record in reader.iter() {
+            match record {
+                Ok(r) => end = r.lsn.as_u64() + r.payload.len() as u64 + 12,
+                Err(_) => break,
+            }
+        }
+        end
+    }
+
+    /// The async journal paths must honour the write gate: a
+    /// `sync_through_async` leader may only publish a durable frontier
+    /// once every async append reserved below it has been written. In
+    /// the first 1.1.1 merge the native io_uring append reserved its
+    /// LSN range without registering with the gate, so a leader could
+    /// fsync and publish past a large write still in the kernel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_async_synced_frontier_never_covers_unwritten_bytes() {
+        use std::sync::atomic::AtomicBool;
+        let dir = test_dir("async_frontier");
+        let fs = builder().build().expect("handle");
+        let path = dir.0.join("frontier.wal");
+        let log = Arc::new(
+            fs.journal_with(&path, fsys::JournalOptions::new().group_commit_window(None))
+                .expect("journal"),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::new();
+        // One appender with large records (long kernel writes) and
+        // three append + sync loops.
+        {
+            let log = Arc::clone(&log);
+            let stop = Arc::clone(&stop);
+            workers.push(tokio::spawn(async move {
+                for _ in 0..24 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let big = vec![0xB1u8; 2 * 1024 * 1024];
+                    let _ = log.clone().append_async(big).await.expect("big append");
+                }
+            }));
+        }
+        // Even iterations sync through the async leader, odd ones
+        // through the blocking `sync_through` leader, so both leader
+        // kinds race the async appends.
+        for t in 0..3u8 {
+            let log = Arc::clone(&log);
+            let stop = Arc::clone(&stop);
+            workers.push(tokio::spawn(async move {
+                for i in 0..2000u32 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let lsn = log
+                        .clone()
+                        .append_async(vec![t + 1; 64])
+                        .await
+                        .expect("append");
+                    if i % 2 == 0 {
+                        log.clone().sync_through_async(lsn).await.expect("sync");
+                    } else {
+                        let log = Arc::clone(&log);
+                        tokio::task::spawn_blocking(move || log.sync_through(lsn))
+                            .await
+                            .expect("join")
+                            .expect("sync");
+                    }
+                }
+            }));
+        }
+        let checker = {
+            let log = Arc::clone(&log);
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let mut checks = 0u64;
+                while std::time::Instant::now() < deadline {
+                    let synced = log.synced_lsn().as_u64();
+                    let written = clean_prefix_end(&path);
+                    assert!(
+                        written >= synced,
+                        "synced_lsn {synced} covers bytes that are not written \
+                         (clean prefix ends at {written})"
+                    );
+                    checks += 1;
+                }
+                checks
+            })
+        };
+        let checks = checker.await;
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            w.await.expect("worker");
+        }
+        assert!(checks.expect("checker") > 0);
+    }
+
     /// FS-C2: cancelling `write_async` at an early await point must
     /// leave each target with either its previous content or the full
     /// new payload, never foreign bytes.

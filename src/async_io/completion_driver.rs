@@ -29,6 +29,11 @@
 //! therefore never frees in-flight memory and never closes an
 //! in-flight fd; the op simply finishes without anyone waiting.
 //!
+//! An owner that must learn how its op ended even after the caller
+//! gave up implements [`OpHook`] and is attached with
+//! [`FileRef::with_hook`]. The driver reports the final result to it
+//! before dropping it.
+//!
 //! If the owner task itself stops with ops still in flight (runtime
 //! shutdown, panic, or an abort), the remaining buffers and file
 //! keep-alives are leaked instead of freed, because the kernel may
@@ -115,7 +120,33 @@ impl IoBuf {
 /// under the kernel.
 pub(crate) struct FileRef {
     fd: RawFd,
-    _owner: Arc<dyn Any + Send + Sync>,
+    owner: Owner,
+}
+
+/// The keep-alive a [`FileRef`] holds.
+enum Owner {
+    /// Only keeps the file open (never read, only dropped).
+    Plain { _owner: Arc<dyn Any + Send + Sync> },
+    /// Keeps the file open and is told how the op ended.
+    Hooked(Arc<dyn OpHook>),
+}
+
+/// A file keep-alive that also needs to know how its op ended, even
+/// when the caller's future was dropped (the async journal uses it
+/// to end its write-gate registration and to poison itself on a
+/// failed write or fsync).
+pub(crate) trait OpHook: Send + Sync + 'static {
+    /// Runs once, on the owner task, with the op's final result,
+    /// after the kernel is done with the op and before the driver
+    /// drops this keep-alive and replies to the caller.
+    fn finished(&self, result: &std::io::Result<usize>);
+
+    /// Runs instead of [`Self::finished`] when the owner task stops
+    /// with the op still in flight. The op's outcome is unknown and
+    /// the kernel may still use the op's memory, so the keep-alive is
+    /// leaked right after this call and never dropped; any cleanup
+    /// that `Drop` would do must happen here.
+    fn abandoned(&self);
 }
 
 impl FileRef {
@@ -126,7 +157,32 @@ impl FileRef {
         fd_of: impl FnOnce(&T) -> RawFd,
     ) -> Self {
         let fd = fd_of(&owner);
-        Self { fd, _owner: owner }
+        Self {
+            fd,
+            owner: Owner::Plain { _owner: owner },
+        }
+    }
+
+    /// Like [`Self::new`], with an owner that is told how the op
+    /// ended (see [`OpHook`]).
+    pub(crate) fn with_hook<T: OpHook>(owner: Arc<T>, fd_of: impl FnOnce(&T) -> RawFd) -> Self {
+        let fd = fd_of(&owner);
+        Self {
+            fd,
+            owner: Owner::Hooked(owner),
+        }
+    }
+
+    fn finished(&self, result: &std::io::Result<usize>) {
+        if let Owner::Hooked(hook) = &self.owner {
+            hook.finished(result);
+        }
+    }
+
+    fn abandoned(&self) {
+        if let Owner::Hooked(hook) = &self.owner {
+            hook.abandoned();
+        }
     }
 }
 
@@ -288,6 +344,7 @@ impl Drop for PendingOps {
         // free them. Dropping each `reply` wakes its caller with an
         // error.
         for (_, op) in self.0.drain() {
+            op.file.abandoned();
             std::mem::forget(op.buf);
             std::mem::forget(op.file);
             drop(op.reply);
@@ -472,12 +529,14 @@ fn start_op(ring: &mut io_uring::IoUring, pending: &mut PendingOps, id: u64, op:
     submit_or_fail(ring, pending, id, in_flight);
 }
 
-/// Releases `op`'s buffer and file keep-alive, then delivers
-/// `result`. The kernel is done with both by the time this runs.
+/// Reports `result` to the op's hook (if any), releases its buffer
+/// and file keep-alive, then delivers `result`. The kernel is done
+/// with both by the time this runs.
 fn finish(op: InFlight, result: std::io::Result<usize>) {
     let InFlight {
         reply, file, buf, ..
     } = op;
+    file.finished(&result);
     drop(buf);
     drop(file);
     // The caller may have dropped its future (cancellation); the
@@ -818,6 +877,133 @@ mod tests {
                     "op {i}: cancelled write landed with foreign bytes"
                 );
             }
+        })
+        .await;
+    }
+
+    /// Records how the driver ended an op.
+    #[derive(Default)]
+    struct Probe {
+        finished_ok: std::sync::atomic::AtomicU32,
+        finished_err: std::sync::atomic::AtomicU32,
+        abandoned: std::sync::atomic::AtomicU32,
+        fd: RawFd,
+    }
+
+    impl OpHook for Probe {
+        fn finished(&self, result: &std::io::Result<usize>) {
+            let counter = if result.is_ok() {
+                &self.finished_ok
+            } else {
+                &self.finished_err
+            };
+            let _ = counter.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn abandoned(&self) {
+            let _ = self.abandoned.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Probe {
+        fn counts(&self) -> (u32, u32, u32) {
+            (
+                self.finished_ok.load(Ordering::SeqCst),
+                self.finished_err.load(Ordering::SeqCst),
+                self.abandoned.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hook_sees_final_result_even_when_caller_dropped() {
+        with_timeout(async {
+            let Some(ring) = ring_or_skip() else { return };
+            // Failed op, awaited.
+            let probe = Arc::new(Probe {
+                fd: -1,
+                ..Probe::default()
+            });
+            let result = ring
+                .submit(|reply| Op::Fdatasync {
+                    file: FileRef::with_hook(Arc::clone(&probe), |p| p.fd),
+                    reply,
+                })
+                .await;
+            assert!(matches!(result, Err(Error::Io(_))));
+            assert_eq!(probe.counts(), (0, 1, 0));
+
+            // Successful op whose future is dropped after one poll:
+            // the hook still hears the result, then is released.
+            let path = std::env::temp_dir().join(format!(
+                "fsys_driver_hook_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .expect("open");
+            let probe = Arc::new(Probe {
+                fd: file.as_raw_fd(),
+                ..Probe::default()
+            });
+            let fut = ring.submit(|reply| Op::Write {
+                file: FileRef::with_hook(Arc::clone(&probe), |p| p.fd),
+                buf: IoBuf::Vec(b"hooked".to_vec()),
+                offset: 0,
+                reply,
+            });
+            let _elapsed = tokio::time::timeout(Duration::ZERO, fut).await;
+            while Arc::strong_count(&probe) > 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(probe.counts(), (1, 0, 0));
+            drop(file);
+            let bytes = std::fs::read(&path).expect("read back");
+            let _cleanup = std::fs::remove_file(&path);
+            assert_eq!(bytes, b"hooked");
+        })
+        .await;
+    }
+
+    /// An op still in the kernel when the owner task stops is
+    /// abandoned: its hook hears `abandoned` (and never `finished`).
+    /// A write larger than the pipe's capacity stays in flight
+    /// because nothing reads the pipe.
+    #[tokio::test]
+    async fn test_hook_abandoned_when_owner_stops_with_op_in_flight() {
+        with_timeout(async {
+            let Some(ring) = ring_or_skip() else { return };
+            let mut fds = [0 as RawFd; 2];
+            // SAFETY: `fds` is a valid, writable two-element array,
+            // as `pipe(2)` requires.
+            let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+            assert_eq!(rc, 0, "pipe");
+            // SAFETY: both descriptors were just returned by `pipe`
+            // and are owned by nothing else.
+            let (read_end, write_end) =
+                unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            let write_end = Arc::new(write_end);
+            let probe = Arc::new(Probe {
+                fd: write_end.as_raw_fd(),
+                ..Probe::default()
+            });
+            let fut = ring.submit(|reply| Op::Write {
+                file: FileRef::with_hook(Arc::clone(&probe), |p| p.fd),
+                buf: IoBuf::Vec(vec![0x5Au8; 4 * 1024 * 1024]),
+                offset: 0,
+                reply,
+            });
+            let _elapsed = tokio::time::timeout(Duration::from_millis(50), fut).await;
+            assert_eq!(probe.counts(), (0, 0, 0), "write finished on a full pipe");
+            let join = take_join(&ring);
+            join.abort();
+            let _cancelled = join.await;
+            assert_eq!(probe.counts(), (0, 0, 1));
+            drop(read_end);
         })
         .await;
     }

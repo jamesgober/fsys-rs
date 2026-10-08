@@ -65,12 +65,38 @@ pub(crate) struct WriteGate {
 /// marks the write finished (successful or not).
 #[must_use = "dropping the ticket marks the write finished"]
 pub(crate) struct WriteTicket<'a> {
-    counter: &'a AtomicU64,
+    gate: &'a WriteGate,
+    parity: usize,
 }
 
 impl Drop for WriteTicket<'_> {
     fn drop(&mut self) {
-        let _ = self.counter.fetch_sub(1, Ordering::Release);
+        self.gate.leave(self.parity);
+    }
+}
+
+/// A [`WriteTicket`] detached from its borrow of the gate, for a
+/// write that outlives the caller's stack frame (the native async
+/// append, whose write is owned by the io_uring driver). The owner
+/// must hand it back through [`WriteGate::leave_detached`] exactly
+/// once, when the write has finished; a detached ticket that is
+/// never returned keeps every later drain of its parity waiting.
+#[cfg(all(target_os = "linux", feature = "async"))]
+#[must_use = "a detached ticket must be returned with WriteGate::leave_detached"]
+pub(crate) struct DetachedTicket {
+    parity: usize,
+}
+
+#[cfg(all(target_os = "linux", feature = "async"))]
+impl WriteTicket<'_> {
+    /// Detaches the registration from this borrow. See
+    /// [`DetachedTicket`].
+    pub(crate) fn detach(self) -> DetachedTicket {
+        let parity = self.parity;
+        // The registration now belongs to the detached ticket; skip
+        // this ticket's `Drop`, which would end it.
+        std::mem::forget(self);
+        DetachedTicket { parity }
     }
 }
 
@@ -106,21 +132,47 @@ impl WriteGate {
     pub(crate) fn enter(&self) -> WriteTicket<'_> {
         let mut spins = 0u32;
         loop {
+            if let Some(ticket) = self.try_enter() {
+                return ticket;
+            }
+            backoff(&mut spins);
+        }
+    }
+
+    /// [`Self::enter`] without the wait: returns `None` while the
+    /// gate is closed. Async callers use it to yield instead of
+    /// blocking their worker thread.
+    #[inline]
+    pub(crate) fn try_enter(&self) -> Option<WriteTicket<'_>> {
+        loop {
             let epoch = self.epoch.load(Ordering::SeqCst);
             if epoch & CLOSED != 0 {
-                backoff(&mut spins);
-                continue;
+                return None;
             }
-            let counter: &AtomicU64 = &self.in_flight[parity(epoch)];
-            let _ = counter.fetch_add(1, Ordering::SeqCst);
+            let parity = parity(epoch);
+            let _ = self.in_flight[parity].fetch_add(1, Ordering::SeqCst);
             if self.epoch.load(Ordering::SeqCst) == epoch {
-                return WriteTicket { counter };
+                return Some(WriteTicket { gate: self, parity });
             }
             // A leader flipped the epoch (or the gate closed)
-            // between the read
-            // and the increment; we have not reserved anything yet.
-            let _ = counter.fetch_sub(1, Ordering::Release);
+            // between the read and the increment; we have not
+            // reserved anything yet.
+            self.leave(parity);
         }
+    }
+
+    /// Ends one registration under `parity`.
+    #[inline]
+    fn leave(&self, parity: usize) {
+        let _ = self.in_flight[parity].fetch_sub(1, Ordering::Release);
+    }
+
+    /// Ends the registration held by a detached ticket. Call it only
+    /// once the ticket's write has finished (successfully or not).
+    #[cfg(all(target_os = "linux", feature = "async"))]
+    #[inline]
+    pub(crate) fn leave_detached(&self, ticket: DetachedTicket) {
+        self.leave(ticket.parity);
     }
 
     /// Reads the reservation frontier with `read_frontier` and
@@ -133,6 +185,26 @@ impl WriteGate {
         let old = self.epoch.fetch_add(FLIP, Ordering::SeqCst);
         wait_zero(&self.in_flight[parity(old)]);
         frontier
+    }
+
+    /// Non-blocking check for callers that must not wait (the native
+    /// async group-commit leader): reads the reservation frontier
+    /// with `read_frontier` and returns it when no write is
+    /// registered at all after the read, `None` otherwise.
+    ///
+    /// Sound without an epoch flip: a write reserved below the
+    /// frontier registered before its reservation, which precedes
+    /// the frontier read in the `SeqCst` order, so a later `SeqCst`
+    /// load that reads zero from its counter is ordered after its
+    /// decrement and therefore after its write. The check can fail
+    /// indefinitely under steady append load; callers then fall back
+    /// to [`Self::drain_below`], which cannot be starved.
+    #[cfg(all(target_os = "linux", feature = "async"))]
+    pub(crate) fn try_quiescent(&self, read_frontier: impl FnOnce() -> u64) -> Option<u64> {
+        let frontier = read_frontier();
+        let idle = self.in_flight[0].load(Ordering::SeqCst) == 0
+            && self.in_flight[1].load(Ordering::SeqCst) == 0;
+        idle.then_some(frontier)
     }
 
     /// Closes the gate: new appenders wait in [`Self::enter`] and
@@ -280,6 +352,53 @@ mod tests {
         drop(ticket);
         closer.join().unwrap();
         assert!(done.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_gate_try_enter_on_closed_gate_returns_none() {
+        let gate = WriteGate::new();
+        {
+            let _closed = gate.close();
+            assert!(gate.try_enter().is_none());
+        }
+        let ticket = gate.try_enter().expect("open gate admits a writer");
+        drop(ticket);
+        assert_eq!(gate.drain_below(|| 5), 5);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "async"))]
+    #[test]
+    fn test_gate_detached_ticket_holds_drain_until_returned() {
+        let gate = Arc::new(WriteGate::new());
+        let detached = gate.enter().detach();
+        assert_eq!(gate.try_quiescent(|| 9), None);
+        let finished = Arc::new(AtomicBool::new(false));
+        let g2 = Arc::clone(&gate);
+        let f2 = Arc::clone(&finished);
+        let drainer = std::thread::spawn(move || {
+            let frontier = g2.drain_below(|| 9);
+            f2.store(true, Ordering::SeqCst);
+            frontier
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "drain finished while a detached write was in flight"
+        );
+        gate.leave_detached(detached);
+        assert_eq!(drainer.join().unwrap(), 9);
+        assert_eq!(gate.try_quiescent(|| 11), Some(11));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "async"))]
+    #[test]
+    fn test_gate_try_quiescent_without_writers_returns_frontier() {
+        let gate = WriteGate::new();
+        assert_eq!(gate.try_quiescent(|| 0), Some(0));
+        let ticket = gate.enter();
+        assert_eq!(gate.try_quiescent(|| 3), None);
+        drop(ticket);
+        assert_eq!(gate.try_quiescent(|| 3), Some(3));
     }
 
     /// Model check of the protocol: writers reserve ranges on a
