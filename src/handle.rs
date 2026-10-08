@@ -868,7 +868,7 @@ impl Handle {
     /// write".
     ///
     /// **Probing happens once per process** (via
-    /// [`crate::hardware::drive`]) and the result is cached for
+    /// [`crate::hardware::drive()`]) and the result is cached for
     /// the lifetime of the process. Hot-plug is not re-probed.
     ///
     /// Describes the drive that holds the process's current working
