@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(target_os = "linux")]
-use std::sync::Mutex;
+use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 use crate::platform::linux_iouring::{IoUringRing, NvmeAccess};
@@ -49,37 +49,6 @@ use crate::async_io::completion_driver::AsyncIoUring;
 use crate::platform::windows_nvme::NvmeAccess as WinNvmeAccess;
 #[cfg(target_os = "windows")]
 use std::sync::Arc as WinArc;
-
-/// Per-handle io_uring ring slot (Linux only).
-///
-/// Three states:
-/// - `Untried`: no Direct op has run yet; the ring has not been
-///   probed.
-/// - `Active(ring)`: ring construction succeeded; subsequent Direct
-///   ops route through it.
-/// - `Disabled`: ring construction failed (kernel < 5.1, SECCOMP,
-///   container restriction, etc.). Cached so we don't retry on every
-///   op; the Direct path falls through to the existing
-///   `pwrite`+`fdatasync` fallback.
-#[cfg(target_os = "linux")]
-enum IoUringState {
-    Untried,
-    Active(Arc<IoUringRing>),
-    Disabled,
-}
-
-/// Per-handle native async io_uring substrate slot (Linux + async
-/// feature only). Same three-state pattern. Constructed on the
-/// first async Direct op. Once `Disabled`, the substrate caches
-/// the failure and async ops fall through to `spawn_blocking`.
-///
-/// New in `0.7.0`.
-#[cfg(all(target_os = "linux", feature = "async"))]
-enum AsyncIoUringState {
-    Untried,
-    Active(Arc<AsyncIoUring>),
-    Disabled,
-}
 
 /// A capability probed once per handle, for the first storage device a
 /// Direct op touches.
@@ -246,15 +215,17 @@ pub struct Handle {
     /// timeout. On kernels / environments that reject the setup
     /// (EPERM on < 5.13 without CAP_SYS_NICE, restricted
     /// sandboxes), `IoUringRing::new` returns the setup error
-    /// and `iouring_slot` flips to `Disabled` — the Direct path
-    /// then falls back to non-SQPOLL pwrite cleanly.
+    /// and `iouring_slot` caches `None` — the Direct path then
+    /// falls back to the `pwrite` path cleanly.
     #[cfg(target_os = "linux")]
     iouring_sqpoll_idle_ms: Option<u32>,
-    /// Linux-only: lazy `io_uring` ring slot. `Untried` until the
-    /// first Direct op probes; `Active(...)` or `Disabled` for the
-    /// rest of this Handle's lifetime.
+    /// Linux-only: lazy `io_uring` ring. Empty until the first Direct
+    /// op; then `Some(ring)`, or `None` when construction failed (kernel
+    /// < 5.1, seccomp, container restriction), for the rest of this
+    /// Handle's lifetime. After initialisation every lookup is a single
+    /// atomic load; earlier versions took a mutex on every Direct op.
     #[cfg(target_os = "linux")]
-    iouring_slot: Mutex<IoUringState>,
+    iouring_slot: OnceLock<Option<Arc<IoUringRing>>>,
     /// Linux-only: NVMe-passthrough capability (an owned `/dev/nvmeX`
     /// handle plus namespace id), probed on the first Direct op and
     /// keyed by the `st_dev` it was probed for.
@@ -266,9 +237,9 @@ pub struct Handle {
     #[cfg(target_os = "windows")]
     nvme_slot_win: DeviceKeyed<WinNvmeAccess>,
     /// Linux + `async` feature only: lazy native io_uring async
-    /// substrate slot. New in `0.7.0`.
+    /// substrate. Same states as `iouring_slot`. New in `0.7.0`.
     #[cfg(all(target_os = "linux", feature = "async"))]
-    async_iouring_slot: Mutex<AsyncIoUringState>,
+    async_iouring_slot: OnceLock<Option<Arc<AsyncIoUring>>>,
     /// 0.9.2: optional structured-telemetry observer. Registered
     /// once at handle-construction time via
     /// [`crate::Builder::observer`]; cloned (cheap `Arc::clone`)
@@ -312,13 +283,13 @@ impl Handle {
             #[cfg(target_os = "linux")]
             iouring_sqpoll_idle_ms,
             #[cfg(target_os = "linux")]
-            iouring_slot: Mutex::new(IoUringState::Untried),
+            iouring_slot: OnceLock::new(),
             #[cfg(target_os = "linux")]
             nvme_slot: DeviceKeyed::new(),
             #[cfg(target_os = "windows")]
             nvme_slot_win: DeviceKeyed::new(),
             #[cfg(all(target_os = "linux", feature = "async"))]
-            async_iouring_slot: Mutex::new(AsyncIoUringState::Untried),
+            async_iouring_slot: OnceLock::new(),
             observer,
         }
     }
@@ -343,26 +314,13 @@ impl Handle {
     /// completion-driver task on the current runtime).
     #[cfg(all(target_os = "linux", feature = "async"))]
     pub(crate) fn async_io_uring(&self) -> Option<Arc<AsyncIoUring>> {
-        let mut guard = match self.async_iouring_slot.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        match &*guard {
-            AsyncIoUringState::Active(a) => return Some(a.clone()),
-            AsyncIoUringState::Disabled => return None,
-            AsyncIoUringState::Untried => {}
-        }
-        match AsyncIoUring::new(self.iouring_queue_depth) {
-            Ok(ring) => {
-                let arc = Arc::new(ring);
-                *guard = AsyncIoUringState::Active(arc.clone());
-                Some(arc)
-            }
-            Err(_) => {
-                *guard = AsyncIoUringState::Disabled;
-                None
-            }
-        }
+        self.async_iouring_slot
+            .get_or_init(|| {
+                AsyncIoUring::new(self.iouring_queue_depth)
+                    .ok()
+                    .map(Arc::new)
+            })
+            .clone()
     }
 
     /// Returns the Windows NVMe-passthrough access for the volume that
@@ -491,11 +449,7 @@ impl Handle {
         if self.nvme_slot.is_active() {
             return crate::primitive::IO_URING_NVME_FLUSH;
         }
-        let ring_active = matches!(
-            *self.iouring_slot.lock().unwrap_or_else(|p| p.into_inner()),
-            IoUringState::Active(_)
-        );
-        if ring_active {
+        if matches!(self.iouring_slot.get(), Some(Some(_))) {
             crate::primitive::IO_URING_FDATASYNC
         } else {
             crate::primitive::O_DIRECT_PWRITE_FDATASYNC
@@ -561,7 +515,7 @@ impl Handle {
     /// always returns `false` — the native substrate is unreachable.
     #[cfg(all(target_os = "linux", feature = "async"))]
     fn substrate_is_native(&self) -> bool {
-        if std::env::var_os("FSYS_DISABLE_NATIVE_ASYNC").is_some() {
+        if native_async_disabled_by_env() {
             return false;
         }
         if self.active_method() != Method::Direct {
@@ -571,14 +525,9 @@ impl Handle {
         // its driver isn't poisoned. The first async Direct op finds
         // SpawnBlocking (async ring not yet constructed), routes
         // through spawn_blocking; the next op finds the cached
-        // result. We also check the poisoned flag — a panicked
-        // driver is functionally fallback even if the slot says
-        // Active.
-        let guard = match self.async_iouring_slot.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        matches!(&*guard, AsyncIoUringState::Active(ring) if !ring.is_poisoned())
+        // result. A panicked driver is functionally fallback even if
+        // the ring exists.
+        matches!(self.async_iouring_slot.get(), Some(Some(ring)) if !ring.is_poisoned())
     }
 
     /// Linux without async feature: native substrate is gated by
@@ -603,38 +552,22 @@ impl Handle {
     /// method.
     #[cfg(target_os = "linux")]
     pub(crate) fn io_uring_ring(&self) -> Option<Arc<IoUringRing>> {
-        let mut guard = match self.iouring_slot.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        match &*guard {
-            IoUringState::Active(r) => return Some(r.clone()),
-            IoUringState::Disabled => return None,
-            IoUringState::Untried => {}
-        }
-        match IoUringRing::new(self.iouring_queue_depth, self.iouring_sqpoll_idle_ms) {
-            Ok(ring) => {
-                let arc = Arc::new(ring);
-                *guard = IoUringState::Active(arc.clone());
-                Some(arc)
-            }
-            Err(_) => {
-                *guard = IoUringState::Disabled;
-                None
-            }
-        }
+        self.iouring_slot
+            .get_or_init(|| {
+                IoUringRing::new(self.iouring_queue_depth, self.iouring_sqpoll_idle_ms)
+                    .ok()
+                    .map(Arc::new)
+            })
+            .clone()
     }
 
     /// Test-only: marks the `io_uring` ring as unavailable so Direct
     /// ops take the platform `pwrite` path, the same path a kernel
-    /// without `io_uring` (or a restricted container) would take.
+    /// without `io_uring` (or a restricted container) would take. Must
+    /// run before the handle's first Direct op.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn disable_io_uring_for_test(&self) {
-        let mut guard = match self.iouring_slot.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        *guard = IoUringState::Disabled;
+        let _ = self.iouring_slot.set(None);
     }
 
     /// Returns a clone of the per-handle aligned buffer pool,
@@ -1544,6 +1477,15 @@ impl Handle {
             .submit_async(ops, self.snapshot(), false)
             .await
     }
+}
+
+/// `true` when `FSYS_DISABLE_NATIVE_ASYNC` is set. Read once per
+/// process (the variable is a startup switch), so the async substrate
+/// check costs no environment lookup per op.
+#[cfg(all(target_os = "linux", feature = "async"))]
+fn native_async_disabled_by_env() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("FSYS_DISABLE_NATIVE_ASYNC").is_some())
 }
 
 /// Volume serial number of the volume holding `file`, used to key the
