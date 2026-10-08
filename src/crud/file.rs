@@ -452,19 +452,36 @@ impl Handle {
     // Durability helpers
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// Flushes the OS write buffers for an open file.
+    /// Flushes the file at `path` to stable storage.
     ///
-    /// The exact primitive depends on the handle's active method:
-    /// - `Sync`: full fsync (data + metadata).
-    /// - `Data`: fdatasync on Linux, full sync elsewhere.
-    /// - `Direct`: no separate flush (data is already on media).
+    /// Use it after [`Handle::append`] or [`Handle::write_at`], which
+    /// do not flush on their own. The primitive depends on the handle's
+    /// active method:
+    /// - `Data`: `fdatasync` on Linux, `F_FULLFSYNC` on macOS,
+    ///   `FlushFileBuffers` on Windows.
+    /// - every other method: `fsync` on Linux, `F_FULLFSYNC` on macOS,
+    ///   `FlushFileBuffers` on Windows.
+    ///
+    /// The file must already exist; `sync` never creates it. On Unix it
+    /// is opened read-only (`fsync` does not need write access), so a
+    /// file the process may only read can still be flushed. Windows'
+    /// `FlushFileBuffers` requires write access, so there the file is
+    /// opened for writing (without truncation).
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] if the flush syscall fails.
+    /// - [`Error::InvalidPath`] if `path` escapes the handle root.
+    /// - [`Error::Io`] if the file does not exist, cannot be opened, or
+    ///   the flush fails.
     pub fn sync(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = self.resolve_path(path.as_ref())?;
-        let (file, _) = platform::open_write_at(&path).map(|f| (f, false))?;
+        #[cfg(not(windows))]
+        let file = std::fs::File::open(&path).map_err(Error::Io)?;
+        #[cfg(windows)]
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(Error::Io)?;
         match self.active_method() {
             Method::Data => platform::sync_data(&file),
             _ => platform::sync_full(&file),
@@ -1071,6 +1088,38 @@ mod tests {
         let before = super::super::fence_probe::dir_syncs();
         h.delete(&path).expect("delete");
         assert_eq!(super::super::fence_probe::dir_syncs(), before + 1);
+    }
+
+    #[test]
+    fn test_sync_missing_file_errors_without_creating_it() {
+        let path = tmp_path("sync_missing");
+        let _g = TmpFile(path.clone());
+        match handle().sync(&path) {
+            Err(crate::Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        assert!(!path.exists(), "sync must not create the file");
+    }
+
+    #[test]
+    fn test_sync_flushes_existing_file() {
+        let path = tmp_path("sync_existing");
+        let _g = TmpFile(path.clone());
+        let h = handle();
+        h.append(&path, b"abc").expect("append");
+        h.sync(&path).expect("sync");
+        assert_eq!(std::fs::read(&path).expect("read"), b"abc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sync_works_on_read_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_path("sync_read_only");
+        let _g = TmpFile(path.clone());
+        std::fs::write(&path, b"ro").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+        handle().sync(&path).expect("sync of a read-only file");
     }
 
     #[test]
