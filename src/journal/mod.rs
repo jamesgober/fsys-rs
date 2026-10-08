@@ -669,21 +669,36 @@ impl JournalHandle {
         // record length against `FRAME_MAX_PAYLOAD` (256 MiB)
         // and the total frame size against `usize::MAX` before
         // any allocation.
-        let payload_len = record.len();
-        if (payload_len as u64) > (format::FRAME_MAX_PAYLOAD as u64) {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "journal record exceeds FRAME_MAX_PAYLOAD (256 MiB)",
-            )));
-        }
-        let total = payload_len
-            .checked_add(format::FRAME_OVERHEAD)
-            .ok_or_else(|| {
-                Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "journal frame size overflow",
-                ))
-            })?;
+        // Validate and encode before reserving (1.1.1): nothing can
+        // fail between the reservation and the write except the
+        // write itself, so an encode or size error never leaves a
+        // hole in the LSN space. `frame_len` bounds the record by
+        // `FRAME_MAX_PAYLOAD` (256 MiB) before any allocation.
+        //
+        // 0.9.1 stack-allocated frame fast path: for typical
+        // WAL records (≤ STACK_FRAME_THRESHOLD-12 bytes payload,
+        // i.e. ≤ 2036 bytes, which covers virtually every real-world
+        // WAL record), encode directly into a stack array,
+        // eliminating the per-append `Vec<u8>` allocation that
+        // dominates the bulk-load tight-loop profile. Records
+        // larger than the threshold fall back to the heap-
+        // allocated path.
+        //
+        // `MaybeUninit` skips the per-call zero-init of the whole
+        // stack array. 1.1.1: the encoder writes the frame through
+        // `MaybeUninit::write` and only then exposes those bytes as
+        // `&[u8]`; pre-1.1.1 code built a `&mut [u8]` over the
+        // uninitialized array first, which is undefined behaviour
+        // even though every byte was written before the read.
+        let total = format::frame_len(record.len())?;
+        let mut stack = [std::mem::MaybeUninit::<u8>::uninit(); STACK_FRAME_THRESHOLD];
+        let heap;
+        let encoded: &[u8] = if total <= STACK_FRAME_THRESHOLD {
+            format::encode_frame_into_uninit(record, &mut stack)?
+        } else {
+            heap = format::encode_frame_owned(record)?;
+            &heap
+        };
         let frame_len = total as u64;
 
         // Reserve a slot for the entire frame. The LSN
@@ -701,47 +716,14 @@ impl JournalHandle {
         // leader's frontier load. On x86 every RMW is already
         // sequentially consistent; on aarch64 this is the same
         // `LDADDAL` the pre-0.9.7 `AcqRel` emitted.
+        //
+        // Lock-free hot path: pwrite directly against `&self.file`;
+        // concurrent appenders write to distinct offsets per the
+        // LSN-reservation invariant.
         let _ticket = self.write_gate.enter();
         let start = self.next_lsn.fetch_add(frame_len, Ordering::SeqCst);
-        let end = start + frame_len;
-
-        // 0.9.1 stack-allocated frame fast path: for typical
-        // WAL records (≤ STACK_FRAME_THRESHOLD-12 bytes payload,
-        // i.e. ≤ 2036 bytes — covers virtually every real-world
-        // WAL record), encode directly into a stack array,
-        // eliminating the per-append `Vec<u8>` allocation that
-        // dominates the bulk-load tight-loop profile. Records
-        // larger than the threshold fall back to the heap-
-        // allocated path. Lock-free hot path: pwrite directly
-        // against `&self.file`; concurrent appenders write to
-        // distinct offsets per the LSN-reservation invariant.
-        if total <= STACK_FRAME_THRESHOLD {
-            // Use `MaybeUninit` to skip the per-call zero-init
-            // of an entire `[u8; STACK_FRAME_THRESHOLD]` array.
-            // The encoder writes every byte of `stack[..total]`
-            // before any byte is read by `write_at`. Bytes
-            // `[total..STACK_FRAME_THRESHOLD]` are never read —
-            // we only pass `&stack[..total]` to `write_at`.
-            let mut stack: std::mem::MaybeUninit<[u8; STACK_FRAME_THRESHOLD]> =
-                std::mem::MaybeUninit::uninit();
-            // SAFETY: `MaybeUninit::as_mut_ptr().cast::<u8>()`
-            // yields a `*mut u8` pointing at valid heap-aligned
-            // stack memory of at least `STACK_FRAME_THRESHOLD`
-            // bytes. The slice we construct is exactly `total`
-            // bytes (≤ STACK_FRAME_THRESHOLD), so the slice is
-            // contained within the allocation. `u8` has no
-            // invalid bit patterns; the encoder writes every
-            // byte before this slice is read.
-            let stack_slice: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(stack.as_mut_ptr().cast::<u8>(), total) };
-            let _ = format::encode_frame_into(record, stack_slice)?;
-            self.write_reserved(start, stack_slice)?;
-        } else {
-            let frame = format::encode_frame_owned(record)?;
-            self.write_reserved(start, &frame)?;
-        }
-
-        Ok(Lsn(end))
+        self.write_reserved(start, encoded)?;
+        Ok(Lsn(start + frame_len))
     }
 
     /// Writes `bytes` at the reserved offset `start` (buffered
@@ -925,48 +907,29 @@ impl JournalHandle {
         // v0.8.5: the per-record framing overhead now amortises
         // across N records instead of paying N independent
         // syscalls + N independent LSN-reservation atomics.
+        // Build the write buffer in reserved capacity without
+        // zeroing it: `encode_frame_extend` appends each frame with
+        // `extend_from_slice`, so the buffer never exposes
+        // uninitialized bytes and skips a `total`-byte memset (on a
+        // 5 K x 150 B WAL batch, ~810 KiB, that memset was the
+        // difference between a 0.77x regression and a 1.6x win vs
+        // `append`-in-loop). 1.1.1: replaces a `Vec::set_len` over
+        // uninitialized capacity followed by `&mut buf[cursor..]`,
+        // which was undefined behaviour. The buffer is built before
+        // the LSN reservation so nothing but the write itself can
+        // fail once the range is reserved.
+        let mut buf: Vec<u8> = Vec::with_capacity(total);
+        for record in records {
+            let _ = format::encode_frame_extend(record, &mut buf)?;
+        }
+        debug_assert_eq!(buf.len(), total);
+
         let frame_total = total as u64;
         // 1.1.1: registered with the write gate before the
         // `SeqCst` reservation, same as the single-record path.
         let _ticket = self.write_gate.enter();
         let start = self.next_lsn.fetch_add(frame_total, Ordering::SeqCst);
         let end = start + frame_total;
-
-        // Allocate without zeroing — `encode_frame_into` writes
-        // every byte of every frame, and `write_at` only reads
-        // the first `total` bytes. Skipping the `vec![0u8; total]`
-        // memset eliminates a `total`-byte zero pass on the hot
-        // path; on a 5 K × 150 B WAL batch (~810 KiB) that's the
-        // difference between a 0.77× regression and a 1.6× win
-        // vs `append`-in-loop on the canonical sanity bench.
-        //
-        // `clippy::uninit_vec` warns categorically against this
-        // pattern; we override per-call because the surrounding
-        // encode loop establishes the must-write-before-read
-        // invariant for every byte in `[0..total]`.
-        #[allow(clippy::uninit_vec)]
-        let mut buf: Vec<u8> = {
-            let mut v: Vec<u8> = Vec::with_capacity(total);
-            // SAFETY: `Vec::with_capacity(total)` reserves at
-            // least `total` bytes of valid, allocator-aligned
-            // heap memory; `set_len(total)` exposes those bytes
-            // as `u8` (which has no invalid bit patterns and is
-            // not `Drop`). Every byte in `v[0..total]` is fully
-            // written by the encoder loop below — across all
-            // frames the cursor walks from 0 to `total` exactly
-            // once — before `write_at` ever reads from `&buf`.
-            // No uninitialised byte is ever observed.
-            unsafe {
-                v.set_len(total);
-            }
-            v
-        };
-        let mut cursor = 0usize;
-        for record in records {
-            let written = format::encode_frame_into(record, &mut buf[cursor..])?;
-            cursor += written;
-        }
-        debug_assert_eq!(cursor, total);
 
         self.write_reserved(start, &buf)?;
 

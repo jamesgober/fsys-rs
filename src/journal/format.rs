@@ -247,6 +247,93 @@ pub(crate) fn encode_frame_owned(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// The 8-byte frame header (magic + version, payload length) for a
+/// payload of `len` bytes. `len` must already be validated against
+/// [`FRAME_MAX_PAYLOAD`].
+#[inline]
+fn frame_header(len: u32) -> [u8; 8] {
+    let mut header = [0u8; 8];
+    header[0..4].copy_from_slice(&FRAME_MAGIC_V1.to_be_bytes());
+    header[4..8].copy_from_slice(&len.to_le_bytes());
+    header
+}
+
+/// CRC-32C trailer for a frame: the checksum of `header` followed by
+/// `payload`, computed from the sources so the destination buffer is
+/// never read.
+#[inline]
+fn frame_crc(header: &[u8; 8], payload: &[u8]) -> [u8; 4] {
+    let mut crc = Crc32cBuilder::new();
+    crc.update(header);
+    crc.update(payload);
+    crc.finalize().to_le_bytes()
+}
+
+/// Encodes the frame for `payload` into the start of `out`, which may
+/// be uninitialized (1.1.1). Returns the encoded frame as an
+/// initialized slice of exactly `FRAME_OVERHEAD + payload.len()`
+/// bytes. Lets the buffered append path encode into stack memory
+/// without zeroing it first and without reading uninitialized bytes.
+///
+/// # Errors
+///
+/// [`Error::Io`] with `InvalidInput` if `payload` exceeds
+/// [`FRAME_MAX_PAYLOAD`] or `out` is shorter than the frame.
+#[inline]
+pub(crate) fn encode_frame_into_uninit<'a>(
+    payload: &[u8],
+    out: &'a mut [std::mem::MaybeUninit<u8>],
+) -> Result<&'a [u8]> {
+    let total = frame_len(payload.len())?;
+    if out.len() < total {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "encode_frame_into_uninit: buffer too small",
+        )));
+    }
+    // `frame_len` bounded the length by FRAME_MAX_PAYLOAD < u32::MAX.
+    let header = frame_header(payload.len() as u32);
+    let crc = frame_crc(&header, payload);
+    let out = &mut out[..total];
+    let (head, rest) = out.split_at_mut(8);
+    let (body, tail) = rest.split_at_mut(payload.len());
+    for (dst, src) in head
+        .iter_mut()
+        .chain(body.iter_mut())
+        .chain(tail.iter_mut())
+        .zip(header.iter().chain(payload).chain(crc.iter()))
+    {
+        let _ = dst.write(*src);
+    }
+    // SAFETY: `out` is exactly `total` = 8 + payload.len() + 4 bytes
+    // and the loop above wrote every one of them (the three source
+    // iterators yield 8, payload.len() and 4 bytes, matching the
+    // three destination chunks). `MaybeUninit<u8>` has the same size
+    // and alignment as `u8`, so the pointer cast and length are valid
+    // for a `[u8]` borrowed from `out` for `'a`.
+    Ok(unsafe { std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), total) })
+}
+
+/// Appends the frame for `payload` to `out` (1.1.1). Used by the
+/// buffered batch path to build one contiguous write buffer from
+/// reserved but unfilled capacity without exposing uninitialized
+/// bytes. Returns the number of bytes appended.
+///
+/// # Errors
+///
+/// [`Error::Io`] with `InvalidInput` if `payload` exceeds
+/// [`FRAME_MAX_PAYLOAD`].
+#[inline]
+pub(crate) fn encode_frame_extend(payload: &[u8], out: &mut Vec<u8>) -> Result<usize> {
+    let total = frame_len(payload.len())?;
+    let header = frame_header(payload.len() as u32);
+    let crc = frame_crc(&header, payload);
+    out.extend_from_slice(&header);
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&crc);
+    Ok(total)
+}
+
 /// Outcome of attempting to decode a frame from a byte slice.
 #[derive(Debug)]
 pub(crate) enum FrameDecode {
@@ -450,6 +537,44 @@ mod tests {
         let bad_len = (FRAME_MAX_PAYLOAD + 1).to_le_bytes();
         buf[4..8].copy_from_slice(&bad_len);
         assert!(matches!(decode_frame(&buf), FrameDecode::LengthOverflow));
+    }
+
+    #[test]
+    fn test_encode_frame_into_uninit_matches_encode_frame_owned() {
+        for len in [0usize, 1, 7, 8, 100, 2036] {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            let mut stack = [std::mem::MaybeUninit::<u8>::uninit(); 2048];
+            let encoded = encode_frame_into_uninit(&payload, &mut stack).expect("encode");
+            assert_eq!(
+                encoded,
+                encode_frame_owned(&payload).expect("owned").as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn test_encode_frame_into_uninit_short_buffer_rejected() {
+        let mut small = [std::mem::MaybeUninit::<u8>::uninit(); 12];
+        assert!(encode_frame_into_uninit(b"x", &mut small).is_err());
+        assert_eq!(
+            encode_frame_into_uninit(b"", &mut small)
+                .expect("empty fits")
+                .len(),
+            FRAME_OVERHEAD
+        );
+    }
+
+    #[test]
+    fn test_encode_frame_extend_matches_encode_frame_owned() {
+        let payloads: [&[u8]; 4] = [b"", b"a", b"hello journal", &[0xEE; 3000]];
+        let mut out = Vec::with_capacity(4096);
+        let mut expected = Vec::new();
+        for p in payloads {
+            let n = encode_frame_extend(p, &mut out).expect("extend");
+            assert_eq!(n, p.len() + FRAME_OVERHEAD);
+            expected.extend_from_slice(&encode_frame_owned(p).expect("owned"));
+        }
+        assert_eq!(out, expected);
     }
 
     #[test]
