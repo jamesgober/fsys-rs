@@ -124,7 +124,7 @@ passthrough slot (Linux + Windows). It is `Send + Sync` and
 |---|---|
 | `write(path, data)` | Atomic-replace write; durable on return. |
 | `write_copy(path, data)` | Atomic-replace write **preserving the existing target's metadata** (mode/ACLs/timestamps). *Not* a file-to-file copy — see [`std::fs::copy`] for that. |
-| `write_at(path, offset, data)` | Positioned write at `offset` without atomic-replace. |
+| `write_at(path, offset, data)` | Positioned write at `offset` without atomic-replace. Not flushed; call `sync(path)` when the writes must be durable. Creates the file if missing. |
 | `append(path, data)` | Append to an existing file (creates if missing). Not individually flushed; call `Handle::sync` for batched durability. |
 | `read(path)` | Read full file contents into a `Vec<u8>`. |
 | `read_at(path, offset, len)` | Read `len` bytes from `offset`. *(Renamed from `read_range` in 0.7.0.)* |

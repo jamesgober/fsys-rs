@@ -203,8 +203,14 @@ impl Handle {
     ///
     /// Direct IO is NOT used for positioned writes because arbitrary offsets
     /// require a read-modify-write cycle at the sector boundary, which
-    /// removes the performance benefit of Direct IO. The write is buffered
-    /// and uses the standard sync primitive for this handle's method.
+    /// removes the performance benefit of Direct IO. The write is buffered.
+    ///
+    /// Like [`Handle::append`], the write is **not** flushed and is not
+    /// crash-atomic: a power cut can lose it or leave the range partly
+    /// updated. Call [`Handle::sync`] after a series of positioned writes
+    /// when they must be durable; that issues the handle's durability
+    /// primitive once for all of them. The file is created if it does
+    /// not exist.
     ///
     /// # Errors
     ///
