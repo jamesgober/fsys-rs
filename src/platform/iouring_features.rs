@@ -144,7 +144,7 @@ fn probe() -> Option<IoUringFeatures> {
     }
 
     let tiers: [(IoUringFeatures, ApplyFlags); 3] = [
-        // Tier 1 — DEFER_TASKRUN (6.1+) requires SINGLE_ISSUER, and
+        // Tier 1: DEFER_TASKRUN (6.1+) requires SINGLE_ISSUER, and
         // pairs naturally with COOP_TASKRUN. `let _ = ` consumes the
         // chained `&mut Builder` return so the crate's `unused_results`
         // lint is satisfied; the builder mutation is the side effect
@@ -162,7 +162,7 @@ fn probe() -> Option<IoUringFeatures> {
                     .setup_coop_taskrun();
             },
         ),
-        // Tier 2 — SINGLE_ISSUER (6.0+) + COOP_TASKRUN.
+        // Tier 2: SINGLE_ISSUER (6.0+) + COOP_TASKRUN.
         (
             IoUringFeatures {
                 coop_taskrun: true,
@@ -173,7 +173,7 @@ fn probe() -> Option<IoUringFeatures> {
                 let _ = b.setup_single_issuer().setup_coop_taskrun();
             },
         ),
-        // Tier 3 — COOP_TASKRUN (5.19+) alone.
+        // Tier 3: COOP_TASKRUN (5.19+) alone.
         (
             IoUringFeatures {
                 coop_taskrun: true,

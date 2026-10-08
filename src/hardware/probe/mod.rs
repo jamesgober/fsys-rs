@@ -8,9 +8,9 @@
 //!
 //! Every probe function in this module **never panics** and **never
 //! errors out the handle**. When a probe cannot reach its data source
-//! — a sandboxed container has no `/sys/` mount, a Windows process
+//! (a sandboxed container has no `/sys/` mount, a Windows process
 //! cannot open the volume for `IOCTL_STORAGE_QUERY_PROPERTY`, a macOS
-//! sysctl name has gone away — the function returns the documented
+//! sysctl name has gone away), the function returns the documented
 //! default
 //! ([`crate::hardware::DriveInfo::default`], `MemoryInfo::default`,
 //! etc.).
@@ -57,7 +57,7 @@ pub(super) use self::windows as platform;
 /// guess. When the probe cannot conclusively determine PLP status, the
 /// answer is [`PlpStatus::Unknown`].
 ///
-/// **Current reliability** — the Linux and Windows probes report
+/// **Current reliability:** the Linux and Windows probes report
 /// [`PlpStatus::Yes`] when the drive's vendor / model matches a table of
 /// known PLP-equipped enterprise drives and [`PlpStatus::Unknown`]
 /// otherwise; they never report [`PlpStatus::No`]. macOS always reports

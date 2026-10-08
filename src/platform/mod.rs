@@ -261,7 +261,7 @@ pub(crate) fn write_all_direct(
 ///
 /// Uses `pwrite(2)` on Unix and `WriteFile` with the offset in an
 /// `OVERLAPPED` struct on Windows, so concurrent callers on one handle
-/// never race on a shared cursor. This is **not** crash-atomic — a power
+/// never race on a shared cursor. This is **not** crash-atomic: a power
 /// failure mid-write may leave the file in a partially updated state.
 /// Callers that need crash safety should use [`crate::Handle::write`]
 /// instead.

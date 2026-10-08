@@ -1002,7 +1002,7 @@ fn cluster_size(file: &File) -> Result<u64> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Windows preallocate via `SetFileInformationByHandle` with
-/// `FileAllocationInfo` — the analog of Linux's
+/// `FileAllocationInfo`, the analog of Linux's
 /// `fallocate(FALLOC_FL_KEEP_SIZE)`. Reserves NTFS clusters for
 /// `[0, offset + len)` without changing the file's logical size (EOF),
 /// so later `WriteFile` calls land on reserved space without

@@ -10,18 +10,18 @@
 //! ## Status
 //!
 //! What each probe actually reads:
-//! - **Drive kind / sectors / capacity** — Linux: sysfs
+//! - **Drive kind / sectors / capacity**: Linux: sysfs
 //!   `/sys/block/<dev>/queue/*` and `statvfs`; Windows:
 //!   `GetDiskFreeSpace(Ex)W`; macOS: `statvfs`. Drive kind is only
 //!   classified on Linux.
-//! - **PLP detection** — vendor / model lookup table (Linux sysfs,
+//! - **PLP detection**: vendor / model lookup table (Linux sysfs,
 //!   Windows `IOCTL_STORAGE_QUERY_PROPERTY`); `Yes` or `Unknown`, never
 //!   `No`. Not probed on macOS.
-//! - **NAWUN / NAWUPF** (atomic-write unit) — NVMe Identify Namespace,
+//! - **NAWUN / NAWUPF** (atomic-write unit): NVMe Identify Namespace,
 //!   Linux only, and only with access to `/dev/nvmeX`.
 //! - **CPU features** — true runtime detection (CPUID on x86,
 //!   HWCAP on aarch64) since 0.9.2.
-//! - **Memory** — `/proc/meminfo`, `sysctl`, `GlobalMemoryStatusEx`.
+//! - **Memory**: `/proc/meminfo`, `sysctl`, `GlobalMemoryStatusEx`.
 //!
 //! ## Which drive is probed
 //!

@@ -44,7 +44,7 @@ impl DriveKind {
 ///
 /// Populated from per-platform probes (the crate-internal `probe`
 /// module). The probe runs once per process (cached via
-/// [`super::info`] / [`super::drive()`]) and never fails the handle —
+/// [`super::info`] / [`super::drive()`]) and never fails the handle;
 /// fields the probe couldn't determine fall back to the values returned
 /// by [`DriveInfo::default`].
 ///

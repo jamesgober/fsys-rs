@@ -141,7 +141,7 @@ fn load_or_probe(
     let fresh = probe();
     // Best-effort write. Failure to persist the cache is not fatal;
     // it just means the next process will re-probe. Errors are
-    // ignored deliberately — REPS forbids silent error swallow,
+    // ignored deliberately. REPS forbids silent error swallow,
     // but this is the documented "best-effort persistence" path.
     let _ = store(&fresh);
     fresh
