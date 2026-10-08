@@ -311,19 +311,23 @@ pub(crate) fn read_all_direct(
 /// (`pread(2)` on Unix, `OVERLAPPED` offsets on Windows), so concurrent
 /// callers on the same handle do not race on a shared cursor.
 ///
-/// The buffer is never larger than the file can supply: see
-/// [`read_range_with`].
+/// The buffer never grows past what the file can supply (rounded up to
+/// 64 KiB): see [`read_range_with`].
 ///
-/// Not suitable for `O_DIRECT` / `FILE_FLAG_NO_BUFFERING` handles: the
-/// returned `Vec` is not sector-aligned and the clamped length need not be
-/// a sector multiple.
+/// On `O_DIRECT` / `FILE_FLAG_NO_BUFFERING` handles the request length
+/// and offset reach the kernel unchanged (for any `len` up to 64 KiB, or
+/// any sector-multiple `len` within the file), but the returned `Vec` is
+/// not sector-aligned, so such reads only succeed when the allocator
+/// happens to return a suitably aligned buffer.
 #[inline]
 pub(crate) fn read_range(file: &std::fs::File, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
     imp::read_range(file, offset, len)
 }
 
-/// Buffer growth step for range reads on files whose size is not known
-/// up front (pipes, character devices, procfs entries).
+/// Allocation granule for range reads: the up-front buffer for a
+/// regular file is `size - offset` rounded up to this, and buffers for
+/// files of unknown size (pipes, character devices, procfs) grow in
+/// steps of at least this much.
 const RANGE_READ_GROW_STEP: usize = 64 * 1024;
 
 /// Shared body of every platform's `read_range`.
@@ -333,10 +337,14 @@ const RANGE_READ_GROW_STEP: usize = 64 * 1024;
 /// (`0` at end of file). `ErrorKind::Interrupted` is retried.
 ///
 /// Allocation is bounded by what the file can supply, never by `len`
-/// alone: for a regular file the request is clamped to `size - offset`
-/// from one `fstat` (an `offset` at or past the end returns an empty
-/// buffer without reading); for other file types the buffer grows in
-/// 64 KiB steps as data arrives.
+/// alone. For a regular file the buffer is `min(len, size - offset
+/// rounded up to 64 KiB)` from one `fstat`; an `offset` at or past the
+/// end returns an empty buffer without reading. The rounding keeps the
+/// first request at the caller's full length in the common cases, which
+/// matters on `O_DIRECT` handles where a request shorter than a sector
+/// is rejected; the kernel's short read at end of file then trims the
+/// result. For other file types the buffer grows in 64 KiB (or
+/// doubling) steps as data arrives, up to `len`.
 pub(crate) fn read_range_with(
     file: &std::fs::File,
     offset: u64,
@@ -344,19 +352,26 @@ pub(crate) fn read_range_with(
     mut read_at: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
 ) -> crate::Result<Vec<u8>> {
     let meta = file.metadata().map_err(crate::Error::Io)?;
-    let (limit, initial) = if meta.is_file() {
+    let (initial, can_grow) = if meta.is_file() {
         let available = meta.len().saturating_sub(offset);
-        let limit = usize::try_from(available).map_or(len, |a| a.min(len));
-        (limit, limit)
+        let step = RANGE_READ_GROW_STEP as u64;
+        let rounded = available
+            .checked_add(step - 1)
+            .map_or(u64::MAX, |v| v / step * step);
+        let cap = usize::try_from(rounded).unwrap_or(usize::MAX);
+        (len.min(cap), false)
     } else {
-        (len, len.min(RANGE_READ_GROW_STEP))
+        (len.min(RANGE_READ_GROW_STEP), true)
     };
 
     let mut buf = vec![0u8; initial];
     let mut total = 0usize;
-    while total < limit {
+    loop {
         if total == buf.len() {
-            let grow = (limit - total).min(RANGE_READ_GROW_STEP.max(buf.len()));
+            if !can_grow || total >= len {
+                break;
+            }
+            let grow = (len - total).min(RANGE_READ_GROW_STEP.max(buf.len()));
             buf.resize(total + grow, 0);
         }
         let pos = offset.checked_add(total as u64).ok_or_else(|| {
@@ -807,6 +822,28 @@ mod tests {
         let path = range_tmp("huge", b"abc");
         let f = std::fs::File::open(&path).expect("open");
         assert_eq!(read_range(&f, 0, usize::MAX).expect("read"), b"abc");
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_range_with_keeps_full_request_length_for_short_tail() {
+        // A 1000-byte file read at 0 for 4096 bytes: the first request
+        // must still ask for 4096 bytes (an O_DIRECT read of a partial
+        // final sector needs the full sector length), then stop at EOF.
+        let path = range_tmp("fullreq", &[7u8; 1000]);
+        let f = std::fs::File::open(&path).expect("open");
+        let mut requests = Vec::new();
+        let got = read_range_with(&f, 0, 4096, |buf, pos| {
+            requests.push((pos, buf.len()));
+            let start = usize::try_from(pos).expect("pos");
+            let n = buf.len().min(1000usize.saturating_sub(start));
+            buf[..n].fill(7);
+            Ok(n)
+        })
+        .expect("read");
+        assert_eq!(got.len(), 1000);
+        assert_eq!(requests, vec![(0, 4096), (1000, 3096)]);
         drop(f);
         let _ = std::fs::remove_file(&path);
     }
