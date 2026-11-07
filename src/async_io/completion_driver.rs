@@ -385,7 +385,16 @@ async fn owner_loop(queue_depth: u32, eventfd_raw: RawFd, mut rx: mpsc::Unbounde
     {
         return;
     }
-    let Ok(async_fd) = AsyncFd::with_interest(owned_fd, tokio::io::Interest::READABLE) else {
+    // SAFETY: `owned_fd` is the open eventfd from `create_eventfd`,
+    // and the `AsyncFd` takes ownership of the `OwnedFd`, so nothing
+    // else can close or replace it. It is only reached through
+    // `get_inner()` for reads, never swapped out, and closes exactly
+    // once when the `AsyncFd` drops. `OwnedFd::as_raw_fd` always
+    // returns the same fd. On error the `OwnedFd` comes back inside
+    // the error and closes when it drops.
+    let Ok(async_fd) =
+        (unsafe { AsyncFd::register_with_interest(owned_fd, tokio::io::Interest::READABLE) })
+    else {
         return;
     };
 

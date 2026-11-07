@@ -4,7 +4,7 @@
 ######################################################
 [package]
 name    = "fsys"
-version = "1.1.3"
+version = "1.1.4"
 
 # METADATA
 readme  = "README.md"
@@ -168,7 +168,12 @@ spdk = []
 # `fs` was dropped in 0.6.0 — fsys's async layer uses
 # `spawn_blocking` against the sync core, never tokio's fs
 # primitives.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "time"], optional = true }
+# `1.53.3` is the first mainline release with the `unsafe`
+# `AsyncFd::register_with_interest` constructor and the fix for
+# RUSTSEC-2026-0386. The patched 1.51.6 LTS release cannot be allowed
+# without also allowing the affected 1.52.x releases, and 1.53.3
+# still builds on fsys's MSRV (tokio 1.53 needs Rust 1.71).
+tokio = { version = "1.53.3", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "time"], optional = true }
 
 # Optional structured-event instrumentation. Gated behind the
 # `tracing` feature flag; when off, the dep isn't pulled in.
