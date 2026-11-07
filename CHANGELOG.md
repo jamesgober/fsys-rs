@@ -5,6 +5,15 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.4] - 2026-11-07
+
+**Security dependency release.** Moves the `async` feature onto tokio's I/O-safe `AsyncFd` constructor for [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386.html). No public item was added, removed or changed, and the on-disk journal format is unchanged.
+
+### Security
+
+- **`tokio` >= 1.53.3** ([RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386.html)): the first mainline release with the `unsafe` `AsyncFd::register_with_interest`; the patched 1.51.6 LTS line cannot be allowed without also allowing the affected 1.52.x, and tokio 1.53 still builds on the 1.75 MSRV.
+- The io_uring completion driver (Linux, `async` feature) registers its eventfd with `AsyncFd::register_with_interest` instead of the deprecated `AsyncFd::with_interest`. The `AsyncFd` owns the eventfd's `OwnedFd`, so the fd stays open and unchanged until the driver drops it; fsys was not exposed to the advisory's fd-reuse case.
+
 ## [1.1.3] - 2026-10-08
 
 **Journal open regression fix.** fsys 1.1.1 made `Handle::journal` / `Handle::journal_with` refuse a journal whose resume scan stopped at a bad magic or an oversized frame length (`Error::Io(InvalidData)`), where 1.1.0 opened it. Consumers that recover the valid prefix of a journal followed by garbage could no longer open it. 1.1.3 opens it again, without appending after the garbage and without destroying it. No public item was added, removed or changed, and the on-disk journal format is unchanged.
