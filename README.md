@@ -166,6 +166,7 @@ The full per-version delta lives in [`CHANGELOG.md`](CHANGELOG.md). Headline cap
 
 | Release | Headline |
 |---|---|
+| **1.1.4** | `tokio` >= 1.53.3 for RUSTSEC-2026-0386: the io_uring completion driver registers its eventfd through the I/O-safe `AsyncFd::register_with_interest`. No API change; on-disk format unchanged. |
 | **1.1.3** | Journal opens tolerate a corrupt tail again (regression from 1.1.1): they resume after the last valid frame and copy the discarded bytes to a `<name>.corrupt-<offset>` sidecar file before truncating. No API change; on-disk format unchanged. |
 | **1.1.2** | `Method::Mmap` maps through the first-party `mmap_io::raw` layer; `memmap2` removed from the dependency tree. No API or behavior change. |
 | **1.1.1** | Security, durability and correctness release: fixes wrong-file Direct writes on Linux io_uring, async cancellation safety, journal gaps / durable-frontier / poisoning, missing data fences (macOS, Windows, batches), a root-jail escape through dangling symlinks, temp-name collisions, and two RUSTSEC advisories. No API changes; on-disk format unchanged and 1.1.0 journals stay readable. |
