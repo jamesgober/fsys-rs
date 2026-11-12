@@ -411,7 +411,7 @@ pub(crate) fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
     // POSIX rename(2) is atomic within the same filesystem. It is the
     // correct primitive for our atomic-replace pattern.
     //
-    // Design note (see .dev/DECISIONS-0.3.0.md): renameat2(RENAME_EXCHANGE)
+    // Design note (see the 0.3.0 design notes): renameat2(RENAME_EXCHANGE)
     // atomically swaps two existing files, which is NOT what we need here —
     // we want to replace the destination (which may not exist). Plain
     // rename() is the correct choice. renameat2(RENAME_NOREPLACE) would

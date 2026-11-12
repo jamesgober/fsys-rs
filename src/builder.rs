@@ -42,7 +42,7 @@ use std::sync::Arc;
 /// - `io_uring_queue_depth` defaults to `128` (Linux io_uring SQ
 ///   depth). Real `io_uring` integration shipped in `0.5.1` after
 ///   the rustc 1.95 ICE workaround landed; see the io_uring blocker
-///   record in `.dev/DECISIONS-0.5.0.md`.
+///   record in the 0.5.0 design notes.
 pub struct Builder {
     method: Method,
     root: Option<PathBuf>,
@@ -68,7 +68,7 @@ pub struct Builder {
 
 /// SPDK-specific configuration carried by [`Builder`] (1.1.0).
 ///
-/// Defaults are sized for HiveDB-class workloads on consumer-NVMe
+/// Defaults are sized for database-class workloads on consumer-NVMe
 /// server hardware. The [`crate::capability::capabilities()`] probe
 /// supplies sensible defaults when no override is set; callers can
 /// override individual knobs via the `Builder::spdk_*` methods.
@@ -318,7 +318,7 @@ impl Builder {
     /// to `O_DIRECT` + `pwrite` + `fdatasync` — same durability
     /// contract, slower path. macOS and Windows ignore this value
     /// (no io_uring on those platforms by design — see locked
-    /// decision #1 in `.dev/DECISIONS-0.5.0.md`).
+    /// decision #1 in the 0.5.0 design notes).
     ///
     /// Default: `128`.
     #[must_use]
@@ -362,7 +362,7 @@ impl Builder {
     ///
     /// Linux-only knob. On macOS / Windows the value is captured
     /// but never consulted (no io_uring on those platforms by
-    /// design — locked decision #1 in `.dev/DECISIONS-0.5.0.md`).
+    /// design — locked decision #1 in the 0.5.0 design notes).
     #[must_use]
     pub fn sqpoll(mut self, idle_ms: u32) -> Self {
         self.iouring_sqpoll_idle_ms = Some(idle_ms);
@@ -427,7 +427,7 @@ impl Builder {
     /// values — apply presets first.
     ///
     /// **`Workload::Database`** — tuned for storage-engine
-    /// workloads (HiveDB, embedded KV stores, log-structured
+    /// workloads (embedded KV stores, log-structured
     /// merge trees) on NVMe with sustained bulk writes. Sets:
     /// - `io_uring_queue_depth = 256` (= 2× the default).
     /// - `batch_queue_max = 4096` (= 4× the default).
@@ -674,7 +674,7 @@ pub enum Workload {
     Default,
     /// Storage-engine / database workload preset. 256-deep ring,
     /// 4096-deep batch queue (plus the reserved buffer-pool knobs).
-    /// Suitable for HiveDB, embedded KV stores, log-structured merge
+    /// Suitable for embedded KV stores, log-structured merge
     /// trees, and any workload with sustained bulk writes against an
     /// NVMe target.
     Database,
@@ -780,7 +780,7 @@ mod tests {
     // ── 0.4.0 batch knob tests ────────────────────────────────────────
 
     #[test]
-    fn test_builder_default_pipeline_config_matches_prompt() {
+    fn test_builder_default_pipeline_config_matches_spec() {
         let b = Builder::new();
         assert_eq!(b.pipeline_config.batch_size_max, 128);
         assert_eq!(b.pipeline_config.batch_queue_max, 1024);
@@ -886,7 +886,7 @@ mod tests {
     // ── 0.5.0 buffer pool + io_uring knobs ────────────────────────
 
     #[test]
-    fn test_builder_default_buffer_pool_knobs_match_prompt() {
+    fn test_builder_default_buffer_pool_knobs_match_spec() {
         let b = Builder::new();
         assert_eq!(b.buffer_pool_count, 64);
         assert_eq!(b.buffer_pool_block_size, 4096);

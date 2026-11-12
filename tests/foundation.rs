@@ -118,7 +118,7 @@ fn path_set_is_consistent() {
 #[test]
 fn path_for_helpers_join_normalised_suffix() {
     let base = path::data();
-    let joined = path::data_for("hivedb/docs/info");
+    let joined = path::data_for("myapp/docs/info");
     assert!(joined.starts_with(&base));
     assert!(joined.ends_with("info"));
 
@@ -126,7 +126,7 @@ fn path_for_helpers_join_normalised_suffix() {
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    for needle in ["hivedb", "docs", "info"] {
+    for needle in ["myapp", "docs", "info"] {
         assert!(
             parts.iter().any(|p| p == needle),
             "expected component {needle:?} in {joined:?}"

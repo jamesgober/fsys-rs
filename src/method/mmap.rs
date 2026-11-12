@@ -5,7 +5,7 @@
 //! region; writes flow through a mapping over the atomic-replace temp
 //! file. The mapping's lifetime is bounded by the operation — no
 //! mapping outlives the call (locked decision #4 in
-//! `.dev/DECISIONS-0.5.0.md`).
+//! the 0.5.0 design notes).
 //!
 //! ## Crash safety
 //!
@@ -19,7 +19,7 @@
 //!
 //! ## Fallback to `Method::Sync`
 //!
-//! Per locked decision #4 + R-2'' in `.dev/DECISIONS-0.5.0.md`, the
+//! Per locked decision #4 + R-2'' in the 0.5.0 design notes, the
 //! mmap path falls back permanently to Sync (per-Handle, observable
 //! via [`crate::Handle::active_method`]) when:
 //!

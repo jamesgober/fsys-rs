@@ -550,7 +550,7 @@ pub(crate) fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
     // POSIX rename(2) is atomic within the same filesystem.
     // renameatx_np(RENAME_SWAP) would swap two existing files, which is NOT
     // what we need — we want to replace the destination. Plain rename() is
-    // the correct primitive. See .dev/DECISIONS-0.3.0.md.
+    // the correct primitive. See the 0.3.0 design notes.
     std::fs::rename(from, to).map_err(Error::Io)
 }
 
@@ -568,7 +568,7 @@ pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<u64> {
     // copies, the syscall returns an error and we fall back to
     // `std::fs::copy` for full-byte-copy semantics.
     //
-    // The win for HiveDB checkpoint flush workloads is significant:
+    // The win for database checkpoint flush workloads is significant:
     // clonefile is O(metadata) — the data blocks are shared until
     // first write (COW). For a 1 GiB checkpoint clone, this drops
     // from seconds to microseconds on APFS.

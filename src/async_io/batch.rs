@@ -4,7 +4,7 @@
 //! [`tokio::task::spawn_blocking`]), the batch async path goes
 //! through the same per-handle dispatcher as sync batches but
 //! responds via [`tokio::sync::oneshot`] — locked decision D-5 in
-//! `.dev/DECISIONS-0.6.0.md`. The caller `.await`s the oneshot
+//! the 0.6.0 design notes. The caller `.await`s the oneshot
 //! without blocking a tokio worker.
 //!
 //! ## Why not `spawn_blocking`?

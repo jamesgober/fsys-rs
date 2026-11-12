@@ -17,7 +17,7 @@
 //! Both types are `pub(crate)`; the pool is an internal optimisation
 //! and not part of the public crate API.
 //!
-//! ## Semantics (locked at checkpoint B' in `.dev/DECISIONS-0.5.0.md`)
+//! ## Semantics (locked at checkpoint B' in the 0.5.0 design notes)
 //!
 //! 1. `lease()` blocks on exhaustion until a buffer is returned. A
 //!    future opt-in [`crate::Error::BufferPoolExhausted`] error-mode

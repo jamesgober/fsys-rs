@@ -108,9 +108,7 @@ back for a handle, it stays fallen-back.
   new.
 
 Per the D-4 protocol from `0.4.0`, every crash-safety change runs
-the test 100× pre-merge to catch flakes. The 0.5.0 / 0.5.1
-crash-test runs are documented in
-`.dev/DECISIONS-0.5.0.md` and `.dev/DECISIONS-0.6.0.md`.
+the test 100× pre-merge to catch flakes.
 
 ## Journal substrate durability (0.9.0)
 

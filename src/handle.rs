@@ -92,7 +92,7 @@ impl<T> DeviceKeyed<T> {
 /// Pool configuration captured by [`Builder`] and consumed at
 /// [`Handle`] construction. Held opaquely in the Handle until the
 /// first Direct-method op triggers lazy pool allocation (locked
-/// decision #6 in `.dev/DECISIONS-0.5.0.md`).
+/// decision #6 in the 0.5.0 design notes).
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // reserved buffer pool: configured but not yet used by an IO path (see crate::buffer)
 pub(crate) struct HandleBufferPoolConfig {
@@ -162,7 +162,7 @@ pub struct Handle {
     /// fallbacks, because the dispatcher runs without a [`Handle`] reference.
     /// Group-lane fallback information surfaces in
     /// [`BatchError::source`] for the failing op. See decision D-5 in
-    /// `.dev/DECISIONS-0.4.0.md`.
+    /// the 0.4.0 design notes.
     methods: AtomicU16,
     /// Optional root directory. When set, all relative paths are resolved
     /// against this root and path-escape checks are enforced.
@@ -1351,7 +1351,7 @@ impl Handle {
     //
     // Routes through the group-lane pipeline. The pipeline's dispatcher is
     // spawned lazily on first use and shut down cleanly on `Handle` drop.
-    // See `pipeline/mod.rs` and `.dev/DECISIONS-0.4.0.md` (D-4, D-5) for the
+    // See `pipeline/mod.rs` and the 0.4.0 design notes (D-4, D-5) for the
     // architecture.
     // ──────────────────────────────────────────────────────────────────────────
 
@@ -1484,7 +1484,7 @@ impl Handle {
     ///
     /// # Allocation semantics
     ///
-    /// Per decision R-15 in `.dev/DECISIONS-0.4.0.md`, the builder
+    /// Per decision R-15 in the 0.4.0 design notes, the builder
     /// allocates **at each `.write()` / `.delete()` / `.copy()` call**,
     /// not lazily at commit. Allocations are paced; a 10K-op batch pays
     /// 10K small allocations spread across the build loop, not one big

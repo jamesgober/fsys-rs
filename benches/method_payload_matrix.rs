@@ -9,7 +9,7 @@
 //! covered (and superseded) by this matrix.
 //!
 //! All payloads are page-aligned so `Method::Mmap` exercises its real
-//! mmap path (R-2'' in `.dev/DECISIONS-0.5.0.md`); sub-page payloads
+//! mmap path (R-2'' in the 0.5.0 design notes); sub-page payloads
 //! would fall back to `Method::Sync` and the bench would measure the
 //! wrong thing.
 //!

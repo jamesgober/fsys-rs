@@ -93,7 +93,7 @@ impl Handle {
         // 0.5.0: route Method::Mmap through the mmap atomic-replace
         // path when the payload is suitable. Sub-page payloads (and
         // zero-length writes) fall back permanently to Sync per
-        // R-2'' in `.dev/DECISIONS-0.5.0.md`. The fallback updates
+        // R-2'' in the 0.5.0 design notes. The fallback updates
         // the Handle's active_method so subsequent ops on this
         // Handle take the Sync path directly without the
         // suitability check.
@@ -273,7 +273,7 @@ impl Handle {
         // suitability. Files smaller than the page size, zero-byte
         // files, and non-regular files (sockets/pipes/FIFOs) cause a
         // permanent fallback to Sync per R-2'' in
-        // `.dev/DECISIONS-0.5.0.md`.
+        // the 0.5.0 design notes.
         if self.active_method() == Method::Mmap {
             let suitable = std::fs::metadata(&path)
                 .map(|m| crate::method::mmap::is_suitable_for_read(&m))
@@ -311,7 +311,7 @@ impl Handle {
     ///
     /// Symmetric with [`Handle::write_at`] — both target a positioned
     /// IO operation. Renamed from `read_range` in `0.7.0` per the
-    /// API audit (see `.dev/API-AUDIT-0.7.0.md` H.1 Open Question 2)
+    /// API audit (item H.1, open question 2)
     /// to match POSIX `pread` / `pwrite` symmetry.
     ///
     /// # Errors
@@ -813,7 +813,7 @@ fn iouring_read_direct(
 }
 
 /// Applies the metadata-preservation set defined for `write_copy`
-/// (locked decision D-8 in `.dev/DECISIONS-0.6.0.md`) to `staging`,
+/// (locked decision D-8 in the 0.6.0 design notes) to `staging`,
 /// reading source attributes from `target` (the path whose metadata
 /// we want to preserve) and `existing_meta`.
 ///

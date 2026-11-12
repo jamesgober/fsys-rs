@@ -2,7 +2,7 @@
 //!
 //! Compares Criterion bench output against baselines stored in
 //! `benches/baselines.json`. Per locked decisions D-4 and D-11
-//! in `.dev/DECISIONS-0.7.0.md`:
+//! in the 0.7.0 design notes:
 //!
 //! - **Hybrid strictness**: critical-path benchmarks (single
 //!   write all methods, batch throughput, hardware probe latency,

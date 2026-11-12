@@ -1,7 +1,7 @@
 //! Latency tail validation harness — confirms `p99.9 within 10× p50`
 //! across representative ops.
 //!
-//! Per locked decision D-5 in `.dev/DECISIONS-0.7.0.md`, every
+//! Per locked decision D-5 in the 0.7.0 design notes, every
 //! benchmark gets a relative-target check: the worst 0.1% of
 //! operations should fall within 10× of the median. This is
 //! portable across hardware (absolute numbers vary; ratios

@@ -196,7 +196,7 @@ impl Handle {
     /// [`Handle::scan_all`] for the recursive variant.
     ///
     /// Renamed from `scan(path, recursive: bool)` in `0.7.0` per
-    /// the API audit (see `.dev/API-AUDIT-0.7.0.md` H.5
+    /// the API audit (item H.5
     /// reconciliation #3).
     ///
     /// Order is OS-dependent; do not rely on it. Symlinks are

@@ -46,7 +46,7 @@
 //! Construction failure (kernel < 5.1, SECCOMP/AppArmor block, no
 //! permission, or owner-thread spawn failure) returns
 //! [`Error::IoUringSetupFailed`]. Per locked decision #1 + R-2''' in
-//! `.dev/DECISIONS-0.5.0.md`, callers (the `Method::Direct` backend
+//! the 0.5.0 design notes, callers (the `Method::Direct` backend
 //! in `crud/file.rs`) catch the error and fall back to `O_DIRECT` +
 //! `pwrite` + `fdatasync`. `active_method` is **not** downgraded;
 //! the durability contract is identical.
@@ -770,7 +770,7 @@ fn owner_dead() -> Error {
 // io_uring submission would add complexity (Entry128 SQEs, ring
 // reconstruction, kernel ≥ 5.19 requirement) for zero measurable
 // gain on this specific opcode. Filed as refinement R-1 in
-// `.dev/DECISIONS-0.6.0.md`.
+// the 0.6.0 design notes.
 
 /// Result of resolving an arbitrary fd to its underlying NVMe
 /// character device for passthrough commands.
@@ -788,7 +788,7 @@ pub(crate) struct NvmeAccess {
 ///
 /// Returns `Some(NvmeAccess)` when:
 /// 1. `FSYS_DISABLE_NVME_PASSTHROUGH` env override is **not** set
-///    (locked decision D-11 in `.dev/DECISIONS-0.6.0.md`).
+///    (locked decision D-11 in the 0.6.0 design notes).
 /// 2. The block device backing `fd` is an NVMe drive.
 /// 3. `/dev/nvmeX` (the character device) opens successfully with
 ///    `O_RDWR` — i.e. the calling process has the privilege to send

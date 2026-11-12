@@ -27,7 +27,7 @@
 //! let _set = fsys::path::set();
 //!
 //! // Compose a sub-path under data.
-//! let p = fsys::path::data_for("hivedb/docs/info");
+//! let p = fsys::path::data_for("myapp/docs/info");
 //! assert!(p.ends_with("info"));
 //!
 //! // Mode resolution is explicit and predictable.
@@ -47,7 +47,7 @@ pub use self::mode::{current as mode, Mode};
 /// Bundle of OS-aware default paths.
 ///
 /// Probed once at first access and cached. Field semantics are
-/// documented per OS in `.dev/PLANNING.md`. Every field is owned —
+/// OS-specific. Every field is owned —
 /// callers that need to mutate clone the field they care about
 /// rather than reaching into the cache.
 #[derive(Debug, Clone)]
@@ -175,9 +175,9 @@ mod tests {
     #[test]
     fn test_data_for_appends_segments() {
         let base = data();
-        let joined = data_for("hivedb");
+        let joined = data_for("myapp");
         assert!(joined.starts_with(&base));
-        assert!(joined.ends_with("hivedb"));
+        assert!(joined.ends_with("myapp"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Integration tests for [`fsys::Handle::write_copy`].
 //!
 //! Validates the atomic-swap contract from D-3 and the metadata-
-//! preservation set from D-8 in `.dev/DECISIONS-0.6.0.md`.
+//! preservation set from D-8 in the 0.6.0 design notes.
 
 use fsys::builder;
 use std::path::PathBuf;

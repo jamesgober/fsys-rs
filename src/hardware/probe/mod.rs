@@ -53,7 +53,7 @@ pub(super) use self::windows as platform;
 /// actually means). Vendor-specific log pages or NVMe-MI 1.1+
 /// capabilities are needed for definitive answers.
 ///
-/// Per locked decision #3 in `.dev/DECISIONS-0.5.0.md`, fsys does not
+/// Per locked decision #3 in the 0.5.0 design notes, fsys does not
 /// guess. When the probe cannot conclusively determine PLP status, the
 /// answer is [`PlpStatus::Unknown`].
 ///

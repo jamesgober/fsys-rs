@@ -7,8 +7,7 @@
 //! [`crate::hardware::info`] — the cached real probe — and picks the
 //! method that is safe + fast for the actual hardware + OS combination.
 //!
-//! Decision matrix locked in `.dev/PROMPTS/0.5.0-methods.md` and
-//! restated in `Method::Auto`'s doc comment.
+//! The decision matrix is documented in `Method::Auto`'s doc comment.
 
 use super::Method;
 

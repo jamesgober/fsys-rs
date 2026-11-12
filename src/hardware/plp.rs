@@ -1,6 +1,6 @@
 //! Power-Loss Protection (PLP) detection refinement (0.7.0).
 //!
-//! Per refinement R-2 in `.dev/DECISIONS-0.7.0.md`, PLP detection uses
+//! Per refinement R-2 in the 0.7.0 design notes, PLP detection uses
 //! one signal: a **per-vendor model lookup table** of known
 //! PLP-equipped enterprise drives (Intel D3-S4510/4610, Samsung
 //! PM983/PM9A3/PM1735, Micron 7300/7400/7450, WD/HGST Ultrastar DC

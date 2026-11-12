@@ -79,7 +79,7 @@ async fn direct_method_pre_op_substrate_is_spawn_blocking() {
     // Even with Method::Direct, async_substrate() returns
     // SpawnBlocking until the first async Direct op constructs the
     // native ring. This is the documented "configuration intent
-    // vs runtime truth" semantics from `.dev/DECISIONS-0.7.0.md`.
+    // vs runtime truth" semantics from the 0.7.0 design notes.
     let fs = builder()
         .method(fsys::Method::Direct)
         .build()

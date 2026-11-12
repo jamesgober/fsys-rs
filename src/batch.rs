@@ -24,7 +24,7 @@
 //!   many control-flow paths (e.g. inside a loop with conditional
 //!   `write` / `delete` calls). Allocations are paced across each
 //!   builder method call rather than concentrated at submission time
-//!   — see decision R-15 in `.dev/DECISIONS-0.4.0.md`.
+//!   — see decision R-15 in the 0.4.0 design notes.
 //!
 //! Both paths produce identical durability and ordering semantics: ops
 //! execute in submission order, the first failure stops the batch, and

@@ -22,7 +22,7 @@
 //!
 //! ## Asymmetry by design
 //!
-//! Per locked decision `D-1` in `.dev/DECISIONS-0.7.0.md`, the
+//! Per locked decision `D-1` in the 0.7.0 design notes, the
 //! native substrate is Linux-only. Windows and macOS async stay on
 //! `spawn_blocking` indefinitely — there's no clean primitive for a
 //! native async fast path on those platforms (Windows IOCP would

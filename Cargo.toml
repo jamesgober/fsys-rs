@@ -97,7 +97,7 @@ path = "src/lib.rs"
 ###########################
 [features]
 default = []
-# Async layer (locked decision D-1 in `.dev/DECISIONS-0.6.0.md`).
+# Async layer (locked decision D-1 in the 0.6.0 design notes).
 # Adds `_async` siblings to every sync method via
 # `tokio::task::spawn_blocking`; async batch ops via
 # `tokio::sync::oneshot`. Pulls in tokio's `rt`, `rt-multi-thread`,
@@ -159,7 +159,7 @@ spdk = []
 [dependencies]
 # Tokio runtime — gated behind the `async` feature flag.
 # Feature set rationale (locked decision D-10 in
-# `.dev/DECISIONS-0.6.0.md`):
+# the 0.6.0 design notes):
 # - `rt` + `rt-multi-thread`: required for `spawn_blocking` and
 #   `#[tokio::test(flavor = "multi_thread")]` for batch tests.
 # - `sync`: required for `tokio::sync::oneshot` (async batch
@@ -196,7 +196,7 @@ crossbeam-channel = "0.5"
 
 # Bounded lock-free `ArrayQueue` for the 0.5.0 per-handle aligned
 # buffer pool. Selected over the `crossbeam` umbrella crate (D-5 in
-# `.dev/DECISIONS-0.5.0.md`): same maintainers and security posture as
+# the 0.5.0 design notes): same maintainers and security posture as
 # `crossbeam-channel`, ~2K LOC vs the umbrella's 10–20× larger surface,
 # version-pinnable independently. No transitive deps.
 crossbeam-queue = "0.3"
@@ -241,7 +241,7 @@ mmap-io = { version = "1.1.0", default-features = false }
 # the Rust ecosystem (~300k weekly downloads). Selected over
 # implementing glob from scratch (which would either be incomplete
 # or several hundred LOC) per locked decision D-4 in
-# `.dev/DECISIONS-0.6.0.md`. Mature, well-maintained, no transitive
+# the 0.6.0 design notes. Mature, well-maintained, no transitive
 # bloat.
 glob = "0.3"
 
@@ -253,7 +253,7 @@ libc = { version = "0.2", default-features = false }
 
 # Linux-only: io_uring submission/completion ring for the elite
 # `Method::Direct` path (locked decision #1 in
-# `.dev/DECISIONS-0.5.0.md`). Hard dep on Linux — no Cargo feature
+# the 0.5.0 design notes). Hard dep on Linux — no Cargo feature
 # flag — with graceful runtime fallback to `O_DIRECT` + `pwrite` +
 # `fdatasync` when `io_uring_setup` fails. Selected over the multiple
 # alternative crates (`io_uring` underscored, `linux-io-uring`, `rio`,
@@ -289,7 +289,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemInformation",
     "Win32_Security",
     # 0.6.0: Windows ACL preservation in `Handle::write_copy` (D-8 in
-    # `.dev/DECISIONS-0.6.0.md`) uses `GetNamedSecurityInfoW` /
+    # the 0.6.0 design notes) uses `GetNamedSecurityInfoW` /
     # `SetNamedSecurityInfoW` from this module.
     "Win32_Security_Authorization",
 ] }
@@ -322,7 +322,7 @@ harness = false
 # 0.4.0 group-lane benchmarks.
 # Floor-target validation runs on the Linux primary box; Windows
 # numbers are the Windows-specific baseline for regression detection
-# (decision D-3 in `.dev/DECISIONS-0.4.0.md`).
+# (decision D-3 in the 0.4.0 design notes).
 [[bench]]
 name    = "batch_throughput"
 harness = false

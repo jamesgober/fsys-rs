@@ -9,7 +9,7 @@
 //!
 //! Payloads here are page-aligned (>= page size) to avoid the mmap
 //! path falling back to Sync per R-2'' in
-//! `.dev/DECISIONS-0.5.0.md`.
+//! the 0.5.0 design notes.
 
 #[path = "crash_harness/mod.rs"]
 mod harness;

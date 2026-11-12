@@ -28,7 +28,7 @@
 //! Trait extraction (moving the in-line append/sync paths behind a
 //! `Box<dyn JournalBackend>` so the kernel and SPDK implementations
 //! are interchangeable at the type level) lands in a follow-up
-//! session — that refactor touches every method on the load-bearing
+//! release: that refactor touches every method on the load-bearing
 //! journal hot path and demands careful, isolated testing against
 //! the existing emdb production workload. Splitting it from the
 //! observability + capability work in 1.1.0 keeps the public 1.x

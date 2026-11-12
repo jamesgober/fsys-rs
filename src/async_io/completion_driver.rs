@@ -4,7 +4,7 @@
 //!
 //! ## Architecture (one fused task, not separate submitter/driver)
 //!
-//! Per `.dev/DECISIONS-0.7.0.md` §`Native io_uring async substrate`:
+//! Per the 0.7.0 design notes §`Native io_uring async substrate`:
 //! a single tokio task owns the `io_uring::IoUring` value on its
 //! stack frame and fuses submission and completion into one
 //! `tokio::select!` loop:
@@ -701,7 +701,7 @@ mod tests {
     }
 
     /// Validates the load-bearing invariant from
-    /// `.dev/DECISIONS-0.7.0.md` "Critical reminders": a poisoned
+    /// the 0.7.0 design notes "Critical reminders": a poisoned
     /// handle must answer with an error, never hang.
     #[tokio::test]
     async fn poisoned_flag_short_circuits_submit() {

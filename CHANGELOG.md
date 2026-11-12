@@ -134,7 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SPDK eligibility probe** — pure system-state inspection (`/proc/meminfo`, `/sys/bus/pci/devices/`, `/sys/kernel/iommu_groups/`, `CAP_SYS_ADMIN`, core count). Reports six specific [`SpdkSkipReason`] variants for any precondition that fails, so operators see exactly what to fix.
 - **`Method::Spdk`** — runtime-validated kernel-bypass backend selector. Without the `spdk` Cargo feature, returns `Error::FeatureNotEnabled`. With the feature on but the system ineligible, returns `Error::SpdkUnavailable { reason }`. The actual backend implementation lives in the companion `fsys-spdk` crate (scaffold state in 1.1.0; ships in a follow-up).
 - **`JournalBackend` trait + observability surface** — `JournalBackendKind`, `JournalBackendHealth`, `JournalBackendInfo`. Every `JournalHandle` now exposes `backend_kind()` / `backend_health()` / `backend_info()` so ops teams can verify which backend is live without ambiguity.
-- **`Builder::spdk_device` / `spdk_queue_depth` / `spdk_polling_threads` / `spdk_hugepage_size_mb`** — SPDK-specific configuration knobs with sensible HiveDB-class defaults.
+- **`Builder::spdk_device` / `spdk_queue_depth` / `spdk_polling_threads` / `spdk_hugepage_size_mb`** — SPDK-specific configuration knobs with sensible database-class defaults.
 
 ### Added
 
@@ -161,7 +161,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`SpdkConfig` struct** — re-exported from the crate root; carries the SPDK builder configuration.
 - **Cargo feature `spdk`** — gates `Method::Spdk` activation. With the feature off (the default), the variant compiles but selecting it returns `Error::FeatureNotEnabled`. With the feature on, selecting it consults the capability probe.
 - **`docs/SPDK.md`** — system setup guide (hugepages, IOMMU, device binding) + per-`SpdkSkipReason` remediation steps.
-- **`.dev/DECISIONS-1.1.0.md`** — decisions captured during 1.1 design + unresolved decisions tracked for the follow-up sessions.
 
 ### Changed
 
@@ -174,11 +173,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 The `JournalBackend` *trait shape itself* is marked **provisional** in 1.1.0. The trait's downstream types (`JournalBackendKind`, `JournalBackendHealth`, `JournalBackendInfo`) and the accessor methods on `JournalHandle` are **stable** 1.x surface — those are what consumers should depend on. The trait method signatures may be refined in 1.2 / 1.3 as additional backends land; we will use the deprecation cycle described in `docs/STABILITY-1.0.md` for any trait change.
 
-### Deferred to follow-up sessions
+### Deferred to follow-up releases
 
 - **`KernelJournalBackend` extraction.** The existing journal hot path moves behind `Box<dyn JournalBackend>` so the SPDK implementation can plug in at the type level. The refactor is mechanical but touches the load-bearing `JournalHandle` append/sync paths; it is split into its own session to preserve regression discipline against the production emdb workload.
 - **`fsys-spdk` companion crate.** Scaffolded in 1.1.0 (Cargo metadata only); the `SpdkJournalBackend` implementation, SPDK FFI bindings (or `spdk-sys` audit), polling-thread pool, DMA buffer allocator, and crash-safety recovery flow ship in follow-up `1.1.x` releases as the work completes against real Linux + NVMe hardware.
-- **Capability probe deep-probe lazy split.** 1.1.0 runs the light + deep probes together on every fresh probe. The brief specifies splitting them so the deep probe (PCI enumeration, IOMMU groups) only runs when an SPDK-related accessor is read. The optimisation is observable internally and lands when the SPDK backend is the consumer driving it.
+- **Capability probe deep-probe lazy split.** 1.1.0 runs the light + deep probes together on every fresh probe. The design calls for splitting them so the deep probe (PCI enumeration, IOMMU groups) only runs when an SPDK-related accessor is read. The optimisation is observable internally and lands when the SPDK backend is the consumer driving it.
 
 ### Tests
 
@@ -588,7 +587,7 @@ MSRV: Rust 1.75.
   `copy_file` primitive tries `clonefile` first and falls back
   to `std::fs::copy` on any error (ENOTSUP for non-APFS,
   EEXIST for existing destinations, EXDEV for cross-volume,
-  EACCES for permission issues). For HiveDB-style checkpoint
+  EACCES for permission issues). For database-style checkpoint
   workloads on APFS, a multi-GiB clone drops from seconds to
   microseconds.
 - **ReFS `FSCTL_DUPLICATE_EXTENTS_TO_FILE` reflink fast path**
@@ -744,7 +743,7 @@ that callers can switch to mechanically.
   eliminates the kernel's per-SQE page-pinning hop —
   expected per-write win of ~100-500 ns depending on page-
   fault behaviour at the call boundary. Cumulative impact on
-  HiveDB-class workloads (thousands of journal flushes per
+  database-class workloads (thousands of journal flushes per
   second) is measurable in cache-hit-rate retention and
   reduced kernel-time fraction.
 - **Direct-mode batch append:** the new
@@ -902,7 +901,7 @@ target expansion), M-11 (boundary-condition tests).
   the old slot `flushing`, drops the state lock, runs the
   syscall on the flushing slot **unlocked**, and re-acquires
   the lock to publish completion. Other appenders fill the
-  new active slot concurrently. For HiveDB-class workloads
+  new active slot concurrently. For database-class workloads
   (many concurrent writers per handle), Direct mode goes
   from a single-core ceiling to multi-core scalable.
   - **Memory cost**: 2× per-journal — `log_buffer_kib(N)`
@@ -1343,7 +1342,7 @@ examples, final review, 1.0 stability commitment doc.
   - **The lever this fixes.** Pre-0.9.3 every group-lane batch
     from a shared handle funneled through one dispatcher
     thread — a hard one-core ceiling for concurrent batch
-    submitters writing to different files (the canonical HiveDB
+    submitters writing to different files (the canonical LSM
     SST flush shape, for instance). With `N` shards, the
     pipeline scales near-linearly with concurrent submitters
     up to `min(N, num_cpus::get())`.
@@ -1524,7 +1523,7 @@ through the same Linux CI runner:
 > builds), and a coordinated [`Workload`](crate::Workload) preset
 > on [`Builder`](crate::Builder) that bumps buffer-pool / ring /
 > queue defaults 4–32× for storage-engine workloads with one call.
-> Net effect: HiveDB and similar consumers now have a 1-line
+> Net effect: database consumers now have a 1-line
 > Builder configuration plus a clean PLP-aware durability decision
 > path. Public API additions are strictly additive — every 0.9.1
 > caller compiles unchanged.
@@ -1577,7 +1576,7 @@ through the same Linux CI runner:
     `Unknown`) form for callers who need to log "drive PLP
     unknown, falling back to fdatasync" vs "drive confirmed no
     PLP, fdatasync mandatory".
-  - **What this enables for HiveDB:** on a PLP-protected drive,
+  - **What this enables for databases:** on a PLP-protected drive,
     durable writes need only the `pwrite` syscall to reach the
     drive's write cache — `fsync` / `fdatasync` becomes a
     strict no-op from a crash-safety perspective. A
@@ -1639,7 +1638,7 @@ through the same Linux CI runner:
     `CpuFeatures::PCLMULQDQ` are updated to reflect the
     cross-arch semantics; the bit pattern is preserved so the
     flag set is portable between x86 and aarch64 consumers.
-    Load-bearing for HiveDB's planned AES-GCM at-rest path on
+    Useful for AES-GCM encryption at rest on
     Apple Silicon deployments.
   - **Two new tests** in `src/hardware/cpu.rs`: SSE2 must be
     reported on every x86_64 host (it's part of the baseline
@@ -1702,7 +1701,7 @@ The following items from the original 0.9.2 plan are staged for
 the next major rather than this patch. Each is a substantial
 rewrite that touches load-bearing internals; the testing
 surface grew faster than the patch budget. Recording them here
-so HiveDB and other consumers can plan integration around the
+so consumers can plan integration around the
 known shape:
 
 - **Sharded pipeline dispatchers** (`Builder::dispatcher_shards(N)`).
@@ -2214,8 +2213,8 @@ single-`append` + single-fsync workload that bench measures.
 
 ### Fixed (correctness — checkpoint B)
 
-The B-checkpoint internal audit (parallel code-quality + hot-path
-agents) produced **5 Critical findings**, all fixed:
+The B-checkpoint internal audit (parallel code-quality and hot-path
+passes) produced **5 Critical findings**, all fixed:
 
 - **Windows `write_at` 64-bit offset truncation.** Offsets above
   2 GiB silently went to the wrong location because the offset
@@ -2336,10 +2335,6 @@ agents) produced **5 Critical findings**, all fixed:
   `std::fs` and `tokio::fs`.
 - New **`docs/EXAMPLES.md`** catalogue + 16 runnable examples in
   `examples/` covering every feature matrix entry.
-- New decision log: [`.dev/DECISIONS-0.8.0.md`](.dev/DECISIONS-0.8.0.md).
-- New audit reconciliation docs:
-  [`.dev/CODE-AUDIT-0.8.0.md`](.dev/CODE-AUDIT-0.8.0.md) (B) and
-  [`.dev/SECURITY-REVIEW-0.8.0.md`](.dev/SECURITY-REVIEW-0.8.0.md) (J).
 
 ### Stability (release-candidate freeze contract)
 
@@ -2488,13 +2483,6 @@ release-candidate-to-1.0 runway.
 - Comprehensive **`docs/API.md`** rewrite covering the full
   public surface, the three-tier entry points, and the
   alpha-freeze policy.
-- New `.dev/DECISIONS-0.7.0.md` with 13 locked decisions
-  (11 from the original prompt + 2 reversals discovered
-  during execution: R-2 PLP refinement, R-3 1.46× WSL
-  measurement).
-- New `.dev/API-AUDIT-0.7.0.md` documenting the internal +
-  external-subagent + reconciliation passes that produced
-  the renames and docstring strengthenings above.
 - **Removed** `docs/MIGRATION.md` (per locked decision D-6:
   migration content is part of `CHANGELOG.md` and the
   rename table in `docs/API.md`, not a separate file).
@@ -2698,7 +2686,7 @@ release-candidate-to-1.0 runway.
   Both paths satisfy the same atomic-replace + durability contract;
   `active_method()` is **not** downgraded for the io_uring fallback
   alone (this differs from the Mmap fallback per R-2''' in
-  `.dev/DECISIONS-0.5.0.md`).
+  the 0.5.0 design notes).
 - Cached failure: once `IoUringRing::new` fails for a Handle, the
   ring slot transitions to `Disabled` and subsequent Direct ops
   skip the construction attempt — they go straight to the
@@ -2737,7 +2725,7 @@ release-candidate-to-1.0 runway.
   (`memmap2` + `msync` / `FlushViewOfFile` + atomic rename) with
   per-handle suitability fallback to `Method::Sync` for sub-page
   payloads, zero-length writes, and non-regular files (R-2'' in
-  `.dev/DECISIONS-0.5.0.md`). Fallback is observable via
+  the 0.5.0 design notes). Fallback is observable via
   `Handle::active_method()` and is permanent for the lifetime of
   the handle.
 - `Method::Auto` is now genuinely hardware-aware. Resolution ladder
@@ -2766,10 +2754,6 @@ release-candidate-to-1.0 runway.
   `mmap_workloads` (page-aligned fast path vs sub-page Sync
   fallback), `direct_iouring` (post-stub baseline for
   `Method::Direct`).
-- `.dev/DECISIONS-0.5.0.md` — full architectural decision log for
-  this release: 7 locked decisions (D-1..D-7), R-2 / R-2' / R-2''
-  iteration notes for the Mmap suitability fallback, and the
-  io_uring blocker section.
 
 ### Changed
 
@@ -2828,7 +2812,7 @@ release-candidate-to-1.0 runway.
   `Error::QueueFull` (FS-00010, never emitted in 0.4.0).
 - Internal `pipeline` subsystem (crate-private): bounded MPMC
   queue + dispatcher thread + atomic-replace helper. Built on
-  `crossbeam-channel`. See `.dev/DECISIONS-0.4.0.md` for the
+  `crossbeam-channel`. See the 0.4.0 design notes for the
   architecture record.
 - 8 integration test files in `tests/`: `pipeline_basic`,
   `pipeline_concurrency` (16-thread stress), `pipeline_backpressure`
@@ -2842,7 +2826,7 @@ release-candidate-to-1.0 runway.
 - 3 panic-safety unit tests in `pipeline::group::tests` exercising
   the `catch_unwind` wrapper via a generic-executor variant of
   `process_jobs` (no test-only code in production paths — see
-  decision D-6 in `.dev/DECISIONS-0.4.0.md`).
+  decision D-6 in the 0.4.0 design notes).
 
 ### Changed
 
@@ -2856,7 +2840,7 @@ release-candidate-to-1.0 runway.
   `BatchError::source` for the failing op rather than aggregated
   to the handle. Cross-lane consistency lifts in 0.5.0 when the
   platform module's IO state machine is consolidated. See
-  decision D-5 in `.dev/DECISIONS-0.4.0.md`.
+  decision D-5 in the 0.4.0 design notes.
 - `Handle::new_raw` (`pub(crate)`) signature extended with a
   `pipeline: Pipeline` parameter. Internal-only; no public-API
   break.
@@ -2917,8 +2901,7 @@ release-candidate-to-1.0 runway.
   of the foundation layer.
 
 ### Changed
-- Crate version bumped to `0.2.0` to match the foundation phase
-  declared in `.dev/PLANNING.md`.
+- Crate version bumped to `0.2.0` to match the foundation phase.
 
 ## [0.1.0] - 2026-05-04
 

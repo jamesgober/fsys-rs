@@ -1,6 +1,6 @@
 //! Cross-platform subprocess crash-safety harness.
 //!
-//! Per locked decision #7 + D-2 in `.dev/DECISIONS-0.5.0.md`, the
+//! Per locked decision #7 + D-2 in the 0.5.0 design notes, the
 //! harness uses subprocess + signal injection to verify each
 //! durability method's crash-safety contract. Synchronization uses
 //! the child's stdout (line-based) so kill points are deterministic

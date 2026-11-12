@@ -1,5 +1,5 @@
 //! Regression tests for the 5 Critical findings fixed in 0.8.0
-//! checkpoint B (see `.dev/CODE-AUDIT-0.8.0.md`).
+//! checkpoint B.
 //!
 //! Each test maps to a specific `C-N` fix:
 //!

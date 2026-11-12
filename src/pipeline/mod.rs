@@ -22,7 +22,7 @@
 //!   in parallel.
 //!
 //! Routing is explicit and fixed per call site (decision R-12 in
-//! `.dev/DECISIONS-0.4.0.md`): batch APIs always use the group lane,
+//! the 0.4.0 design notes): batch APIs always use the group lane,
 //! everything else the solo lane. There is no automatic promotion of
 //! single ops to batches.
 //!
@@ -36,7 +36,7 @@
 //!
 //! `0.4.0`'s dispatcher executes each batch op via the same
 //! atomic-replace pattern as the solo lane — see decisions D-1 and
-//! D-4(c) in `.dev/DECISIONS-0.4.0.md`. This means:
+//! D-4(c) in the 0.4.0 design notes. This means:
 //!
 //! | Platform | Per-op fence in the group lane |
 //! |---|---|
@@ -51,7 +51,7 @@
 //! fallback occurs (e.g. one path in a batch lives on tmpfs and rejects
 //! `O_DIRECT`). In `0.4.0`, that fallback information surfaces in the
 //! `BatchError::source` of the failing op rather than aggregated to the
-//! handle. This is decision D-5 in `.dev/DECISIONS-0.4.0.md`; full
+//! handle. This is decision D-5 in the 0.4.0 design notes; full
 //! cross-lane consistency arrives in `0.5.0` alongside the platform
 //! module's IO state-machine consolidation.
 
@@ -522,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pipeline_config_default_matches_prompt() {
+    fn test_pipeline_config_default_matches_spec() {
         let c = PipelineConfig::default();
         assert_eq!(c.batch_size_max, 128);
         assert_eq!(c.batch_queue_max, 1024);
