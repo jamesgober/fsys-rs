@@ -95,7 +95,7 @@ pub(crate) fn probe_drive() -> DriveInfo {
         info.available_bytes = avail;
     }
 
-    // PLP detection (0.7.0 R-2 in `.dev/DECISIONS-0.7.0.md`):
+    // PLP detection (0.7.0 R-2 in the 0.7.0 design notes):
     // lookup-table over `vendor` + `model` from sysfs. False
     // positives are conservatively avoided; false negatives stay
     // `Unknown` (which costs performance, not correctness — the

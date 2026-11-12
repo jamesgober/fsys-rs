@@ -3,7 +3,7 @@
 //! ## Status of io_uring in 0.5.0
 //!
 //! Per the "io_uring 0.5.x blocker" section in
-//! `.dev/DECISIONS-0.5.0.md`, the Linux io_uring submission path is
+//! the 0.5.0 design notes, the Linux io_uring submission path is
 //! **stubbed** in 0.5.0 due to a rustc 1.95 ICE
 //! (`check_mod_deathness` panic) when `io_uring::IoUring` is wrapped
 //! in any std synchronisation primitive. `Method::Direct` on Linux

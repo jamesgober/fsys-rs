@@ -2,7 +2,7 @@
 //!
 //! Two flavours: [`build_dev`] returns CWD-relative paths used during
 //! development (`./data`, `./logs`, ...) and [`build_prod`] returns the
-//! OS-standard system paths described in `.dev/PLANNING.md`.
+//! OS-standard system paths.
 
 use std::path::PathBuf;
 

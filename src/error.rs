@@ -5,7 +5,7 @@
 //! single error type produced by the library; consumers match on its
 //! variants rather than juggling boxed trait objects.
 //!
-//! Error codes use the prefix `FS-` per the wider Hive error registry.
+//! Error codes use the prefix `FS-` per the wider error registry.
 //! Codes are stable once assigned: the integer associated with each variant
 //! is part of the public contract and will not change between versions.
 
@@ -175,7 +175,7 @@ pub enum Error {
     /// **Code:** `FS-00011`. Caller action: the Linux Direct path's
     /// io_uring branch is unavailable for this handle; fsys silently
     /// falls back to the `O_DIRECT` + `pwrite` + `fdatasync` path
-    /// (locked decision #1 in `.dev/DECISIONS-0.5.0.md`). The fallback
+    /// (locked decision #1 in the 0.5.0 design notes). The fallback
     /// is observable via [`crate::Handle::active_method`]. This variant
     /// surfaces only when a caller explicitly requests ring diagnostics
     /// — normal handle creation does not return it. Common causes:
@@ -224,7 +224,7 @@ pub enum Error {
     /// handle creation. The variant exists in the enum so a future
     /// `probe_plp() -> Result<bool>` API can surface the underlying
     /// reason on request (out of scope for `0.5.0` per follow-up F-8
-    /// in `.dev/DECISIONS-0.5.0.md`).
+    /// in the 0.5.0 design notes).
     PlpDetectionUnavailable {
         /// Human-readable explanation: missing capability, unsupported
         /// platform, IOCTL failure, etc.

@@ -16,7 +16,7 @@
 //!   is what prevents a flipped bit from silently producing the
 //!   wrong payload at the application layer.
 //!
-//! Per `.dev/DECISIONS-0.6.0.md` D-7, fuzz targets compile
+//! Per decision D-7 (0.6.0 design notes), fuzz targets compile
 //! against the public-or-pub-crate-test surface of the library
 //! crate. The journal frame helpers are pub(crate), so this
 //! target enables them via the `fuzz` cargo feature flag the

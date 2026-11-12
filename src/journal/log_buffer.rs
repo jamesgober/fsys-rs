@@ -23,7 +23,7 @@
 //! (milliseconds on Direct IO) runs unlocked, letting
 //! appenders into the new active slot.
 //!
-//! For HiveDB-class workloads (many concurrent writers per
+//! For database-class workloads (many concurrent writers per
 //! handle), this is the difference between Direct-mode being
 //! a single-core ceiling and being multi-core scalable.
 //!

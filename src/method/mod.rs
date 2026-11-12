@@ -23,7 +23,7 @@
 //! - The `auto` submodule contains the per-platform `resolve_auto`
 //!   ladder. 0.5.0 replaces 0.3.0's heuristic ladder with one that
 //!   consults the real hardware probe (D-4 in
-//!   `.dev/DECISIONS-0.5.0.md`).
+//!   the 0.5.0 design notes).
 //! - Per-method backends (`sync`, `data`, `direct`, `mmap`, `journal`)
 //!   land in their own files as they are implemented. The
 //!   `mmap` and `direct` upgrades arrive in checkpoints E and F+G of

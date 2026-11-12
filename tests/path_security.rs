@@ -3,7 +3,7 @@
 //! The hostile-input matrix below is intentionally exhaustive
 //! because path security is the most attack-relevant surface in
 //! the public API, and the J-checkpoint security review will
-//! re-validate this with a fresh subagent. Every entry that the
+//! re-validate this independently. Every entry that the
 //! handle-root scope rejects must continue to be rejected; every
 //! entry that resolves cleanly must continue to resolve cleanly.
 

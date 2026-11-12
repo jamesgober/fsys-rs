@@ -17,7 +17,7 @@
 //!
 //! ## Why this matters
 //!
-//! The journal is the load-bearing HiveDB primitive (every WAL
+//! The journal is the load-bearing database primitive (every WAL
 //! write goes through `JournalHandle::append`). Any panic /
 //! corruption here breaks every downstream consumer. The
 //! existing `journal_frame` target validates the framing format

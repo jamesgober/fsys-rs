@@ -1,7 +1,7 @@
 //! Integration tests for handle-poisoning semantics (0.7.0).
 //!
 //! Validates the load-bearing invariant from
-//! `.dev/DECISIONS-0.7.0.md` "Critical reminders":
+//! the 0.7.0 design notes "Critical reminders":
 //!
 //! > A panic in the driver without poisoning the handle hangs every
 //! > in-flight async op forever (their oneshots never get sent).

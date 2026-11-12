@@ -3,7 +3,7 @@
 //! 0.9.2 introduced workload presets to bundle the multi-knob
 //! coordination that storage-engine workloads need. The `Database`
 //! preset sets four knobs at once to values tuned for sustained NVMe
-//! bulk-write workloads (HiveDB, embedded KV stores, LSM-tree
+//! bulk-write workloads (embedded KV stores, LSM-tree
 //! compaction):
 //!
 //! | Knob | Default (`Workload::Default`) | `Workload::Database` |

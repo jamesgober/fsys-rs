@@ -5,7 +5,7 @@
 //! - Round-trip write+read with Method::Mmap on a page-or-larger
 //!   payload.
 //! - Permanent fallback to Method::Sync when the payload is sub-page
-//!   (per R-2'' in `.dev/DECISIONS-0.5.0.md`). The Handle's
+//!   (per R-2'' in the 0.5.0 design notes). The Handle's
 //!   `active_method()` reflects the fallback after one unsuitable
 //!   op.
 //! - Permanent fallback when reading a sub-page or zero-byte file.

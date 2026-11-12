@@ -1,7 +1,7 @@
 # cargo-fuzz workspace for fsys (locked decision D-7 — pragmatic
 # mode). Build with `cargo fuzz build`; run targets with `cargo fuzz
 # run <target>`. Full-duration runs (1M iterations or 1 hour) are
-# documented protocol in `.dev/DECISIONS-0.6.0.md`; dev iteration
+# the release protocol; dev iteration
 # uses `--max_total_time=60` for a quick sanity pass.
 
 [package]

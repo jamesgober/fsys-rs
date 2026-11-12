@@ -5,7 +5,7 @@
 //! the syscall is in flight — the documented torn-write window),
 //! and `PostSyscall` (kill after rename completed).
 //!
-//! Per D-2 in `.dev/DECISIONS-0.5.0.md`, kill points are
+//! Per D-2 in the 0.5.0 design notes, kill points are
 //! deterministic via stdout-line-based synchronisation, not timing-
 //! based. The 100× pre-merge stability protocol from D-4 applies to
 //! this file.

@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_segment_passthrough_for_safe_input() {
-        assert_eq!(sanitize_segment("hivedb"), "hivedb");
+        assert_eq!(sanitize_segment("myapp"), "myapp");
         assert_eq!(sanitize_segment("my-file_2"), "my-file_2");
     }
 

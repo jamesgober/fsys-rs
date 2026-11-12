@@ -83,7 +83,7 @@ fn direct_write_round_trip_is_platform_symmetric() {
 
 /// Buffered-mode journal append + sync + read-back round-trips on
 /// every platform. The journal substrate is the load-bearing
-/// HiveDB primitive — its observable behaviour MUST be identical
+/// database primitive — its observable behaviour MUST be identical
 /// across OS.
 #[test]
 fn journal_buffered_round_trip_is_platform_symmetric() {

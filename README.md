@@ -61,7 +61,7 @@ See [`examples/`](examples/) (33 runnable patterns) and [`docs/EXAMPLES.md`](doc
 ## At a glance
 
 - **Five durability methods** &mdash; `Sync`, `Data`, `Mmap`, `Direct`, and hardware-aware `Auto`. Every method is platform-honest: the actual primitive in use is observable via `Handle::active_durability_primitive()`.
-- **Journal substrate** &mdash; open-once append-only log with atomic LSN reservation, group-commit fsync, and a CRC-32C-protected frame format. Three throughput tiers (sync, lock-free concurrent, native io_uring async on Linux). The HiveDB-class WAL primitive.
+- **Journal substrate** &mdash; open-once append-only log with atomic LSN reservation, group-commit fsync, and a CRC-32C-protected frame format. Three throughput tiers (sync, lock-free concurrent, native io_uring async on Linux). The database-class WAL primitive.
 - **Atomic-replace writes** &mdash; every `write` / `write_copy` / `Batch::commit` uses temp-file + atomic rename. The target is either entirely the old payload or entirely the new payload &mdash; never torn.
 - **Linux io_uring on the hot path** &mdash; `Method::Direct` and the journal Direct-IO path submit through io_uring with `IORING_OP_WRITE_FIXED` against pre-registered buffer slots. Falls back to `O_DIRECT` + `pwrite` + `fdatasync` cleanly when io_uring is unavailable.
 - **NVMe passthrough flush** &mdash; on Linux (`NVME_IOCTL_IO_CMD`) and Windows (`IOCTL_STORAGE_PROTOCOL_COMMAND`) when the hardware supports it. Transparent fallback to `fdatasync` / `WRITE_THROUGH` otherwise.

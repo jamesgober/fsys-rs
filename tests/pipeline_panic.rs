@@ -1,6 +1,6 @@
 //! 0.4.0 integration: post-failure recovery contract.
 //!
-//! Per decision D-6 in `.dev/DECISIONS-0.4.0.md`, the dispatcher's
+//! Per decision D-6 in the 0.4.0 design notes, the dispatcher's
 //! `catch_unwind` panic-safety wrapper is **unit-tested** in
 //! `pipeline::group::tests::test_process_jobs_with_catches_panic_*`
 //! using a panicking executor closure passed to the test-only generic

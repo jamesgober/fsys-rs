@@ -422,8 +422,5 @@ setup, controller probing, and DMA buffer pool allocation.
   `fsys::journal::backend` API.
 - [Stability commitment](./STABILITY-1.0.md) — what the 1.x line
   guarantees about these new types.
-- [`.dev/DECISIONS-1.1.0.md`](../.dev/DECISIONS-1.1.0.md) —
-  rationale + alternatives for the design choices captured during
-  1.1 development.
 - [Upstream SPDK docs](https://spdk.io/doc/) — for low-level
   configuration details beyond what fsys exposes.

@@ -28,7 +28,7 @@ use linux as imp;
 
 // io_uring wrapper — Linux only. Lazy-init per-Handle ring used by
 // `Method::Direct`'s elite path (locked decision #1 in
-// `.dev/DECISIONS-0.5.0.md`). Falls back to `pwrite` + `fdatasync`
+// the 0.5.0 design notes). Falls back to `pwrite` + `fdatasync`
 // when `io_uring_setup(2)` is unavailable.
 #[cfg(target_os = "linux")]
 pub(crate) mod linux_iouring;
@@ -52,7 +52,7 @@ mod windows;
 use windows as imp;
 
 // Windows NVMe passthrough flush via `IOCTL_STORAGE_PROTOCOL_COMMAND`
-// (locked decision D-2 in `.dev/DECISIONS-0.6.0.md`). Capability
+// (locked decision D-2 in the 0.6.0 design notes). Capability
 // detection at first Direct op; falls back to
 // `FILE_FLAG_WRITE_THROUGH` when the IOCTL is unavailable.
 #[cfg(target_os = "windows")]

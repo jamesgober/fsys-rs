@@ -17,7 +17,7 @@
 //! particular op, the dispatcher falls back locally for that op but
 //! does **not** propagate the fallback back to
 //! [`crate::Handle::active_method`] (decision D-5 in
-//! `.dev/DECISIONS-0.4.0.md`).
+//! the 0.4.0 design notes).
 //!
 //! ## Panic safety
 //!
@@ -91,7 +91,7 @@ pub(crate) struct HandleSnapshot {
 }
 
 /// Response channel for a batch — sync or async. Locked decision
-/// D-5 in `.dev/DECISIONS-0.6.0.md`.
+/// D-5 in the 0.6.0 design notes.
 ///
 /// The dispatcher matches exhaustively on this enum (no catch-all
 /// arm). The two variants are routed to the same processing path;
@@ -230,7 +230,7 @@ fn process_jobs(jobs: Vec<BatchJob>) {
 /// Executes every accumulated [`BatchJob`] in order using `executor`
 /// for each op.
 ///
-/// Per decision D-6 in `.dev/DECISIONS-0.4.0.md`, the executor is
+/// Per decision D-6 in the 0.4.0 design notes, the executor is
 /// extracted as a function parameter so the panic-safety unit test
 /// can substitute a panicking closure. Production code calls this
 /// with [`execute_op`].
@@ -358,7 +358,7 @@ fn execute_op(op: BatchOp, snapshot: &HandleSnapshot, grouped: bool) -> Result<(
 /// dispatcher has no handle, so no `io_uring` ring); a Direct request
 /// that the filesystem refuses falls back to a buffered write for this
 /// op only, without changing [`crate::Handle::active_method`]
-/// (decision D-5 in `.dev/DECISIONS-0.4.0.md`).
+/// (decision D-5 in the 0.4.0 design notes).
 ///
 /// In grouped mode the parent-directory sync is skipped here and
 /// issued once per unique directory by [`process_jobs_with`].

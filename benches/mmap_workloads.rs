@@ -1,6 +1,6 @@
 //! Mmap-specific workload benchmarks.
 //!
-//! Validates two claims from `.dev/DECISIONS-0.5.0.md`:
+//! Validates two claims from the 0.5.0 design notes:
 //!
 //! 1. **R-2'' (suitability fallback):** sub-page payloads transparently
 //!    fall back to `Method::Sync`. The bench labels the run with the

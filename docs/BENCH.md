@@ -390,4 +390,3 @@ The kind + health accessors are sub-50-ns by construction (no allocation, no sys
 
 - [`PERFORMANCE.md`](PERFORMANCE.md) &mdash; tuning knobs and what each one moves.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) &mdash; the substrate-selection and dispatcher layering that the benches measure.
-- [`.dev/DECISIONS-0.7.0.md`](../.dev/DECISIONS-0.7.0.md) &mdash; locked decisions D-5 (relative tail target), D-8 (1.46&times; WSL measurement), and the hybrid strictness rationale.

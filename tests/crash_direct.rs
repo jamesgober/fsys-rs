@@ -2,7 +2,7 @@
 //!
 //! Method::Direct uses the existing `O_DIRECT` + `pwrite` +
 //! `fdatasync` path on Linux (io_uring deferred to 0.5.x patch
-//! per the io_uring blocker in `.dev/DECISIONS-0.5.0.md`),
+//! per the io_uring blocker in the 0.5.0 design notes),
 //! `F_NOCACHE` + `F_FULLFSYNC` on macOS, and
 //! `FILE_FLAG_NO_BUFFERING` + `FILE_FLAG_WRITE_THROUGH` on Windows.
 //! The atomic-replace contract is identical across all backends.

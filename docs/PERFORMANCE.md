@@ -134,7 +134,7 @@ over hand-setting individual knobs:
 | `Workload::Database` | 1024 | 8 KiB | 256 | 4096 |
 
 `Workload::Database` is tuned for storage-engine workloads
-(HiveDB, embedded KV stores, LSM trees) on NVMe with sustained
+(embedded KV stores, LSM trees) on NVMe with sustained
 bulk writes. The effective changes are the 2× ring depth and the
 4× batch queue; the two buffer-pool columns are reserved knobs with
 no effect in 1.1.x.

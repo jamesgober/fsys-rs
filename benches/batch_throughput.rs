@@ -5,7 +5,7 @@
 //! floor target on Linux NVMe is < 5 ms for size 128 and < 30 ms for
 //! size 1024. Windows numbers are recorded as the Windows-specific
 //! baseline for regression detection (see decision D-3 in
-//! `.dev/DECISIONS-0.4.0.md`).
+//! the 0.4.0 design notes).
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use fsys::builder::Builder;

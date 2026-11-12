@@ -11,7 +11,7 @@
 //!
 //! ## Why `spawn_blocking`?
 //!
-//! Locked decision D-1 in `.dev/DECISIONS-0.6.0.md`:
+//! Locked decision D-1 in the 0.6.0 design notes:
 //! `spawn_blocking` is the canonical async/sync bridge in the Rust
 //! async ecosystem — well-tested, plays correctly with tokio
 //! backpressure, and adds zero new threads beyond tokio's existing

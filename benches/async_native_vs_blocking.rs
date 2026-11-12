@@ -1,7 +1,7 @@
 //! Native io_uring async substrate vs `spawn_blocking` fallback —
 //! head-to-head Criterion bench.
 //!
-//! Per locked decision D-8 in `.dev/DECISIONS-0.7.0.md`, the
+//! Per locked decision D-8 in the 0.7.0 design notes, the
 //! load-bearing performance metric for 0.7.0 is the **2× advantage
 //! of native io_uring async over `spawn_blocking`** on Linux
 //! Direct async writes. This bench is the regression detector for
