@@ -64,7 +64,7 @@ See [`examples/`](examples/) (33 runnable patterns) and [`docs/EXAMPLES.md`](doc
 - **Journal substrate** &mdash; open-once append-only log with atomic LSN reservation, group-commit fsync, and a CRC-32C-protected frame format. Three throughput tiers (sync, lock-free concurrent, native io_uring async on Linux). The HiveDB-class WAL primitive.
 - **Atomic-replace writes** &mdash; every `write` / `write_copy` / `Batch::commit` uses temp-file + atomic rename. The target is either entirely the old payload or entirely the new payload &mdash; never torn.
 - **Linux io_uring on the hot path** &mdash; `Method::Direct` and the journal Direct-IO path submit through io_uring with `IORING_OP_WRITE_FIXED` against pre-registered buffer slots. Falls back to `O_DIRECT` + `pwrite` + `fdatasync` cleanly when io_uring is unavailable.
-- **NVMe passthrough flush** &mdash; on Linux (`NVME_IOCTL_IO_CMD`) and Windows (`IOCTL_STORAGE_PROTOCOL_COMMAND`) when the hardware supports it. Transparent fallback to `fdatasync` / `WRITE_THROUGH` otherwise.
+- **NVMe passthrough flush** &mdash; on Linux (`NVME_IOCTL_IO_CMD`) and Windows (`IOCTL_STORAGE_PROTOCOL_COMMAND`) when the hardware and permissions allow it, sent as an extra controller flush after `fdatasync` / `WRITE_THROUGH`, which always run.
 - **Cross-platform reflinks** &mdash; macOS `clonefile(2)` + Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE` give APFS / ReFS instant copy-on-write semantics. Multi-GiB checkpoint clones drop from seconds to microseconds.
 - **Optional async layer** (`async` feature) &mdash; every sync method gets an `_async` sibling. On Linux + `Method::Direct`, async ops submit directly to the per-handle io_uring ring (no `spawn_blocking` thread-pool hop).
 - **Hardware-aware tuning** &mdash; PLP detection, NAWUN/NAWUPF probe (atomic-write unit), `Builder::tune_for(Workload::Database)` preset, runtime CPU-feature detection for hardware CRC-32C.
@@ -166,6 +166,7 @@ The full per-version delta lives in [`CHANGELOG.md`](CHANGELOG.md). Headline cap
 
 | Release | Headline |
 |---|---|
+| **1.1.5** | Durability fixes: a failed directory sync after a write is reported as `AtomicReplaceFailed { step: "sync_parent" }` instead of being ignored, and the Linux NVMe passthrough flush now works and runs after `fdatasync` rather than in its place. No API change; on-disk format unchanged. |
 | **1.1.4** | `tokio` >= 1.53.3 for RUSTSEC-2026-0386: the io_uring completion driver registers its eventfd through the I/O-safe `AsyncFd::register_with_interest`. No API change; on-disk format unchanged. |
 | **1.1.3** | Journal opens tolerate a corrupt tail again (regression from 1.1.1): they resume after the last valid frame and copy the discarded bytes to a `<name>.corrupt-<offset>` sidecar file before truncating. No API change; on-disk format unchanged. |
 | **1.1.2** | `Method::Mmap` maps through the first-party `mmap_io::raw` layer; `memmap2` removed from the dependency tree. No API or behavior change. |

@@ -246,6 +246,16 @@ fn process_jobs_with<F>(jobs: Vec<BatchJob>, executor: F)
 where
     F: Fn(BatchOp, &HandleSnapshot, bool) -> Result<()>,
 {
+    process_jobs_with_dir_sync(jobs, executor, crate::crud::sync_parent);
+}
+
+/// [`process_jobs_with`] with the grouped-mode directory sync passed
+/// in, so tests can make it fail.
+fn process_jobs_with_dir_sync<F, D>(jobs: Vec<BatchJob>, executor: F, sync_dir: D)
+where
+    F: Fn(BatchOp, &HandleSnapshot, bool) -> Result<()>,
+    D: Fn(&Path) -> Result<()>,
+{
     use std::collections::BTreeMap;
 
     for job in jobs {
@@ -262,9 +272,10 @@ where
         // N-per-op cost the regular path incurs. The map's key is
         // the parent directory; the value is some file path inside
         // it that `sync_parent` (which takes a file path and
-        // internally `.parent()`s it) can consume directly.
+        // internally `.parent()`s it) can consume directly, plus the
+        // index of the first op in that directory.
         // Only populated when `grouped == true`.
-        let mut grouped_parents: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+        let mut grouped_parents: BTreeMap<PathBuf, (PathBuf, usize)> = BTreeMap::new();
 
         for (idx, op) in ops.into_iter().enumerate() {
             // For the grouped path we need to remember each
@@ -293,7 +304,7 @@ where
                 Ok(Ok(())) => {
                     completed += 1;
                     if let Some((parent, repr_file)) = parent_repr {
-                        let _ = grouped_parents.entry(parent).or_insert(repr_file);
+                        let _ = grouped_parents.entry(parent).or_insert((repr_file, idx));
                     }
                 }
                 Ok(Err(e)) => {
@@ -317,12 +328,32 @@ where
         // The syncs run even when a later op failed: the batch
         // contract is that ops completed before the failure are
         // durable, and their renames / unlinks are only durable
-        // once their directories are synced. Best-effort, matching
-        // the per-op path where a directory-sync error does not
-        // undo an already-published rename.
+        // once their directories are synced.
+        //
+        // A failed directory sync is reported against the first op
+        // in that directory: every op before it lives in a directory
+        // that synced, so `completed` stays true to its contract
+        // that ops before `failed_at` are durable.
         if grouped {
-            for repr in grouped_parents.values() {
-                let _ = crate::crud::sync_parent(repr);
+            let mut dir_failure: Option<(usize, Error)> = None;
+            for (repr, first_idx) in grouped_parents.values() {
+                if let Err(e) = sync_dir(repr) {
+                    if dir_failure.as_ref().map_or(true, |(i, _)| first_idx < i) {
+                        dir_failure = Some((
+                            *first_idx,
+                            Error::AtomicReplaceFailed {
+                                step: "sync_parent",
+                                source: crate::crud::atomic::as_io_error(e),
+                            },
+                        ));
+                    }
+                }
+            }
+            if let Some((idx, e)) = dir_failure {
+                if failure.as_ref().map_or(true, |(f, _)| idx < *f) {
+                    failure = Some((idx, e));
+                    completed = idx;
+                }
             }
         }
 
@@ -731,6 +762,50 @@ mod tests {
             "the completed op's directory must be synced"
         );
         assert_eq!(std::fs::read(&ok).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn test_grouped_job_reports_a_failed_directory_sync() {
+        let a = tmp_path("grouped_dirsync_fail_a");
+        let b = tmp_path("grouped_dirsync_fail_b");
+        let _ga = TmpFile(a.clone());
+        let _gb = TmpFile(b.clone());
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let job = BatchJob {
+            ops: vec![
+                BatchOp::Write {
+                    path: a.clone(),
+                    data: b"a".to_vec(),
+                },
+                BatchOp::Write {
+                    path: b.clone(),
+                    data: b"b".to_vec(),
+                },
+            ],
+            snapshot: snapshot(),
+            response: BatchResponse::Sync(tx),
+            grouped: true,
+        };
+        let failing_sync =
+            |_: &Path| -> Result<()> { Err(Error::Io(std::io::Error::other("injected"))) };
+        process_jobs_with_dir_sync(vec![job], execute_op, failing_sync);
+        let err = rx
+            .recv()
+            .unwrap()
+            .expect_err("a failed directory sync must fail the batch");
+        // Both ops share one directory, so the failure is reported
+        // against the first of them and nothing counts as durable.
+        assert_eq!((err.failed_at, err.completed), (0, 0));
+        assert!(matches!(
+            *err.source,
+            Error::AtomicReplaceFailed {
+                step: "sync_parent",
+                ..
+            }
+        ));
+        // The renames themselves happened.
+        assert_eq!(std::fs::read(&a).unwrap(), b"a");
+        assert_eq!(std::fs::read(&b).unwrap(), b"b");
     }
 
     #[test]

@@ -214,6 +214,14 @@ impl<'a> Batch<'a> {
     /// when each op IS a transaction commit) should use
     /// [`Self::commit`].
     ///
+    /// **Directory sync failures.** If a directory sync fails, the
+    /// batch returns a [`crate::BatchError`] whose
+    /// [`failed_at`](crate::BatchError::failed_at) is the first op in
+    /// that directory and whose source is
+    /// [`crate::Error::AtomicReplaceFailed`] with step `"sync_parent"`.
+    /// The renames and deletes in that directory have happened but may
+    /// not survive a crash.
+    ///
     /// When an op fails, the batch stops there and the directories
     /// of the ops that completed before it are still synced before
     /// the error is returned, so those ops are durable just as

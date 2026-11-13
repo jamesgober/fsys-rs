@@ -895,23 +895,52 @@ pub(crate) fn nvme_identify_namespace(nvme_fd: RawFd, nsid: u32) -> Result<[u8; 
     // frame for the duration of the syscall. `ioctl` returns -1
     // on error; we surface `errno` via `last_os_error`.
     let rc = unsafe { libc::ioctl(nvme_fd, NVME_IOCTL_ADMIN_CMD, &mut cmd) };
-    if rc < 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-    // The kernel sets `cmd.result` to the NVMe completion status;
-    // 0 means success. Non-zero means the controller rejected the
-    // command (e.g. command not supported, namespace inactive).
-    if cmd.result != 0 {
-        return Err(Error::Io(std::io::Error::other(format!(
-            "NVMe Identify Namespace returned status 0x{:x}",
-            cmd.result
-        ))));
-    }
+    // A negative return is an errno; a positive one is the NVMe
+    // status the controller completed the command with (for example
+    // command not supported, or namespace inactive). `cmd.result` is
+    // completion dword 0, not the status, so it is not checked.
+    nvme_ioctl_result(rc, "Identify Namespace")?;
     Ok(buf)
+}
+
+/// Maps the return value of an NVMe passthrough `ioctl` to a result.
+///
+/// The kernel returns -1 with `errno` set when it could not submit
+/// the command, and the controller's non-zero NVMe status code as a
+/// positive value when the controller rejected it.
+fn nvme_ioctl_result(rc: libc::c_int, what: &str) -> Result<()> {
+    match rc {
+        0 => Ok(()),
+        rc if rc < 0 => Err(Error::Io(std::io::Error::last_os_error())),
+        status => Err(Error::Io(std::io::Error::other(format!(
+            "NVMe {what} failed with status 0x{status:x}"
+        )))),
+    }
+}
+
+/// Maps an NVMe block-device name to its controller character device
+/// name: `nvme0n1`, `nvme0n1p3` and the multipath form `nvme0c0n1` all
+/// map to `nvme0`. Returns `None` for anything that is not
+/// `nvme<digits>...`.
+///
+/// (`"nvme0n1".split('n').next()` is `""` because the name starts
+/// with `n`, so splitting on `n` never finds the controller.)
+pub(crate) fn nvme_controller_name(dev_name: &str) -> Option<String> {
+    let rest = dev_name.strip_prefix("nvme")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    Some(format!("nvme{}", &rest[..digits]))
 }
 
 /// 0.9.4 — Parses the **NAWUN** and **NAWUPF** fields from a
 /// 4096-byte NVMe Identify Namespace response.
+///
+/// The fields only apply when bit 1 of NSFEAT (byte 24) is set.
+/// When it is clear the controller-wide values apply instead; this
+/// function then returns `(None, None)` rather than reporting a
+/// guarantee the namespace does not state.
 ///
 /// Returns `(nawun_lba, nawupf_lba)` — each as a count of
 /// **logical blocks**, **0-based** per the NVMe spec. A value of
@@ -928,6 +957,13 @@ pub(crate) fn nvme_identify_namespace(nvme_fd: RawFd, nsid: u32) -> Result<[u8; 
 /// [`crate::Handle::atomic_write_unit`] exposes (converted to
 /// bytes).
 pub(crate) fn parse_nawun_nawupf(id_buf: &[u8; 4096]) -> (Option<u32>, Option<u32>) {
+    // NSFEAT bit 1: NAWUN, NAWUPF and NACWU are defined for this
+    // namespace.
+    const NSFEAT: usize = 24;
+    const NSFEAT_NAMESPACE_ATOMICS: u8 = 1 << 1;
+    if id_buf[NSFEAT] & NSFEAT_NAMESPACE_ATOMICS == 0 {
+        return (None, None);
+    }
     // Both fields are 16-bit little-endian.
     let nawun = u16::from_le_bytes([id_buf[74], id_buf[75]]);
     let nawupf = u16::from_le_bytes([id_buf[76], id_buf[77]]);
@@ -952,8 +988,9 @@ pub(crate) fn parse_nawun_nawupf(id_buf: &[u8; 4096]) -> (Option<u32>, Option<u3
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`] wrapping the underlying `EACCES`, `EPERM`,
-/// or hardware status code on failure. Callers that want to
+/// Returns [`Error::Io`] wrapping the underlying `EACCES` or `EPERM`,
+/// or carrying the NVMe status code when the controller rejected the
+/// command. Callers that want to
 /// distinguish "passthrough denied at runtime" from other IO errors
 /// should match on the inner `io::ErrorKind`.
 pub(crate) fn nvme_flush_ioctl(nvme_fd: RawFd, nsid: u32) -> Result<()> {
@@ -1002,10 +1039,7 @@ pub(crate) fn nvme_flush_ioctl(nvme_fd: RawFd, nsid: u32) -> Result<()> {
     // size field). `ioctl` returns -1 on error rather than
     // panicking; we surface `errno` via `last_os_error`.
     let rc = unsafe { libc::ioctl(nvme_fd, NVME_IOCTL_IO_CMD, &mut cmd) };
-    if rc < 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
+    nvme_ioctl_result(rc, "FLUSH")
 }
 
 /// Resolves `fd` to its NVMe character device path
@@ -1036,15 +1070,14 @@ fn nvme_char_device_for(fd: RawFd) -> Option<std::path::PathBuf> {
     let resolved = std::fs::canonicalize(&block_link).ok()?;
     // resolved looks like `/sys/devices/.../block/nvme0n1`. The
     // character device for that namespace is `/dev/nvme0`.
-    let name = resolved.file_name()?.to_str()?;
-    if !name.starts_with("nvme") {
-        return None;
-    }
-    // `nvme0n1` -> `nvme0`. `nvme0n1p3` -> `nvme0`.
-    let controller = name.split('n').next()?;
-    if controller.is_empty() || !controller.starts_with("nvme") {
-        return None;
-    }
+    nvme_char_device_path(resolved.file_name()?.to_str()?)
+}
+
+/// Maps a block device name to its NVMe character device path:
+/// `nvme0n1` and `nvme0n1p3` -> `/dev/nvme0`. `None` for anything
+/// that is not an NVMe block device.
+fn nvme_char_device_path(block_name: &str) -> Option<std::path::PathBuf> {
+    let controller = nvme_controller_name(block_name)?;
     Some(std::path::PathBuf::from(format!("/dev/{controller}")))
 }
 
@@ -1395,7 +1428,8 @@ mod tests {
         // response with known values at bytes 74-75 (NAWUN) and
         // 76-77 (NAWUPF), both little-endian.
         let mut id = [0u8; 4096];
-        // NAWUN = 0x0007 → "atomic for 8 logical blocks"
+        id[24] = 0x02; // NSFEAT: namespace atomic fields are valid
+                       // NAWUN = 0x0007 → "atomic for 8 logical blocks"
         id[74] = 0x07;
         id[75] = 0x00;
         // NAWUPF = 0x000F → "atomic for 16 logical blocks"
@@ -1412,6 +1446,7 @@ mod tests {
         // surface as None so callers don't mistake "65 535 LBA
         // atomic guarantee" for "no guarantee".
         let mut id = [0u8; 4096];
+        id[24] = 0x02;
         id[74] = 0xFF;
         id[75] = 0xFF;
         id[76] = 0xFF;
@@ -1426,10 +1461,48 @@ mod tests {
         // A value of 0 in NAWUN/NAWUPF is 0-based: it means
         // "atomic for exactly one logical block" (the base
         // NVMe per-LBA guarantee). It is NOT the sentinel.
-        let id = [0u8; 4096];
+        let mut id = [0u8; 4096];
+        id[24] = 0x02;
         let (nawun, nawupf) = parse_nawun_nawupf(&id);
         assert_eq!(nawun, Some(0));
         assert_eq!(nawupf, Some(0));
+    }
+
+    #[test]
+    fn parse_nawun_nawupf_ignores_fields_when_nsfeat_bit_is_clear() {
+        // Without NSFEAT bit 1 the namespace fields are not defined.
+        // An all-zero buffer must not read as "atomic for one block".
+        let mut id = [0u8; 4096];
+        id[76] = 0x0F;
+        assert_eq!(parse_nawun_nawupf(&id), (None, None));
+        id[24] = 0x01; // other NSFEAT bits do not count
+        assert_eq!(parse_nawun_nawupf(&id), (None, None));
+    }
+
+    #[test]
+    fn nvme_ioctl_result_treats_positive_status_as_failure() {
+        assert!(nvme_ioctl_result(0, "FLUSH").is_ok());
+        let err = nvme_ioctl_result(0x4002, "FLUSH").expect_err("status 0x4002 is a failure");
+        assert!(err.to_string().contains("0x4002"), "{err}");
+    }
+
+    #[test]
+    fn nvme_char_device_path_finds_the_controller() {
+        let dev = |name: &str| nvme_char_device_path(name).map(|p| p.display().to_string());
+        assert_eq!(dev("nvme0n1").as_deref(), Some("/dev/nvme0"));
+        assert_eq!(dev("nvme0n1p3").as_deref(), Some("/dev/nvme0"));
+        assert_eq!(dev("nvme3n2").as_deref(), Some("/dev/nvme3"));
+        assert_eq!(dev("nvme0c0n1").as_deref(), Some("/dev/nvme0"));
+        assert_eq!(dev("sda1"), None);
+    }
+
+    #[test]
+    fn nvme_controller_name_handles_every_block_device_form() {
+        assert_eq!(nvme_controller_name("nvme0n1").as_deref(), Some("nvme0"));
+        assert_eq!(nvme_controller_name("nvme0n1p3").as_deref(), Some("nvme0"));
+        assert_eq!(nvme_controller_name("nvme1n2").as_deref(), Some("nvme1"));
+        assert_eq!(nvme_controller_name("nvme0c0n1").as_deref(), Some("nvme0"));
+        assert_eq!(nvme_controller_name("sda"), None);
     }
 
     // ─────────────────────────────────────────────────────────

@@ -47,7 +47,10 @@ impl Handle {
     ///   sequence (open / write / flush / rename / sync_parent) fails.
     ///   The error's `step` field identifies which step failed; the
     ///   original target file is unmodified for any failure before
-    ///   `rename`.
+    ///   `rename`. When `step` is `"sync_parent"`, the rename has
+    ///   already happened: the target holds the new contents, but
+    ///   the directory sync that makes the rename survive a crash
+    ///   failed. Retry the write, or treat the data as not durable.
     ///
     /// # Examples
     ///
@@ -671,9 +674,10 @@ fn needs_trim(len: usize, sector_size: u32) -> bool {
 ///   (`fdatasync` / `F_FULLFSYNC`). `O_DIRECT` and `F_NOCACHE` do not
 ///   make data durable on their own.
 /// - Windows: the handle was opened with `FILE_FLAG_WRITE_THROUGH`,
-///   which completes each write (and the end-of-file update made
-///   through the same handle) to stable storage before returning, so
-///   no separate `FlushFileBuffers` is issued.
+///   which completes each write to stable storage before returning,
+///   so no separate `FlushFileBuffers` is issued for the data. When
+///   the padding is trimmed, one `FlushFileBuffers` follows the trim
+///   so the new end of file is durable too.
 ///
 /// On error, returns the atomic-replace step name that failed.
 pub(crate) fn write_direct_durable_platform(
@@ -682,12 +686,18 @@ pub(crate) fn write_direct_durable_platform(
     sector_size: u32,
 ) -> StepResult {
     platform::write_all_direct(file, data, sector_size).map_err(|e| ("write", e))?;
-    if needs_trim(data.len(), sector_size) {
+    let trimmed = needs_trim(data.len(), sector_size);
+    if trimmed {
         file.set_len(data.len() as u64)
             .map_err(|e| ("truncate", Error::Io(e)))?;
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = trimmed;
+        super::fence_data(file).map_err(|e| ("flush", e))?;
+    }
+    #[cfg(target_os = "windows")]
+    if trimmed {
         super::fence_data(file).map_err(|e| ("flush", e))?;
     }
     Ok(())
@@ -728,20 +738,20 @@ fn iouring_write_direct(
     buf.as_mut_slice()[..data.len()].copy_from_slice(data);
 
     // O_DIRECT minimises cache effects but does not imply durability.
-    // The atomic-replace contract requires the bytes to be on stable
-    // storage before the rename. Fence options:
+    // The atomic-replace contract requires the bytes, and the file
+    // system metadata that locates them (the new file's length and
+    // extents), to be on stable storage before the rename. Only
+    // `fdatasync` covers both, so it is always the fence:
     //
-    // 1. NVMe passthrough flush (locked decision D-2). Sends NVMe
-    //    FLUSH (opcode 0x00) directly to the controller via the
-    //    legacy `NVME_IOCTL_IO_CMD` ioctl. The flush is an ioctl on a
-    //    different fd (`/dev/nvmeX`), so it cannot be linked to the
-    //    write SQE. It flushes the device cache only; filesystem
-    //    metadata for the new file (extents, length) is committed by
-    //    the parent-directory fsync that follows the rename.
-    // 2. Linked write + Fsync(DATASYNC) (`IOSQE_IO_LINK`, 0.9.4) in
+    // 1. Linked write + Fsync(DATASYNC) (`IOSQE_IO_LINK`, 0.9.4) in
     //    one `io_uring_enter(2)` round-trip.
-    // 3. Unfused: write now, fence after the caller trims padding.
-    if fuse_fence && nvme.is_none() {
+    // 2. Unfused: write now, fence after the caller trims padding.
+    //
+    // An NVMe passthrough FLUSH, when available, is sent after the
+    // fence as an extra step (see `nvme_extra_flush`). It never
+    // replaces `fdatasync`: it empties the drive cache but commits
+    // no file system metadata.
+    if fuse_fence {
         let n = ring.write_at_linked_fsync(file.as_raw_fd(), buf.as_slice(), 0)?;
         if n != aligned_len {
             return Err(Error::Io(std::io::Error::other(
@@ -750,6 +760,7 @@ fn iouring_write_direct(
         }
         #[cfg(test)]
         super::fence_probe::record_fence();
+        nvme_extra_flush(nvme);
         return Ok(true);
     }
     let n = ring.write_at(file.as_raw_fd(), buf.as_slice(), 0)?;
@@ -764,8 +775,9 @@ fn iouring_write_direct(
     Ok(fuse_fence)
 }
 
-/// Durability fence for the `io_uring` Direct path: NVMe passthrough
-/// flush when available, otherwise `fdatasync` through the ring.
+/// Durability fence for the `io_uring` Direct path: `fdatasync`
+/// through the ring, followed by an NVMe passthrough flush when one is
+/// available.
 #[cfg(target_os = "linux")]
 fn iouring_fence(
     ring: &crate::platform::linux_iouring::IoUringRing,
@@ -775,12 +787,27 @@ fn iouring_fence(
     use std::os::fd::AsRawFd;
     #[cfg(test)]
     super::fence_probe::record_fence();
-    match nvme {
-        Some(access) => crate::platform::linux_iouring::nvme_flush_ioctl(
+    ring.fdatasync(file.as_raw_fd())?;
+    nvme_extra_flush(nvme);
+    Ok(())
+}
+
+/// Sends an NVMe FLUSH to the controller after `fdatasync` has made
+/// the write durable.
+///
+/// Best-effort, like the Windows controller flush: `fdatasync` has
+/// already committed the data and the metadata that locates it, so a
+/// rejected FLUSH does not make the write less durable and does not
+/// fail it. The ioctl's NVMe status is still checked, so a rejected
+/// command is never mistaken for a completed one.
+#[cfg(target_os = "linux")]
+fn nvme_extra_flush(nvme: Option<&crate::platform::linux_iouring::NvmeAccess>) {
+    use std::os::fd::AsRawFd;
+    if let Some(access) = nvme {
+        let _ = crate::platform::linux_iouring::nvme_flush_ioctl(
             access.char_dev.as_raw_fd(),
             access.nsid,
-        ),
-        None => ring.fdatasync(file.as_raw_fd()),
+        );
     }
 }
 
@@ -1081,6 +1108,61 @@ fn apply_preserved_metadata_inner(
 
 #[cfg(test)]
 mod tests {
+    /// With NVMe passthrough available, the io_uring Direct path must
+    /// still fence with `fdatasync`, and a rejected NVMe FLUSH must
+    /// not fail a write that `fdatasync` already made durable. The
+    /// fake "controller" here is a regular file, so the FLUSH ioctl
+    /// always fails (ENOTTY).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn iouring_direct_write_fences_with_fdatasync_when_nvme_is_present() {
+        use super::{iouring_fence, iouring_write_direct};
+        use crate::platform::linux_iouring::{IoUringRing, NvmeAccess};
+        use crate::Error;
+
+        let ring = match IoUringRing::new(8, None) {
+            Ok(ring) => ring,
+            Err(Error::IoUringSetupFailed { .. }) => return,
+            Err(e) => panic!("unexpected ring construction error: {e:?}"),
+        };
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let data_path = dir.join(format!("fsys_nvme_fence_data_{pid}"));
+        let fake_path = dir.join(format!("fsys_nvme_fence_ctrl_{pid}"));
+        struct Cleanup(Vec<std::path::PathBuf>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for p in &self.0 {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+        let _cleanup = Cleanup(vec![data_path.clone(), fake_path.clone()]);
+        let open_rw = |p: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(p)
+                .expect("open")
+        };
+        let file = open_rw(&data_path);
+        let fake = NvmeAccess {
+            char_dev: open_rw(&fake_path),
+            nsid: 1,
+        };
+
+        let before = crate::crud::fence_probe::count();
+        let fenced = iouring_write_direct(&ring, &file, b"durable", 512, Some(&fake), true)
+            .expect("a rejected NVMe FLUSH must not fail the write");
+        assert!(fenced);
+        assert!(crate::crud::fence_probe::count() > before);
+        iouring_fence(&ring, &file, Some(&fake)).expect("fence with NVMe present");
+        let bytes = std::fs::read(&data_path).expect("read");
+        assert_eq!(&bytes[..7], b"durable");
+    }
+
     use crate::builder::Builder;
     use crate::method::Method;
     use std::sync::atomic::{AtomicU64, Ordering};

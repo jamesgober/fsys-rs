@@ -230,8 +230,9 @@ fn join_error_to_io(e: tokio::task::JoinError) -> Error {
 ///    same handle.
 /// 4. `fdatasync` through the ring. This fence covers the data and
 ///    the final file size, and it completes before the rename.
-/// 5. Rename over the target, then sync the parent directory
-///    (best-effort, as in the sync path).
+/// 5. Rename over the target, then sync the parent directory. A
+///    failed directory sync is reported as the `sync_parent` step,
+///    as in the sync path.
 ///
 /// A guard removes the temp file on every early return and when the
 /// future is dropped before the rename, so a cancelled `write_async`
@@ -323,9 +324,9 @@ async fn write_async_native(
     crate::platform::atomic_rename(&temp, &resolved).map_err(failed("rename"))?;
     temp_guard.armed = false;
 
-    // Best-effort, as in the sync path: the rename already happened,
-    // so a failed directory sync cannot be undone or retried here.
-    let _ = crate::platform::sync_parent_dir(&resolved);
+    // As in the sync path: the rename already happened, but it is not
+    // durable until the directory is synced, so a failure is reported.
+    crate::platform::sync_parent_dir(&resolved).map_err(failed("sync_parent"))?;
     Ok(())
 }
 

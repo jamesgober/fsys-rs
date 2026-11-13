@@ -40,7 +40,7 @@
 //!
 //! | Platform | Per-op fence in the group lane |
 //! |---|---|
-//! | Linux | `fdatasync` (or `fsync` for `Method::Sync`) on the temp file before rename, then best-effort `fsync` on the parent directory after rename. |
+//! | Linux | `fdatasync` (or `fsync` for `Method::Sync`) on the temp file before rename, then `fsync` on the parent directory after rename. |
 //! | macOS | `fcntl(F_FULLFSYNC)` on the temp file before rename. |
 //! | Windows | `FILE_FLAG_WRITE_THROUGH` makes each write durable; no separate fence syscall. The group-lane benefit on Windows comes from queue depth and syscall amortisation, not flush sharing. |
 //!
