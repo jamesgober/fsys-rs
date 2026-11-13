@@ -94,6 +94,11 @@ pub(crate) trait ReplaceHooks {
     fn before_rename(&self, _temp: &Path) -> StepResult {
         Ok(())
     }
+
+    /// Syncs the directory that holds `target` after the rename.
+    fn sync_parent(&self, target: &Path) -> Result<()> {
+        super::sync_parent(target)
+    }
 }
 
 /// Hooks for callers without handle state (the group lane): Direct
@@ -137,8 +142,10 @@ impl Drop for TempGuard<'_> {
 /// # Errors
 ///
 /// [`Error::AtomicReplaceFailed`] naming the failed step
-/// (`open_temp`, `write`, `truncate`, `flush`, or `rename`). The target
-/// is untouched for every failure before `rename`.
+/// (`open_temp`, `write`, `truncate`, `flush`, `rename`, or
+/// `sync_parent`). The target is untouched for every failure before
+/// `rename`. A `sync_parent` failure means the target already holds the
+/// new contents but the rename may not survive a crash.
 pub(crate) fn atomic_replace<H: ReplaceHooks>(
     target: &Path,
     data: &[u8],
@@ -164,10 +171,14 @@ pub(crate) fn atomic_replace<H: ReplaceHooks>(
     guard.armed = false;
 
     if plan.sync_parent {
-        // Best-effort: the rename already published the new contents,
-        // so reporting `AtomicReplaceFailed` here would wrongly tell
-        // the caller the replace did not happen.
-        let _ = super::sync_parent(target);
+        // The rename has already published the new contents, but the
+        // new directory entry is not durable until the directory is
+        // synced. The caller asked for a durable write, so a failure
+        // here is reported. The `sync_parent` step tells the caller
+        // that the target already holds the new contents.
+        hooks
+            .sync_parent(target)
+            .map_err(|e| step_err("sync_parent", e))?;
     }
     Ok(())
 }
@@ -451,6 +462,52 @@ mod tests {
         assert!(result.is_err(), "hook panic must propagate");
         assert_eq!(std::fs::read(&target).expect("read"), b"old");
         assert_eq!(entries(&dir), vec!["t.bin".to_string()], "temp file leaked");
+    }
+
+    struct FailingDirSyncHooks;
+    impl ReplaceHooks for FailingDirSyncHooks {
+        fn write_direct_durable(&self, _file: &File, _data: &[u8]) -> StepResult {
+            Ok(())
+        }
+        fn sync_parent(&self, _target: &Path) -> Result<()> {
+            Err(Error::Io(std::io::Error::other(
+                "injected directory sync failure",
+            )))
+        }
+    }
+
+    #[test]
+    fn test_atomic_replace_reports_a_failed_directory_sync() {
+        let dir = tmp_dir("dir_sync_fail");
+        let _g = DirGuard(dir.clone());
+        let target = dir.join("t.bin");
+        std::fs::write(&target, b"old").expect("seed");
+        let err = atomic_replace(&target, b"new", &plan(), &FailingDirSyncHooks)
+            .expect_err("a failed directory sync must be reported");
+        assert!(matches!(
+            err,
+            Error::AtomicReplaceFailed {
+                step: "sync_parent",
+                ..
+            }
+        ));
+        // The rename had already happened.
+        assert_eq!(std::fs::read(&target).expect("read"), b"new");
+        assert_eq!(entries(&dir), vec!["t.bin".to_string()], "temp file leaked");
+    }
+
+    #[test]
+    fn test_atomic_replace_skips_directory_sync_when_not_planned() {
+        let dir = tmp_dir("dir_sync_skipped");
+        let _g = DirGuard(dir.clone());
+        let target = dir.join("t.bin");
+        let plan = ReplacePlan {
+            sync_parent: false,
+            ..plan()
+        };
+        atomic_replace(&target, b"new", &plan, &FailingDirSyncHooks)
+            .expect("no directory sync was requested");
+        assert_eq!(std::fs::read(&target).expect("read"), b"new");
     }
 
     #[test]

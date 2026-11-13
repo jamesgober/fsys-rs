@@ -192,8 +192,13 @@ pub(crate) fn write(path: &Path, data: &[u8]) -> Result<()> {
         });
     }
 
-    // Step 6 — best-effort parent-dir sync (no-op on Windows).
-    let _ = crate::crud::sync_parent(path);
+    // Step 6 — sync the parent directory so the rename is durable.
+    // The rename has already happened, so the step name tells the
+    // caller the target holds the new contents.
+    crate::crud::sync_parent(path).map_err(|e| Error::AtomicReplaceFailed {
+        step: "sync_parent",
+        source: as_io_error(e),
+    })?;
 
     Ok(())
 }

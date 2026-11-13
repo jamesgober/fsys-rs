@@ -149,7 +149,7 @@ fn probe_nawun_nawupf_linux(block_dir: &std::path::Path) -> Option<(Option<u32>,
     // Resolve `/dev/nvmeX` (character device) from the block
     // device name. For `nvme0n1` the char device is `/dev/nvme0`.
     let dev_name = block_dir.file_name().and_then(|n| n.to_str())?;
-    let char_name = format!("/dev/{}", nvme_controller_name(dev_name)?);
+    let char_name = format!("/dev/{}", linux_iouring::nvme_controller_name(dev_name)?);
     let nvme = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -157,21 +157,6 @@ fn probe_nawun_nawupf_linux(block_dir: &std::path::Path) -> Option<(Option<u32>,
         .ok()?;
     let id_buf = linux_iouring::nvme_identify_namespace(nvme.as_raw_fd(), nsid).ok()?;
     Some(linux_iouring::parse_nawun_nawupf(&id_buf))
-}
-
-/// Maps an NVMe block-device name to its controller character device
-/// name: `nvme0n1` and the multipath form `nvme0c0n1` both map to
-/// `nvme0`. Returns `None` for anything that is not `nvme<digits>...`.
-///
-/// (`"nvme0n1".split('n').next()` is `""` because the name starts with
-/// `n`, which is why the probe previously never found a device.)
-fn nvme_controller_name(dev_name: &str) -> Option<String> {
-    let rest = dev_name.strip_prefix("nvme")?;
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    if digits == 0 {
-        return None;
-    }
-    Some(format!("nvme{}", &rest[..digits]))
 }
 
 /// Reads `vendor` and `model` from sysfs and consults the
@@ -492,7 +477,9 @@ mod tests {
 
     #[test]
     fn test_nvme_controller_name() {
+        use crate::platform::linux_iouring::nvme_controller_name;
         assert_eq!(nvme_controller_name("nvme0n1").as_deref(), Some("nvme0"));
+        assert_eq!(nvme_controller_name("nvme0n1p3").as_deref(), Some("nvme0"));
         assert_eq!(nvme_controller_name("nvme12n3").as_deref(), Some("nvme12"));
         assert_eq!(nvme_controller_name("nvme0c0n1").as_deref(), Some("nvme0"));
         assert_eq!(nvme_controller_name("nvme1c2n1").as_deref(), Some("nvme1"));

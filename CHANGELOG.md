@@ -5,6 +5,20 @@ All notable changes to `fsys` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.5] - 2026-11-13
+
+**Durability fix release.** A failed directory sync after a write is now reported, and the Linux NVMe passthrough flush works and runs after `fdatasync` instead of in its place. No public item was added, removed or changed, and the on-disk journal format is unchanged.
+
+### Fixed
+
+- **`write` no longer hides a failed directory sync.** After the rename, `Handle::write`, `Handle::write_copy`, `Method::Mmap` writes and the native io_uring `write_async` sync the parent directory so the new name survives a crash. A failure there was ignored and the call returned `Ok(())`. It now returns `Error::AtomicReplaceFailed` with step `"sync_parent"`. The target already holds the new contents when this happens; the error says the rename may not survive a crash.
+- **Batches report a failed directory sync too.** In `Batch::commit` each op fails at the `sync_parent` step as above. In `Batch::commit_grouped` the `BatchError` points at the first op in the directory whose sync failed, so every op before `failed_at` is still durable. `delete` keeps its documented best-effort directory sync.
+- **The Linux NVMe passthrough flush never ran.** The controller name was parsed from the block device name by splitting on `n`, which always gave an empty string, so `/dev/nvmeX` was never found. It now uses the same parser as the drive probe.
+- **The NVMe flush no longer replaces `fdatasync` on Linux.** An NVMe FLUSH empties the drive cache but does not commit the new file's length or extents, so a power loss could leave a renamed file empty or padded. `Method::Direct` writes through io_uring now always fence with `fdatasync`, then send the NVMe FLUSH as an extra step when it is available.
+- **NVMe passthrough commands now check the controller status.** The Linux ioctls return the NVMe status as a positive value; only negative values were treated as errors, so a FLUSH or Identify the controller rejected counted as a success.
+- **NAWUN / NAWUPF are only read when the namespace defines them** (NSFEAT bit 1). Otherwise `Handle::atomic_write_unit()` now returns `None` instead of reporting a one-block guarantee the namespace never stated.
+- **Windows Direct writes flush after trimming the padding.** When the payload is not a multiple of the sector size, one `FlushFileBuffers` now follows the trim so the new end of file is durable before the rename. Sector-aligned payloads are unchanged.
+
 ## [1.1.4] - 2026-11-07
 
 **Security dependency release.** Moves the `async` feature onto tokio's I/O-safe `AsyncFd` constructor for [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386.html). No public item was added, removed or changed, and the on-disk journal format is unchanged.
@@ -2926,6 +2940,7 @@ release-candidate-to-1.0 runway.
 - Initial release. Reserved name on crates.io. No public API.
 
 [Unreleased]: https://github.com/jamesgober/fsys-rs/compare/v1.1.4...HEAD
+[1.1.5]: https://github.com/jamesgober/fsys-rs/compare/v1.1.4...v1.1.5
 [1.1.4]: https://github.com/jamesgober/fsys-rs/compare/v1.1.3...v1.1.4
 [1.1.3]: https://github.com/jamesgober/fsys-rs/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/jamesgober/fsys-rs/compare/v1.1.1...v1.1.2
